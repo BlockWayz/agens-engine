@@ -1,0 +1,17 @@
+Agens Engine
+Copyright (c) 2026 Blockway Link Limited. Licensed under the MIT License (see LICENSE).
+
+This product includes or is derived from third-party software:
+
+- FlashInfer 0.6.15.post1 (third_party/flashinfer; Apache License 2.0), https://github.com/flashinfer-ai/flashinfer,
+  commit de358e829443d2cab2261b4c2b403444f6925ab6. Unmodified headers, compiled into the attention kernels;
+  kernels/src/rmsnorm.cu embeds PTX of its CuTe-DSL RMSNorm kernel.
+- NVIDIA CCCL as vendored by FlashInfer (third_party/flashinfer/cccl; Apache License 2.0 with LLVM Exceptions),
+  https://github.com/NVIDIA/cccl. Unmodified, build-time headers.
+- SGLang (Apache License 2.0), https://github.com/sgl-project/sglang: ported parsers, detokenizer, request
+  handling and kernels; GPU binaries compiled from its Triton kernels.
+- flash-linear-attention (MIT License), (c) 2023-2025 Songlin Yang, Yu Zhang.
+- causal-conv1d (BSD 3-Clause), (c) 2024 Tri Dao; vLLM (Apache License 2.0), (c) contributors to the vLLM project.
+- PyTorch / libtorch (BSD 3-Clause), linked at run time.
+
+Details and license texts: THIRD_PARTY_NOTICES.md.

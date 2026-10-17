@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/agens-core", "crates/agens-cuda", "crates/agens-cli", "crates/agens-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2 = "0.9"
+sha2 = "0.10"
+half = "2"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1

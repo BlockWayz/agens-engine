@@ -1,0 +1,16 @@
+[package]
+name = "agens-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "agens_kernels"
+
+[features]
+# Off by default so `cargo test` runs on machines without CUDA (macOS dev box, CI).
+cuda = []
+# M1 standalone forward (links kernels/build/libagens_m1.so, built by CMake with the oracle bridges).
+m1 = ["cuda"]
+
+[dependencies]
+anyhow.workspace = true

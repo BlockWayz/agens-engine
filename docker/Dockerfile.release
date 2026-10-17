@@ -1,0 +1,11 @@
+# Slim image (the release one): docker/make_slim_rootfs.sh + `docker import` (no base image needed).
+# Agens Engine runtime image on a full base: the prebuilt engine (dist/: bin/agens, lib/*.so, bin/agens-entry.sh) on a CUDA 12.9 +
+# libtorch base. Build the dist with scripts/agens-run.sh --make-dist inside the build container, then:
+#   docker build -f docker/Dockerfile.release --build-arg BASE=<cuda 12.9 + torch 2.11 image> -t agens-engine:<tag> .
+ARG BASE
+FROM ${BASE}
+COPY dist/ /opt/agens/
+ENV PATH=/opt/agens/bin:${PATH} LD_LIBRARY_PATH=/opt/agens/lib:${LD_LIBRARY_PATH} \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+EXPOSE 30000
+ENTRYPOINT ["/opt/agens/bin/agens-entry.sh"]
