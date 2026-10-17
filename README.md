@@ -85,6 +85,11 @@ The 219K-token prompt took 148 s to prefill. Device memory peaked at 16.88 GB, i
 The 24 GB profile in server mode, 19 short prompts, 256 new tokens each: 87.7 tok/s aggregate at 1 concurrent
 request, 129.3 at 2, 155.1 at 4. Every completion was identical at every concurrency level.
 
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for what comes next: speculative decoding on 12 GB GPUs, MTP drafting, more
+measured GPUs, and multi-GPU support.
+
 ## Building from source
 
 ```bash
