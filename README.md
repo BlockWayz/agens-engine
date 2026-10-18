@@ -85,15 +85,22 @@ Quality of the 16 GB build against the other v1 builds:
 GPQA Diamond: best of 4 runs, 6K-token thinking budget with forced close, temperature 0.6. HumanEval: pass@1,
 greedy, 1 run.
 
-**24 GB profile** (`--budget-gib 23`, 4-bit weights):
+**24 GB profile vs SGLang** (`--profile 24gb`, v1 4-bit weights). Both run on the same 48 GB GPU with the same
+4-bit weights, the same v1 drafter, the same prompts and token limits, greedy decoding and a single stream; one run
+per side. The SGLang side is the Agens SGLang build with its README drafter settings. Decode tok/s:
 
-| Prompt class | tok/s | accepted |
-|---|---|---|
-| chat | 78.0 | 2.20 |
-| code | 105.5 | 2.98 |
-| reasoning | 92.0 | 2.61 |
-| tool calls | 104.8 | 2.95 |
-| agent session (8K context) | 117.0 | 3.58 |
+| Prompt class | SGLang | Agens Engine | speed-up |
+|---|---|---|---|
+| chat | 58.3 | 85.7 | 1.47x |
+| code | 79.2 | 112.8 | 1.42x |
+| reasoning | 69.4 | 101.3 | 1.46x |
+| tool calls | 79.5 | 110.3 | 1.39x |
+| agent session (8K context) | 90.5 | 120.6 | 1.33x |
+| Cantonese | 67.2 | 104.5 | 1.56x |
+| JSON output | 124.7 | 199.4 | 1.60x |
+| reasoning, code | 54.7 | 100.7 | 1.84x |
+
+Both sides accept about the same number of draft tokens per step; the engine's verify step is faster.
 
 The 24 GB profile in server mode, 19 short prompts, 256 new tokens each: 87.7 tok/s aggregate at 1 concurrent
 request, 129.3 at 2, 155.1 at 4. Every completion was identical at every concurrency level.
