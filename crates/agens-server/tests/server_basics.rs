@@ -90,3 +90,37 @@ async fn small_endpoints_and_rejections() {
     let (_, b) = call(router(st.clone()), chat(r#"{"messages":[{"role":"user","content":"hi"}],"top_p":0}"#)).await;
     assert!(b.contains("top_p must be in (0, 1], got 0.0."), "{b}");
 }
+
+#[tokio::test]
+async fn image_parts_reach_the_backend_expanded() {
+    let Some(tok) = tokenizer() else { return };
+    use base64::Engine as _;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(320, 256, |x, y| image::Rgb([x as u8, y as u8, 3])))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&png));
+    let body = format!(
+        r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{url}"}}}},{{"type":"text","text":"what is this?"}}]}}],"max_tokens":4}}"#
+    );
+    let defaults = GenerationDefaults::from_model_dir(fixtures().join("model"), tok.len()).unwrap();
+    // a text-only backend refuses images
+    let plain = Arc::new(MockBackend::fixed(vec![248046]));
+    let st = Arc::new(AppState::new(tok.clone(), template(), defaults.clone(), plain, "volundr".into()));
+    let (status, b) = call(router(st), chat(&body)).await;
+    assert_eq!(status, 400, "{b}");
+    // an image backend gets the placeholder expanded: 320 x 256 -> 320 x 256 (multiples of 32) = 10 x 8 tokens
+    let mut mb = MockBackend::fixed(vec![248046]);
+    mb.images = true;
+    let backend = Arc::new(mb);
+    let mut st = AppState::new(tok, template(), defaults, backend.clone(), "volundr".into());
+    st.vision = Some(agens_server::vision::ImageCfg { min_pixels: 65536, max_pixels: 16777216, max_images: 4 });
+    let (status, b) = call(router(Arc::new(st)), chat(&body)).await;
+    assert_eq!(status, 200, "{b}");
+    let c = &backend.calls()[0];
+    let mm = c.mm.as_ref().expect("images passed");
+    assert_eq!(mm.images.len(), 1);
+    assert_eq!(mm.spans[0].len, 80);
+    assert_eq!(c.prompt_ids.iter().filter(|&&t| t == agens_server::vision::IMAGE_PAD).count(), 80);
+    assert!(b.contains("\"prompt_tokens\":"), "{b}");
+}

@@ -28,11 +28,22 @@ HV, K, V = 3 * H, 128, 128
 SUF = "" if H == 16 else f"_h{H}"
 DIM = 2 * H * K + HV * V
 ARCH0 = "sm%d%d" % torch.cuda.get_device_capability(0)  # cubins and autotune pins are per GPU arch
+# AOT_TARGET=86: compile for that compute capability instead of this GPU's (Triton GPUTarget), e.g. sm86 cubins
+# recorded on an sm89 card (an sm_86 cubin runs on 8.9, same major); the pins default to this GPU's (AOT_PINS=file).
+# No tuning: the table only has to load and run on 8.6 (built, not tested on 8.6 hardware).
+TARGET = os.environ.get("AOT_TARGET")
+PINS0 = os.path.join(os.path.dirname(__file__), f"aot_pins_{ARCH0}{SUF}.json")
+if TARGET:
+    import triton.runtime.driver as _drv
+    from triton.backends.compiler import GPUTarget
+    _t = GPUTarget("cuda", int(TARGET), 32)
+    _drv.active.get_current_target = lambda: _t
+    ARCH0 = f"sm{TARGET}"
 ARCH = ARCH0 + SUF
 # AOT_PTX=1: emit the kernels' PTX instead of cubins (table kAotKdaPrefill_ptx_<arch>): the driver JIT-compiles it for
 # newer GPUs that have no table of their own (e.g. sm120 from the sm89 run: PTX for sm_89 is forward compatible)
 PTX = os.environ.get("AOT_PTX") == "1"
-PINS = os.path.join(os.path.dirname(__file__), f"aot_pins_{ARCH}.json")  # head-share variants: own pins (--pin-from-run)
+PINS = os.environ.get("AOT_PINS") or (PINS0 if TARGET else os.path.join(os.path.dirname(__file__), f"aot_pins_{ARCH}.json"))  # head-share variants: own pins (--pin-from-run)
 OUT = os.path.join(os.path.dirname(__file__), "..", "kernels", "aot", f"kda_prefill_aot_{'ptx_' if PTX else ''}{ARCH}.inc")
 SLOTS = 64  # engine's KDA state pool for the oracle build (affects only bounds constants, not arithmetic)
 

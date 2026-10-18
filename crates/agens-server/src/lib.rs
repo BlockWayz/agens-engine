@@ -11,6 +11,7 @@
 //! * [`engine`]    request lifecycle: stop strings / EOS / max tokens, detokenization, usage counts
 //! * [`openai`]    request normalisation (sglang's chat path) and response / SSE serialisation
 //! * [`server`]    axum routes
+//! * [`vision`]    image inputs: data-URL decoding, sizing, placeholder expansion, MRoPE positions
 
 pub mod backend;
 pub mod engine;
@@ -22,3 +23,4 @@ pub mod server;
 pub mod template;
 pub mod tokenizer;
 pub mod toolcall;
+pub mod vision;

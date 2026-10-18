@@ -30,6 +30,8 @@ pub struct EngineRequest {
     pub think_end_ids: Vec<u32>,
     pub vocab_size: usize,
     pub session: Option<SessionHint>,
+    /// images of the prompt (expanded placeholders in `prompt_ids`)
+    pub mm: Option<Arc<crate::vision::MmInput>>,
 }
 
 /// One detokenizer output (what the reference's tokenizer manager hands the OpenAI layer per step).
@@ -218,7 +220,10 @@ pub fn run(
         v
     };
     sampling.ignore_eos = req.ignore_eos;
-    let mut steps = backend.generate(req.prompt_ids.clone(), sampling, req.session.clone());
+    let mut steps = match &req.mm {
+        Some(mm) => backend.generate_mm(req.prompt_ids.clone(), mm.clone(), sampling, req.session.clone()),
+        None => backend.generate(req.prompt_ids.clone(), sampling, req.session.clone()),
+    };
     tokio::spawn(async move {
         let tok = tok.as_ref();
         let mut st = ReqState::new(tok, &req);

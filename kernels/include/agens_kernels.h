@@ -92,6 +92,11 @@ int ak_silu_mul(const void* gate_up, void* out, int tokens, int inter, void* str
 int ak_rope_neox(void* q, void* k, const float* cos_sin_cache, const int64_t* positions, int tokens, int nq, int nk,
                  int head_dim, int rot_dim, int q_stride, int k_stride, void* stream);
 int ak_rope_cache(float* out, int max_pos, int rot_dim, float base, void* stream);
+// interleaved MRoPE: pair j by axis T / H / W (sections sec_h, sec_w: H if j%3==1 && j<3*sec_h, W if j%3==2 && j<3*sec_w);
+// positions[a * stride + t]; equal axes = ak_rope_neox exactly
+int ak_rope_neox_m(void* q, void* k, const float* cos_sin_cache, const int64_t* positions, long stride, int tokens,
+                   int nq, int nk, int head_dim, int rot_dim, int q_stride, int k_stride, float base, int sec_h,
+                   int sec_w, void* stream);
 // ak_rope_neox with cos / sin computed in the kernel (bit-identical to the ak_rope_cache table; no table)
 int ak_rope_neox_fly(void* q, void* k, const int64_t* positions, int tokens, int nq, int nk, int head_dim, int rot_dim,
                      int q_stride, int k_stride, float base, void* stream);

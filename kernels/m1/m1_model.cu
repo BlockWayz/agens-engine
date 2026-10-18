@@ -58,6 +58,15 @@ int ak_attn_decode_packed(int mslot, void* q, void* kc, void* vc, int* indices, 
 int ak_attn_decode(int slot, void* q, void* kc, void* vc, int* indices, int* kv_range, int qo_heads, int kv_heads,
                    float sm_scale, void* o, float* lse, void* stream);
 long long ak_bridge_torch_reserved(int release);
+// vision tower (oracle/bridge/vision.cpp)
+int ak_vis_register(const char* name, void* host, const long long* shape, int ndim);
+int ak_vis_ready();
+int ak_vis_encode(const uint8_t* rgb, const uint8_t* jpeg, long long jlen, int h, int w, int rh, int rw, void* out,
+                  void* stream);
+int ak_vis_pixels(const uint8_t* rgb, const uint8_t* jpeg, long long jlen, int h, int w, int rh, int rw, float* out,
+                  void* stream);
+int ak_vis_encode_pixels(const float* pv, int gh, int gw, void* out, void* stream);
+long long ak_vis_peak_bytes();
 int ak_bridge_set_heads(int qh, int kvh);  // far bridge: this rank's q / kv heads (tensor parallel)
 int ak_bridge_far_extend(void* qi_all, void* qh, void* o_loc, void* lse, int seq_len, int T, int req, void* r2t, int R,
                          int Wctx, void* kc, void* vc, void* idx, void* blk, int rows, void* out, void* stream);
@@ -67,6 +76,7 @@ namespace {
 using bf16 = __nv_bfloat16;
 constexpr int HID = 5120, NS = 4, VOCAB = 248320, VOCAB_VALID = 248077;
 constexpr int HD = 256, ROT = 64, WIN = 4096, KK = 128;
+constexpr int kMropeH = 11, kMropeW = 10;  // config rope_parameters.mrope_section [11, 11, 10], interleaved
 // Head counts of this rank (tensor parallel, ak_m1_tp_config before ak_m1_init: each rank holds 1 / tp of the KDA,
 // attention and MLP heads / rows; tp1 = the whole model). Full model: QH 24, KVH 4, KH 16, KHV 48, INTER 17408.
 constexpr int QH_FULL = 24, KVH_FULL = 4, KH_FULL = 16, KHV_FULL = 48, INTER_FULL = 17408;
@@ -122,6 +132,9 @@ int g_w4_bf16w = 0;       // AGENS_M1_W4_NUMERICS=marlin: decode/verify GEMVs us
 // step (W4 linears are batch-invariant on either path). AGENS_M1_BI=1 or ak_m1_spec_init turn it on.
 bool g_bi = getenv("AGENS_M1_BI") && getenv("AGENS_M1_BI")[0] == '1';
 constexpr int kSpecT = 8;                                  // verify block (DFlash2 block size)
+// single-sequence verify staging (step_h / step_d): ints; [32..37] the sampled-accept parameter block (samp_pos: T,
+// top-k, top-p, min-p, seed, step), [kStepDelta] = the session's rope delta
+constexpr int kStepInts = 48, kStepDelta = 40;
 // speculative verify attention in one launch per layer (ak_attn_decode_multi; AGENS_SPEC_MULTI_ATTN=0: per query)
 constexpr int MSLOT_DENSE = 0, MSLOT_WIN = 1, MSLOT_PACKED = 2;
 // dense layer verify as one causal request of the T queries (ak_attn_decode_packed; AGENS_SPEC_DENSE_PACKED=0: the
@@ -155,7 +168,9 @@ bool multi_win_dev() {
 constexpr int kCapLayers = 5;
 int g_cap_layer[kCapLayers] = {-1, -1, -1, -1, -1};        // target layers whose entry stream 0 feeds the drafter
 bool g_capture = false;
-float g_temp = 0.f;               // speculative verify: 0 = greedy accept, > 0 = sampled accept at this temperature
+float g_temp = 0.f, g_topp = 1.f, g_minp = 0.f;
+int g_topk = 0;  // sampled accept: top-k (<= 0: all), top-p, min-p of the request (ak_m1_spec_sampling)
+//               // speculative verify: 0 = greedy accept, > 0 = sampled accept at this temperature
 int g_seed = 0, g_spec_step = 0;  // Philox key and per-request verify step counter (reset by ak_m1_spec_sampling)
 // Weight pointers per (name literal, layer): looked up in the registries once, then read from a pointer table (the
 // forward used to build ~1400 name strings + map lookups per decode step; a decode graph looks up nothing at all).
@@ -303,29 +318,36 @@ __global__ void gather_engram(const long long* r2, const long long* r3, const ui
 // Decode step inputs {token, position, pool row} (staged from pinned host memory, so a captured graph reads the new
 // values on every replay) -> the per-step device state the layers read; rng = decode attention KV ranges over the
 // session's slot map: [0, 2) BCSA window (last min(seq, W) tokens), [2, 4) dense (all tokens).
+// rope positions: rpos[a * rmax + t] for the MRoPE axes a = T, H, W; a decode / verify token is text,
+// so all three are its position + the session's rope delta (staged with the step: graphs stay valid when it changes)
+__device__ __forceinline__ void put_rpos(long long* rpos, int rmax, int t, long long v) {
+  rpos[t] = v, rpos[rmax + t] = v, rpos[2 * rmax + t] = v;
+}
 __global__ void decode_step_prep(const int* in, int* ids, long long* pos, int* loc, long long* outloc, int* r2t,
-                                 int* rng) {
+                                 int* rng, long long* rpos, int rmax) {
   const int tok = in[0], p = in[1], l = in[2];
   ids[0] = tok, pos[0] = p, loc[0] = l, outloc[0] = l;
+  put_rpos(rpos, rmax, 0, (long long)p + in[4]);
   r2t[p] = l;
   rng[0] = p + 1 > WIN ? p + 1 - WIN : 0, rng[1] = p + 1;
   rng[2] = 0, rng[3] = p + 1;
 }
 // Batched decode step (server mode): kBRec ints per row {token, position, pool row, KDA slot, r2t ptr lo/hi,
-// Engram prev ptr lo/hi} staged from pinned host memory -> per-row device state: ids/pos/loc/outloc/slots, the row's
+// Engram prev ptr lo/hi, rope delta, unused} staged from pinned host memory -> per-row device state: ids/pos/loc/outloc/slots, the row's
 // decode ranges (rng4[r]), its r2t entry for this position, its Engram rows (r2/r3) + prev rotation, exactly the bs = 1
 // decode_step_prep + engram_rows_extend(T = 1) + engram_prev_update(T = 1) per row. Session pointers are read from the
 // staged table, so a captured graph serves any set of sessions.
-constexpr int kBRec = 8;
+constexpr int kBRec = 10;
 __device__ __forceinline__ int* rec_ptr(const int* q) {
   return reinterpret_cast<int*>(((unsigned long long)(unsigned)q[1] << 32) | (unsigned)q[0]);
 }
 __global__ void batch_step_prep(const int* in, int B, int* ids, long long* pos, int* loc, long long* outloc, int* slots,
-                                int* rng4, long long* r2, long long* r3) {
+                                int* rng4, long long* r2, long long* r3, long long* rpos, int rmax) {
   const int r = threadIdx.x;
   if (r >= B) return;
   const int* q = in + r * kBRec;
   const int tok = q[0], p = q[1], l = q[2];
+  put_rpos(rpos, rmax, r, (long long)p + q[8]);
   int* r2t = rec_ptr(q + 4);
   int* prev = rec_ptr(q + 6);
   ids[r] = tok, pos[r] = p, loc[r] = l, outloc[r] = l, slots[r] = q[3];
@@ -384,11 +406,12 @@ __global__ void apply_hint(int* step) {
   if (t < nh && t < kSpecT - 1) step[3 + t] = step[21 + t];
 }
 __global__ void verify_step_prep(const int* in, int* ids, long long* pos, int* loc, long long* outloc, int* r2t,
-                                 int* rng) {
+                                 int* rng, long long* rpos, int rmax) {
   const int t = threadIdx.x, T = in[0], P = in[1];
   if (t >= T) return;
   const int p = P + t, l = in[10 + t];
   ids[t] = in[2 + t], pos[t] = p, loc[t] = l, outloc[t] = l;
+  put_rpos(rpos, rmax, t, (long long)p + in[kStepDelta]);
   r2t[p] = l;
   rng[4 * t] = p + 1 > WIN ? p + 1 - WIN : 0, rng[4 * t + 1] = p + 1;
   rng[4 * t + 2] = 0, rng[4 * t + 3] = p + 1;
@@ -499,6 +522,323 @@ __global__ void __launch_bounds__(1024) accept_sampled(const bf16* logits, int l
     res[1 + a] = fin;
   }
 }
+// ---- speculative sampling with top-k / top-p / min-p (1.0.1): the same target-only rule as accept_sampled, over the
+// filtered distribution the host sampler (crates/agens-cli/src/sampler.rs) draws from at that position:
+//   q = softmax(logits / temp) restricted to the top_k logits (ties at the k-th value in index order), renormalised;
+//   then the smallest prefix (logit descending, ties by index) with mass >= top_p; then p >= min_p * p_max.
+// Drafts are deterministic (DFlash2 greedy drafts, context copies, MTP): point-mass proposals, so accepting draft x
+// with probability q(x) and otherwise sampling from q without x (renormalised) samples q exactly (Leviathan / Chen
+// with a one-hot proposal). Per position one block (samp_pos, grid T) finds the filtered set without sorting: exact
+// k-th key / top-p key by two 256-bin radix passes over the order-preserving bf16 key (counts / fp64 masses), the
+// boundary ties cut in index order; then accept / residual / bonus samples from Philox(seed, step, position) as
+// accept_sampled; samp_chain picks the first rejection. Parameters: step[32..35] = temp, top_k (<= 0: all), top_p,
+// min_p (floats as bits); scr[0..7] accept flags, scr[8..15] the token of each position on rejection / as the bonus.
+__device__ __forceinline__ int okey(const bf16 x) {
+  const unsigned short b = __bfloat16_as_ushort(x);
+  return (b & 0x8000) ? (int)(unsigned short)~b : (int)(b | 0x8000);
+}
+struct SampSet {
+  float mx, inv_t, minp;
+  int kall, tk, kcut, pall, tp, pcut;
+  __device__ __forceinline__ float mass(float lv) const { return __expf((lv - mx) * inv_t); }
+  __device__ __forceinline__ bool inA(int v, int key) const { return kall || key > tk || (key == tk && v <= kcut); }
+  __device__ __forceinline__ bool in(int v, const bf16 x) const {
+    const int key = okey(x);
+    if (!inA(v, key)) return false;
+    if (!pall && !(key > tp || (key == tp && v <= pcut))) return false;
+    return minp <= 0.f || mass(__bfloat162float(x)) >= minp;
+  }
+};
+// Layout: warp w owns [w * seg, (w + 1) * seg) (seg a multiple of 32) and lane l reads base + 32 r + l in round r:
+// coalesced loads, and (warp, round, lane) order is index order (tie cuts and draws follow the index order).
+constexpr unsigned kFull = 0xFFFFFFFFu;
+struct SampLay {
+  int seg, base, rounds;
+};
+__device__ __forceinline__ SampLay samp_lay(int nv) {
+  SampLay L;
+  const int nw = blockDim.x >> 5;
+  L.seg = ((nv + nw - 1) / nw + 31) & ~31, L.base = (threadIdx.x >> 5) * L.seg, L.rounds = L.seg >> 5;
+  return L;
+}
+__device__ __forceinline__ int samp_v(const SampLay& L, int r, int nv) {
+  const int v = L.base + 32 * r + (threadIdx.x & 31);
+  return v < nv ? v : -1;
+}
+// warp-aggregated histogram adds (lanes of one bin -> one shared atomic; bin < 0: no element)
+__device__ __forceinline__ void hist_add(int* hist, int bin) {
+  const unsigned m = __match_any_sync(kFull, bin);
+  if (bin >= 0 && (int)(threadIdx.x & 31) == __ffs(m) - 1) atomicAdd(&hist[bin], __popc(m));
+}
+__device__ __forceinline__ void hist_addd(double* hm, int bin, double val) {
+  const unsigned m = __match_any_sync(kFull, bin);
+  double sum = 0.0;
+  for (int src = 0; src < 32; ++src) {
+    const double o = __shfl_sync(kFull, val, src);
+    if ((m >> src) & 1u) sum += o;
+  }
+  if (bin >= 0 && (int)(threadIdx.x & 31) == __ffs(m) - 1) atomicAdd(&hm[bin], sum);
+}
+__device__ double block_sumd(double v, double* red) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(kFull, v, o);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+  __syncthreads();
+  double t = 0.0;
+  for (int w = 0; w < (int)(blockDim.x >> 5); ++w) t += red[w];
+  __syncthreads();
+  return t;
+}
+// the index of the n-th (1-based, index order) element with key == tau (and in A when useA); -1 if fewer exist
+__device__ int samp_tie_cut(const bf16* l, int nv, const SampLay& L, int tau, int n, const SampSet& f, bool useA,
+                            int* wcnt, int* sh) {
+  auto pred = [&](int v) {
+    if (v < 0) return false;
+    const int key = okey(l[v]);
+    return key == tau && (!useA || f.inA(v, key));
+  };
+  int c = 0;
+  for (int r = 0; r < L.rounds; ++r) c += __popc(__ballot_sync(kFull, pred(samp_v(L, r, nv))));
+  if ((threadIdx.x & 31) == 0) wcnt[threadIdx.x >> 5] = c;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const int nw = blockDim.x >> 5;
+    int acc = 0, w = 0;
+    for (; w < nw; ++w) {
+      if (acc + wcnt[w] >= n) break;
+      acc += wcnt[w];
+    }
+    sh[0] = w < nw ? w : -1, sh[1] = n - acc, sh[2] = -1;
+  }
+  __syncthreads();
+  if (sh[0] == (int)(threadIdx.x >> 5)) {
+    int rem = sh[1];
+    for (int r = 0; r < L.rounds; ++r) {
+      const unsigned bal = __ballot_sync(kFull, pred(samp_v(L, r, nv)));
+      const int k = __popc(bal);
+      if (rem <= k) {
+        unsigned bb = bal;
+        for (int i = 1; i < rem; ++i) bb &= bb - 1;
+        if ((threadIdx.x & 31) == 0) sh[2] = L.base + 32 * r + __ffs(bb) - 1;
+        break;
+      }
+      rem -= k;
+    }
+  }
+  __syncthreads();
+  const int out = sh[2];
+  __syncthreads();
+  return out;
+}
+// sample from the set without `skip` (total mass z) at uniform u, in index order (block-wide)
+__device__ int samp_draw(const bf16* l, int nv, const SampLay& L, const SampSet& f, int skip, double z, float u,
+                         double* wm, int* sh, double* shd) {
+  auto mass_of = [&](int v) -> double {
+    return v >= 0 && v != skip && f.in(v, l[v]) ? (double)f.mass(__bfloat162float(l[v])) : 0.0;
+  };
+  double part = 0.0;
+  for (int r = 0; r < L.rounds; ++r) part += mass_of(samp_v(L, r, nv));
+  for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(kFull, part, o);
+  if ((threadIdx.x & 31) == 0) wm[threadIdx.x >> 5] = part;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const int nw = blockDim.x >> 5;
+    const double target = (double)u * z;
+    double acc = 0.0;
+    int w = 0, last = -1;
+    for (; w < nw; ++w) {
+      if (wm[w] > 0.0) last = w;
+      if (acc + wm[w] > target) break;
+      acc += wm[w];
+    }
+    if (w == nw) w = last, acc -= last >= 0 ? wm[last] : 0.0;  // rounding at the top end
+    sh[0] = w, shd[0] = target - acc, sh[1] = -1;
+  }
+  __syncthreads();
+  if (sh[0] == (int)(threadIdx.x >> 5)) {
+    const int lane = threadIdx.x & 31;
+    double rem = shd[0];
+    int lastv = -1;
+    for (int r = 0; r < L.rounds; ++r) {
+      const double m = mass_of(samp_v(L, r, nv));
+      double sc = m;
+      for (int o = 1; o < 32; o <<= 1) {
+        const double t = __shfl_up_sync(kFull, sc, o);
+        if (lane >= o) sc += t;
+      }
+      const double tot = __shfl_sync(kFull, sc, 31);
+      const unsigned has = __ballot_sync(kFull, m > 0.0);
+      if (has) lastv = L.base + 32 * r + (31 - __clz(has));
+      if (tot > rem) {
+        const unsigned hit = __ballot_sync(kFull, sc > rem && m > 0.0);
+        if (lane == 0) sh[1] = hit ? L.base + 32 * r + __ffs(hit) - 1 : lastv;
+        break;
+      }
+      rem -= tot;
+    }
+    if (lane == 0 && sh[1] < 0) sh[1] = lastv;
+  }
+  __syncthreads();
+  const int out = sh[1];
+  __syncthreads();
+  return out;
+}
+// grid B x T blocks: sequence b = blockIdx.x / T, position j; its parameters prm + b * prm_stride = {temp, top_k, top_p,
+// min_p, seed, step} (floats as bits); scr + 16 b; temp <= 0: the greedy accept from the target argmax tok
+__global__ void __launch_bounds__(1024) samp_pos(const bf16* logits, int ld, int nv, const int* ids_all, int T,
+                                                 const int* prm_all, int prm_stride, const int* tok, int* scr_all) {
+  const int b = blockIdx.x / T, j = blockIdx.x % T;
+  const int* ids = ids_all + (size_t)b * T;
+  const int* prm = prm_all + (size_t)b * prm_stride;
+  int* scr = scr_all + 16 * b;
+  if (__int_as_float(prm[0]) <= 0.f) {
+    if (threadIdx.x == 0) {
+      const int g = tok[(size_t)b * T + j];
+      scr[j] = j + 1 < T && ids[j + 1] == g, scr[8 + j] = g;
+    }
+    return;
+  }
+  const bf16* l = logits + ((size_t)b * T + j) * ld;
+  __shared__ float red[32];
+  __shared__ double redd[32], wm[32], hm[256], shd[2];
+  __shared__ int hist[256], sh[4], wcnt[32];
+  const float temp = __int_as_float(prm[0]), topp = __int_as_float(prm[2]), minp = __int_as_float(prm[3]);
+  const int topk = prm[1];
+  const SampLay L = samp_lay(nv);
+  SampSet f;
+  f.inv_t = 1.0f / temp, f.minp = minp;
+  f.kall = !(topk > 0 && topk < nv), f.tk = 0, f.kcut = nv;
+  f.pall = 1, f.tp = 0, f.pcut = nv;
+  float mx = -INFINITY;
+  for (int r = 0; r < L.rounds; ++r) {
+    const int v = samp_v(L, r, nv);
+    if (v >= 0) mx = fmaxf(mx, __bfloat162float(l[v]));
+  }
+  f.mx = block_max(mx, red);
+  // top-k: the k-th largest key by two radix passes over counts; its ties kept in index order up to k
+  if (!f.kall) {
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+    __syncthreads();
+    for (int r = 0; r < L.rounds; ++r) {
+      const int v = samp_v(L, r, nv);
+      hist_add(hist, v >= 0 ? okey(l[v]) >> 8 : -1);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int cum = 0, b = 255;
+      for (; b > 0 && cum + hist[b] < topk; --b) cum += hist[b];
+      sh[0] = b, sh[1] = cum;
+    }
+    __syncthreads();
+    const int b1 = sh[0], above1 = sh[1];
+    __syncthreads();
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+    __syncthreads();
+    for (int r = 0; r < L.rounds; ++r) {
+      const int v = samp_v(L, r, nv);
+      const int key = v >= 0 ? okey(l[v]) : -1;
+      hist_add(hist, key >= 0 && (key >> 8) == b1 ? (key & 255) : -1);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int cum = above1, b = 255;
+      for (; b > 0 && cum + hist[b] < topk; --b) cum += hist[b];
+      sh[2] = (b1 << 8) | b, sh[3] = topk - cum;
+    }
+    __syncthreads();
+    f.tk = sh[2];
+    const int need = sh[3];
+    __syncthreads();
+    f.kcut = samp_tie_cut(l, nv, L, f.tk, need, f, false, wcnt, sh);
+  }
+  // top-p: the smallest prefix of A (key descending, ties by index) with mass >= top_p * Z_A, by two radix passes over
+  // fp64 masses; the boundary key's ties (equal masses) kept in index order as many as the prefix needs
+  if (topp < 1.f) {
+    double za = 0.0;
+    for (int r = 0; r < L.rounds; ++r) {
+      const int v = samp_v(L, r, nv);
+      if (v >= 0 && f.inA(v, okey(l[v]))) za += (double)f.mass(__bfloat162float(l[v]));
+    }
+    const double target = (double)topp * block_sumd(za, redd);
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) hm[b] = 0.0;
+    __syncthreads();
+    for (int r = 0; r < L.rounds; ++r) {
+      const int v = samp_v(L, r, nv);
+      const int key = v >= 0 ? okey(l[v]) : -1;
+      const bool in = key >= 0 && f.inA(v, key);
+      hist_addd(hm, in ? key >> 8 : -1, in ? (double)f.mass(__bfloat162float(l[v])) : 0.0);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      double cum = 0.0;
+      int b = 255;
+      for (; b > 0 && cum + hm[b] < target; --b) cum += hm[b];
+      sh[0] = b, shd[1] = cum;
+    }
+    __syncthreads();
+    const int b1 = sh[0];
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) hm[b] = 0.0;
+    __syncthreads();
+    for (int r = 0; r < L.rounds; ++r) {
+      const int v = samp_v(L, r, nv);
+      const int key = v >= 0 ? okey(l[v]) : -1;
+      const bool in = key >= 0 && (key >> 8) == b1 && f.inA(v, key);
+      hist_addd(hm, in ? key & 255 : -1, in ? (double)f.mass(__bfloat162float(l[v])) : 0.0);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      double cum = shd[1];
+      int b = 255;
+      for (; b > 0 && cum + hm[b] < target; --b) cum += hm[b];
+      sh[2] = (b1 << 8) | b;
+      const unsigned short kb = (unsigned short)sh[2];
+      const unsigned short bits = (kb & 0x8000) ? (unsigned short)(kb & 0x7fff) : (unsigned short)~kb;
+      const double m = (double)f.mass(__bfloat162float(__ushort_as_bfloat16(bits)));
+      const double n = m > 0.0 ? ceil((target - cum) / m) : 1.0;
+      sh[3] = n < 1.0 ? 1 : (n > 1e9 ? 1000000000 : (int)n);
+    }
+    __syncthreads();
+    f.pall = 0, f.tp = sh[2];
+    const int need = sh[3];
+    __syncthreads();
+    const int cut = samp_tie_cut(l, nv, L, f.tp, need, f, true, wcnt, sh);
+    f.pcut = cut < 0 ? nv : cut;  // fewer ties than needed (fp64 rounding at the boundary): keep them all
+  }
+  double zf = 0.0;
+  for (int r = 0; r < L.rounds; ++r) {
+    const int v = samp_v(L, r, nv);
+    if (v >= 0 && f.in(v, l[v])) zf += (double)f.mass(__bfloat162float(l[v]));
+  }
+  const double z = block_sumd(zf, redd);
+  const unsigned long long seed = (unsigned)prm[4], sidx = (unsigned)prm[5];
+  curandStatePhilox4_32_10_t rng;
+  curand_init(seed, sidx * 64 + j, 0, &rng);
+  const float4 u4 = curand_uniform4(&rng);
+  if (j + 1 < T) {
+    const int x = ids[j + 1];
+    const bool inx = x >= 0 && x < nv && f.in(x, l[x]);
+    const double px = inx ? (double)f.mass(__bfloat162float(l[x])) : 0.0;
+    bool acc = inx && (double)u4.x * z < px;
+    if (!acc && z - px <= 0.0) acc = true;  // x is the whole set
+    int tok = x;
+    if (!acc) tok = samp_draw(l, nv, L, f, x, z - px, u4.y, wm, sh, shd);
+    if (threadIdx.x == 0) scr[j] = acc, scr[8 + j] = tok;
+  } else {
+    const int tok = samp_draw(l, nv, L, f, -1, z, u4.y, wm, sh, shd);
+    if (threadIdx.x == 0) scr[j] = 0, scr[8 + j] = tok;
+  }
+}
+// thread b: sequence b's chain (ids + b T, scr + 16 b) -> res + b * res_stride = {n, emitted[..]}
+__global__ void samp_chain(const int* ids_all, int B, int T, const int* scr_all, int* res_all, int res_stride) {
+  const int b = threadIdx.x;
+  if (b >= B) return;
+  const int *ids = ids_all + (size_t)b * T, *scr = scr_all + 16 * b;
+  int* res = res_all + (size_t)b * res_stride;
+  int a = 0;
+  while (a + 1 < T && scr[a]) ++a;
+  res[0] = a + 1;
+  for (int j = 0; j < a; ++j) res[1 + j] = ids[1 + j];
+  res[1 + a] = scr[8 + a];
+}
 // Engram prev pair after committing n of the verify tokens (engram_prev_update with T = n)
 __global__ void engram_prev_commit(const int* ids, const long long* pos, const int* res, int* prev) {
   const int n = res[0];
@@ -514,13 +854,15 @@ __global__ void engram_prev_commit(const int* ids, const long long* pos, const i
 // [24..25] far-cache tag. Each sequence gets exactly what verify_step_prep / engram_rows_extend / accept_greedy /
 // engram_prev_commit give it in a single-sequence verify.
 constexpr int kRI = m1draft::kRecInts;
+constexpr int kRecDelta = 40;  // batched verify record: the sequence's rope delta ([34..39] sampling)
 __global__ void bv_prep(const int* rec, int Wctx, int* ids, long long* pos, int* loc, long long* outloc, int* rng,
-                        int* slots, int T) {
+                        int* slots, int T, long long* rpos, int rmax) {
   const int b = blockIdx.x, t = threadIdx.x;
   if (t >= T) return;
   const int* r = rec + b * kRI;
   const int j = b * T + t, p = r[1] + t, l = r[10 + t];
   ids[j] = r[2 + t], pos[j] = p, loc[j] = l, outloc[j] = l;
+  put_rpos(rpos, rmax, j, (long long)p + r[kRecDelta]);
   rec_ptr(r + 20)[p] = l;
   const int off = b * Wctx;  // ranges index the B x Wctx staged slot maps (r2t_b)
   rng[4 * j] = off + (p + 1 > WIN ? p + 1 - WIN : 0), rng[4 * j + 1] = off + p + 1;
@@ -602,6 +944,8 @@ struct State {
   bf16 *q, *gate, *k, *v, *o, *qi, *ik, *e, *eg;
   float *lse;
   long long *pos, *reqs, *r2, *r3, *outloc;
+  long long* rpos = nullptr;            // rope positions [3][rmax]: MRoPE axes T, H, W of the step's tokens (rope())
+  int rmax = 0;
   int *loc, *ids, *qo_dev, *kv_indptr, *kv_idx, *last1, *tok;
   void* rope = nullptr;                 // cos/sin cache of this device
   int *step_d = nullptr, *step_h = nullptr, *tok_h = nullptr;  // decode inputs (device / pinned host), next token (pinned)
@@ -617,6 +961,8 @@ struct State {
   // [kSpecT][KDIM] pre-conv qkv, [kSpecT][KDIM] conv output, [kSpecT][KHV*KK] gate, [kSpecT][KHV] beta
   std::vector<bf16*> kst;
   int* vres = nullptr;                  // accept result {n, emitted[..]} (device), mirrored to pinned vres_h
+  size_t big0_elems = 0;                // big0 capacity (bf16 elements)
+  int* samp_scr = nullptr;              // sampled accept: per-position accept flags / tokens (samp_pos)
   int* vres_h = nullptr;
   bf16* cap = nullptr;                  // drafter context features: [tokens][kCapLayers][HID] (stream 0 at layer entry)
   int cap_rows = 0;
@@ -649,8 +995,11 @@ struct Session {
   int seq = 0, kslot = 0;
   std::vector<int> rows;                       // host mirror of r2t[0, seq)
   int *r2t[2] = {}, *prev[2] = {}, *slot[2] = {};
+  float samp_t = 0.f, samp_p = 1.f, samp_minp = 0.f;  // batched verify sampling (ak_m1_session_sampling; 0 = greedy)
+  int samp_k = 0, samp_seed = 0, samp_step = 0;
   long long cache_epoch = 0;  // owner tag of the far-branch union caches (globally unique, see g_cache_epoch)
   int cache_seq = 0;          // position at the last verify step (a step back = a new epoch)
+  int rdelta = 0;             // rope position - token position of the next text token (<= 0 after images; vision.md)
 };
 std::vector<Session> g_sess;
 long long g_cache_epoch = 0;  // tags handed out: a session's history may have changed -> a new tag
@@ -715,6 +1064,7 @@ int reset_session_buffers(Session& ss) {  // r2t -> trash row, prev -> (-1,-1), 
       }
   }
   ss.seq = 0;
+  ss.rdelta = 0;
   use(0);
   CK(m1mtp::reset_ring(ss.kslot, S.s));  // MTP context: no pending row
   return 0;
@@ -923,10 +1273,10 @@ int kda_mixer(int i, const bf16* h, bf16* out, int T, bool prefill) {
 
 // RoPE on S.q / S.k: from the registered cos|sin table, or (no table registered: the default) computed in the kernel,
 // bit-identical (AGENS_ROPE_CACHE=1 keeps the table: 64 fp32 per position)
+// The positions are the rope positions S.rpos (three MRoPE rows): equal rows = the 1-D rope exactly.
 int rope(int T) {
-  if (S.rope)
-    return ak_rope_neox(S.q, S.k, (const float*)S.rope, (const int64_t*)S.pos, T, QH, KVH, HD, ROT, QH * HD, KVH * HD, S.s);
-  return ak_rope_neox_fly(S.q, S.k, (const int64_t*)S.pos, T, QH, KVH, HD, ROT, QH * HD, KVH * HD, 10000000.0f, S.s);
+  return ak_rope_neox_m(S.q, S.k, (const float*)S.rope, (const int64_t*)S.rpos, S.rmax, T, QH, KVH, HD, ROT, QH * HD,
+                        KVH * HD, 10000000.0f, kMropeH, kMropeW, S.s);
 }
 
 // AGENS_KV_INT8_DENSE=fake (quality gate input, no memory saved): the dense layer's new K/V rows quantized to INT8 per
@@ -1160,19 +1510,19 @@ int engram(int i, int which, bf16* y, int T) {
 // Batched decode, attention layers: one row at a time with that row's session bound (positions / pool rows offset,
 // its decode attention planned), exactly the bs = 1 call. Restores the batch's slot array afterwards.
 int attn_rows(int i, const bf16* h, bf16* a, bool bcsa) {
-  long long *pos0 = S.pos, *out0 = S.outloc;
+  long long *pos0 = S.pos, *out0 = S.outloc, *rp0 = S.rpos;
   int* loc0 = S.loc;
   for (int r = 0; r < g_B; ++r) {
     g_cur = g_brow[r];
     bind_session();
-    S.pos = pos0 + r, S.outloc = out0 + r, S.loc = loc0 + r;
+    S.pos = pos0 + r, S.outloc = out0 + r, S.loc = loc0 + r, S.rpos = rp0 + r;
     int e = 0;
     if (dev_attn()) {
       decode_ranges<<<1, 1, 0, S.s>>>(S.pos, S.rng);
       e = plan_decode_attention();
     }
     if (!e) e = attn_mixer(i, h + (size_t)r * HID, a + (size_t)r * HID, 1, false, bcsa);
-    S.pos = pos0, S.outloc = out0, S.loc = loc0;
+    S.pos = pos0, S.outloc = out0, S.loc = loc0, S.rpos = rp0;
     if (e) return e;
   }
   for (int d = 0; d < g_ndev; ++d) SD[d].slot = SD[d].slots_b;
@@ -1250,14 +1600,14 @@ std::vector<int> g_bv_reg;  // per sequence: 0 near, 1 every query far, 2 mixed
 int attn_bv(int i, const bf16* h, bf16* out, bool bcsa) {
   const int B = g_BV, TV = g_TV, R = B * TV;
   if (m1kv::on() || (!bcsa && m1d8::on())) {
-    long long *pos0 = S.pos, *out0 = S.outloc;
+    long long *pos0 = S.pos, *out0 = S.outloc, *rp0 = S.rpos;
     int* loc0 = S.loc;
     const int cur0 = g_cur;
     int e = 0;
     for (int b = 0; b < B && !e; ++b) {
       g_cur = g_bv_sess[b];
       bind_session();
-      S.pos = pos0 + b * TV, S.outloc = out0 + b * TV, S.loc = loc0 + b * TV;
+      S.pos = pos0 + b * TV, S.outloc = out0 + b * TV, S.loc = loc0 + b * TV, S.rpos = rp0 + b * TV;
       g_tag_ptr = reinterpret_cast<const long long*>(S.bv_d + b * kRI + 24);
       bv_seq_ranges<<<1, 32, 0, S.s>>>(S.pos, S.rng, TV);
       const int sv = g_BV;
@@ -1266,7 +1616,7 @@ int attn_bv(int i, const bf16* h, bf16* out, bool bcsa) {
       if (!e) e = attn_mixer(i, h + (size_t)b * TV * HID, out + (size_t)b * TV * HID, TV, false, bcsa);
       g_BV = sv;
     }
-    S.pos = pos0, S.outloc = out0, S.loc = loc0, g_tag_ptr = nullptr;
+    S.pos = pos0, S.outloc = out0, S.loc = loc0, S.rpos = rp0, g_tag_ptr = nullptr;
     g_cur = cur0;
     bind_session();
     return e;
@@ -1378,6 +1728,25 @@ m1draft::Target draft_target();
 int run_model(int T, bool prefill, int R = 1);
 int finish_step(int* next, int T, std::chrono::steady_clock::time_point t_start);
 
+// Multimodal prefill input (ak_m1_prefill_mm): for the n tokens of the call, rope positions [3][n]
+// (MRoPE rows T, H, W; null: position + the session's rope delta) and per token the row of `emb` ([rows][HID] bf16,
+// host) that replaces its token embedding (-1: the token's own). `s` = offset of the chunk being forwarded.
+struct MmIn {
+  const long long* rpos;
+  const bf16* emb;
+  const int* row;
+  int n, s;
+};
+MmIn* g_mm = nullptr;
+// the step's rope positions into S.rpos on every device (host rows rp [3][T])
+void stage_rpos(const std::vector<long long>& rp, int T) {
+  for (int d = 0; d < g_ndev; ++d) {
+    use(d);
+    for (int a = 0; a < 3; ++a)
+      cudaMemcpyAsync(S.rpos + (size_t)a * S.rmax, rp.data() + (size_t)a * T, (size_t)T * 8, cudaMemcpyHostToDevice, S.s);
+  }
+}
+
 int forward(const int* ids_host, int T, bool prefill, int* next) {
   const auto t_start = std::chrono::steady_clock::now();
   g_lin = g_lin_w4 = 0;
@@ -1388,6 +1757,12 @@ int forward(const int* ids_host, int T, bool prefill, int* next) {
   std::vector<long long> pos(T);
   std::vector<int> loc(T);
   for (int t = 0; t < T; ++t) pos[t] = g_seq + t, loc[t] = alloc_row(ss);
+  std::vector<long long> rp((size_t)3 * T);
+  for (int a = 0; a < 3; ++a)
+    for (int t = 0; t < T; ++t)
+      rp[(size_t)a * T + t] = g_mm && g_mm->rpos ? g_mm->rpos[(size_t)a * g_mm->n + g_mm->s + t] : pos[t] + ss.rdelta;
+  if (g_mm && g_mm->rpos) ss.rdelta = (int)(rp[T - 1] - pos[T - 1]);  // the chunk's last token (text at a prompt's end)
+  stage_rpos(rp, T);
   std::vector<long long> loc64(loc.begin(), loc.end());
   long long zero = 0;
   bool hi = g_seq > 0;
@@ -1450,6 +1825,12 @@ int forward_rows(const int* sess, const int* tok, int B, int* next) {
     pos[r] = ss.seq, loc[r] = alloc_row(ss), slots[r] = ss.kslot;
   }
   if (batch_dev()) return rows_dev(sess, tok, B, pos, loc, slots, next, t_start);
+  {
+    std::vector<long long> rp((size_t)3 * B);
+    for (int a = 0; a < 3; ++a)
+      for (int r = 0; r < B; ++r) rp[(size_t)a * B + r] = pos[r] + g_sess[sess[r]].rdelta;
+    stage_rpos(rp, B);
+  }
   std::vector<long long> loc64(loc.begin(), loc.end());
   long long zero = 0;
   for (int d = 0; d < g_ndev; ++d) {
@@ -1508,6 +1889,20 @@ int run_model(int T, bool prefill, int R) {
   // embeddings -> 4 identical streams; h_mean = embedding (mean of 4 equal values is exact)
   use(dev_of(0));
   CK(ak_embed(S.ids, WG("model.language_model.embed_tokens.weight"), S.t0, T, HID, S.s));
+  if (g_mm && g_mm->row && prefill) {  // image tokens: their embedding rows replaced by the tower's output (vision.md)
+    const int* row = g_mm->row + g_mm->s;
+    for (int t = 0; t < T;) {
+      if (row[t] < 0) {
+        ++t;
+        continue;
+      }
+      int e = t + 1;
+      while (e < T && row[e] == row[e - 1] + 1) ++e;
+      CK(cudaMemcpyAsync(S.t0 + (size_t)t * HID, g_mm->emb + (size_t)row[t] * HID, (size_t)(e - t) * HID * 2,
+                         cudaMemcpyHostToDevice, S.s));
+      t = e;
+    }
+  }
   broadcast_streams<<<grid((long)T * NS * HID), 256, 0, S.s>>>(S.t0, S.H, T);
   cudaMemcpyAsync(S.hmean, S.t0, (size_t)T * HID * 2, cudaMemcpyDeviceToDevice, S.s);
   bf16 *H = S.H, *Hn = S.H2, *hm = S.hmean, *hmn = S.hmean2;
@@ -1636,8 +2031,8 @@ bool graphs_on() {
   return on && g_ndev == 1 && NL % 2 == 0 && dev_attn() && (!m1kv::on() || m1kv::graph_safe());
 }
 int decode_body() {
-  CK(cudaMemcpyAsync(S.step_d, S.step_h, 4 * sizeof(int), cudaMemcpyHostToDevice, S.s));
-  decode_step_prep<<<1, 1, 0, S.s>>>(S.step_d, S.ids, S.pos, S.loc, S.outloc, S.r2t, S.rng);
+  CK(cudaMemcpyAsync(S.step_d, S.step_h, 5 * sizeof(int), cudaMemcpyHostToDevice, S.s));
+  decode_step_prep<<<1, 1, 0, S.s>>>(S.step_d, S.ids, S.pos, S.loc, S.outloc, S.r2t, S.rng, S.rpos, S.rmax);
   engram_rows_extend<<<1, 128, 0, S.s>>>(S.ids, S.pos, 1, S.prev, S.r2, S.r3);
   engram_prev_update<<<1, 1, 0, S.s>>>(S.ids, S.pos, 1, S.prev);
   CK(plan_decode_attention());
@@ -1651,7 +2046,7 @@ int decode1(int token, int* next) {
   if ((int)g_free.size() < pages_needed(ss, 1)) return (int)cudaErrorMemoryAllocation;
   const int loc = alloc_row(ss);
   use(0);
-  S.step_h[0] = token, S.step_h[1] = g_seq, S.step_h[2] = loc, S.step_h[3] = 0;
+  S.step_h[0] = token, S.step_h[1] = g_seq, S.step_h[2] = loc, S.step_h[3] = 0, S.step_h[4] = ss.rdelta;
   const bool far = g_seq + 1 > WIN;
   // INT8 dense KV: the step's tile count is part of the graph (a new graph every TILE positions)
   const int d8t = m1d8::on() ? (g_seq + 1 + m1d8::TILE - 1) / m1d8::TILE : 0;
@@ -1763,20 +2158,21 @@ int mtp_steps() {
   return n < 1 ? 1 : (n > kSpecT - 1 ? kSpecT - 1 : n);
 }
 int verify_body(int T, bool draft) {
-  CK(cudaMemcpyAsync(S.step_d, S.step_h, 32 * sizeof(int), cudaMemcpyHostToDevice, S.s));
+  CK(cudaMemcpyAsync(S.step_d, S.step_h, kStepInts * sizeof(int), cudaMemcpyHostToDevice, S.s));
   if (draft) {
     if (m1draft::ready()) CK(m1draft::propose(draft_target(), S.step_d));  // writes the 7 drafts into the staged tokens
     apply_hint<<<1, 32, 0, S.s>>>(S.step_d);
     // MTP chain (hybrid drafting: host proposal, then MTP through it, then the DFlash2 drafts in the slots beyond)
     if (m1mtp::ready()) CK(m1mtp::propose(draft_target(), S.step_d, mtp_steps()));
   }
-  verify_step_prep<<<1, kSpecT, 0, S.s>>>(S.step_d, S.ids, S.pos, S.loc, S.outloc, S.r2t, S.rng);
+  verify_step_prep<<<1, kSpecT, 0, S.s>>>(S.step_d, S.ids, S.pos, S.loc, S.outloc, S.r2t, S.rng, S.rpos, S.rmax);
   engram_rows_extend<<<1, 128, 0, S.s>>>(S.ids, S.pos, T, S.prev, S.r2, S.r3);
   CK(plan_verify(T));
   CK(run_model(T, false));
-  if (g_temp > 0.f)
-    accept_sampled<<<1, 1024, 0, S.s>>>(S.big0, VOCAB, VOCAB_VALID, S.ids, T, g_temp, S.step_d, S.vres);
-  else
+  if (g_temp > 0.f) {  // sampled accept over the request's filtered distribution (temperature, top-k / top-p / min-p)
+    samp_pos<<<T, 1024, 0, S.s>>>(S.big0, VOCAB, VOCAB_VALID, S.ids, T, S.step_d + 32, 0, S.tok, S.samp_scr);
+    samp_chain<<<1, 32, 0, S.s>>>(S.ids, 1, T, S.samp_scr, S.vres, 0);
+  } else
     accept_greedy<<<1, 1, 0, S.s>>>(S.ids, S.tok, T, S.vres);
   CK(spec_commit());
   if (m1draft::ready() && g_capture)  // drafter context of the committed tokens
@@ -1814,6 +2210,9 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
   int rows[kSpecT];
   for (int t = 0; t < T; ++t) rows[t] = alloc_row(ss);
   S.step_h[0] = T, S.step_h[1] = g_seq, S.step_h[18] = g_spec_step++, S.step_h[19] = g_seed;
+  memcpy(&S.step_h[32], &g_temp, 4), S.step_h[33] = g_topk, memcpy(&S.step_h[34], &g_topp, 4), memcpy(&S.step_h[35], &g_minp, 4);
+  S.step_h[36] = S.step_h[19], S.step_h[37] = S.step_h[18];  // samp_pos parameter block: seed, step
+  S.step_h[kStepDelta] = ss.rdelta;
   S.step_h[20] = draft ? g_hint_n : 0;
   for (int t = 0; t < kSpecT - 1; ++t) S.step_h[21 + t] = t < g_hint_n ? g_hint[t] : 0;
   g_hint_n = 0;
@@ -1910,7 +2309,7 @@ int verify_body_b(int B) {
   CK(cudaMemcpyAsync(S.bv_d, S.bv_h, (size_t)B * kRI * sizeof(int), cudaMemcpyHostToDevice, S.s));
   CK(m1draft::propose_b(draft_target(), B, S.bv_d));  // drafts into each record [3..9]
   bv_apply_hint<<<B, 32, 0, S.s>>>(S.bv_d);
-  bv_prep<<<B, 32, 0, S.s>>>(S.bv_d, S.Wctx, S.ids, S.pos, S.loc, S.outloc, S.bv_rng, S.bv_slot, g_TV);
+  bv_prep<<<B, 32, 0, S.s>>>(S.bv_d, S.Wctx, S.ids, S.pos, S.loc, S.outloc, S.bv_rng, S.bv_slot, g_TV, S.rpos, S.rmax);
   bv_engram<<<B, 32, 0, S.s>>>(S.bv_d, S.ids, S.pos, S.r2, S.r3, g_TV);
   bv_r2t_stage<<<grid((long)B * S.Wctx), 256, 0, S.s>>>(S.bv_d, B, S.Wctx, S.r2t_b);
   if (!m1kv::on()) {  // all-GPU pools: every query its own request, over the B staged slot maps
@@ -1921,7 +2320,9 @@ int verify_body_b(int B) {
   const int e = run_model(R, false);
   g_BV = 0;
   if (e) return e;
-  bv_accept<<<1, 32, 0, S.s>>>(S.ids, S.tok, B, S.bv_res, g_TV);
+  // per sequence: greedy accept, or the sampled accept over its filtered distribution (record [34..39], 1.0.1)
+  samp_pos<<<B * g_TV, 1024, 0, S.s>>>(S.big0, VOCAB, VOCAB_VALID, S.ids, g_TV, S.bv_d + 34, kRI, S.tok, S.samp_scr);
+  samp_chain<<<1, 32, 0, S.s>>>(S.ids, B, g_TV, S.samp_scr, S.bv_res, kBVRes);
   CK(spec_commit_b(B));
   if (m1draft::ready() && g_capture) CK(m1draft::materialize_b(draft_target(), S.cap, B, S.bv_res, kBVRes, S.pos, S.bv_d, g_TV));
   return (int)cudaMemcpyAsync(S.bv_res_h, S.bv_res, (size_t)B * kBVRes * sizeof(int), cudaMemcpyDeviceToHost, S.s);
@@ -1965,6 +2366,9 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
     for (int t = 0; t < r[26]; ++t) r[27 + t] = hint[b * (kSpecT - 1) + t];
     for (int t = 0; t < TV; ++t) r[10 + t] = alloc_row(ss);
     r[18] = ss.kslot, r[19] = ss.kslot < m1draft::rings() ? ss.kslot : 0;
+    memcpy(r + 34, &ss.samp_t, 4), r[35] = ss.samp_k, memcpy(r + 36, &ss.samp_p, 4), memcpy(r + 37, &ss.samp_minp, 4);
+    r[38] = ss.samp_seed, r[39] = ss.samp_step++;
+    r[kRecDelta] = ss.rdelta;
     put_ptr(r + 20, ss.r2t[0]), put_ptr(r + 22, ss.prev[0]);
     if (ss.seq < ss.cache_seq) ss.cache_epoch = ++g_cache_epoch;
     ss.cache_seq = ss.seq;
@@ -1976,8 +2380,16 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
   g_lin = g_lin_w4 = 0;
   std::vector<long long> key{B, TV, rkey};
   const bool tiered = m1kv::on() || m1d8::on();
+  // INT8 dense KV: the dense layer's attention bakes its tile count (ceil((seq + TV) / TILE), from the host seq) into
+  // the graph, so it is part of the key as in the single-sequence verify (r101 fix: a graph captured for a session at
+  // fewer tiles was replayed for a later session with the same (session, slot) and a longer context -> its last tile
+  // was not attended; m1-spec-batch at batch 2, agent_20k after long_12k)
   if (tiered)
-    for (int b = 0; b < B; ++b) key.push_back(sess[b]), key.push_back(g_sess[sess[b]].kslot);
+    for (int b = 0; b < B; ++b) {
+      const Session& ss = g_sess[sess[b]];
+      key.push_back(sess[b]), key.push_back(ss.kslot);
+      key.push_back(m1d8::on() ? (ss.seq + TV + m1d8::TILE - 1) / m1d8::TILE : 0);
+    }
   auto it = g_bvgraphs.find(key);
   int e = 0;
   if (it != g_bvgraphs.end()) {
@@ -2061,7 +2473,8 @@ std::map<std::pair<int, int>, cudaGraphExec_t> g_bgraphs;
 std::map<std::pair<int, int>, int> g_bwarm;
 int batch_body(int Bp, bool far) {
   CK(cudaMemcpyAsync(S.bstep_d, S.bstep_h, (size_t)Bp * kBRec * sizeof(int), cudaMemcpyHostToDevice, S.s));
-  batch_step_prep<<<1, 32, 0, S.s>>>(S.bstep_d, Bp, S.ids, S.pos, S.loc, S.outloc, S.slots_b, S.rng_b, S.r2, S.r3);
+  batch_step_prep<<<1, 32, 0, S.s>>>(S.bstep_d, Bp, S.ids, S.pos, S.loc, S.outloc, S.slots_b, S.rng_b, S.r2, S.r3, S.rpos,
+                                     S.rmax);
   batch_r2t_stage<<<grid((long)Bp * S.Wctx), 256, 0, S.s>>>(S.bstep_d, Bp, S.Wctx, S.r2t_b);
   CK(m1kv::prep_rows(0, S.slots_b, Bp, S.s));
   S.slot = S.slots_b;
@@ -2088,10 +2501,12 @@ int rows_dev(const int* sess, const int* tok, int B, const std::vector<long long
       const Session& ss = g_sess[sess[r]];
       q[0] = tok[r], q[1] = (int)pos[r], q[2] = loc[r], q[3] = slots[r];
       put_ptr(q + 4, ss.r2t[0]), put_ptr(q + 6, ss.prev[0]);
+      q[8] = ss.rdelta, q[9] = 0;
       far |= pos[r] + 1 > WIN;
     } else {
       q[0] = 0, q[1] = 3, q[2] = g_pad_row, q[3] = -1;  // KDA slot -1: the KDA kernels skip the row
       put_ptr(q + 4, S.dummy_r2t), put_ptr(q + 6, S.dummy_prev);
+      q[8] = 0, q[9] = 0;
     }
   }
   g_lin = g_lin_w4 = 0;
@@ -2190,6 +2605,7 @@ int ak_m1_init(int Wctx, const char* mixers, int engram_a, int engram_b, void* e
   if (const char* e = getenv("AGENS_M1_W4_BATCH_MAX")) g_w4_batch_max = std::max(1, std::min(128, atoi(e)));
   if (const char* e = getenv("AGENS_M1_W4_NUMERICS")) g_w4_bf16w = !strcmp(e, "marlin");
   if (const char* e = getenv("AGENS_M1_BATCH_INVARIANT")) g_binv = e[0] && e[0] != '0';
+  if (const char* e = getenv("AGENS_M1_BI")) g_bi = e[0] == '1';  // also when set after load (agens serve server mode)
   if (const char* e = getenv("AGENS_M1_PREFILL_CHUNK")) g_chunk = std::max(64, std::min(CHUNK, atoi(e)));
   if (const char* e = getenv("AGENS_M1_W4_TILE_MB")) g_w4_tile_bytes = (size_t)std::max(0, atoi(e)) << 20;
   const int rows = (pool_rows > 0 ? pool_rows : Wctx) & ~3;  // whole pages
@@ -2283,12 +2699,15 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
   S.y = dalloc<bf16>(T * HID), S.t0 = dalloc<bf16>(T * HID), S.t1 = dalloc<bf16>(T * KHV_FULL * KK);
   S.t2 = dalloc<bf16>(T * QH_FULL * HD), S.t3 = dalloc<bf16>(T * std::max(2 * KH_FULL * KK + KHV_FULL * KK, QH_FULL * HD));
   S.gu = dalloc<bf16>(T * 2 * INTER_FULL), S.act = dalloc<bf16>(T * INTER_FULL);
-  S.big0 = dalloc<bf16>(std::max(T * QH_FULL * 2 * HD, (size_t)VOCAB)), S.big1 = dalloc<bf16>(T * KHV_FULL * KK);
+  S.big0_elems = std::max(T * QH_FULL * 2 * HD, (size_t)VOCAB);
+  S.big0 = dalloc<bf16>(S.big0_elems), S.big1 = dalloc<bf16>(T * KHV_FULL * KK);
   S.q = dalloc<bf16>(T * QH_FULL * HD), S.gate = dalloc<bf16>(T * QH_FULL * HD), S.k = dalloc<bf16>(T * KVH_FULL * HD);
   S.v = dalloc<bf16>(T * KVH_FULL * HD), S.o = dalloc<bf16>(T * QH_FULL * HD), S.qi = dalloc<bf16>(T * IDXH * IDXD);
   S.ik = dalloc<bf16>(T * IDXD), S.e = dalloc<bf16>(T * 2 * ENG_DIM), S.eg = dalloc<bf16>(T);
   S.lse = dalloc<float>(T * QH_FULL);
   S.pos = dalloc<long long>(T), S.reqs = dalloc<long long>(1), S.r2 = dalloc<long long>(T), S.r3 = dalloc<long long>(T);
+  S.rmax = (int)std::max<size_t>({T, (size_t)kMaxBatch, (size_t)kMaxBV * kSpecT, (size_t)kSpecT});
+  S.rpos = dalloc<long long>((size_t)3 * S.rmax);
   S.outloc = dalloc<long long>(T);
   S.loc = dalloc<int>(T), S.ids = dalloc<int>(T), S.qo_dev = dalloc<int>(2), S.kv_indptr = dalloc<int>(2);
   S.kv_idx = dalloc<int>(Wctx), S.last1 = dalloc<int>(1), S.tok = dalloc<int>(kMaxBatch > kSpecT ? kMaxBatch : kSpecT);
@@ -2302,10 +2721,12 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
     cudaMemcpy(S.dummy_r2t, trash.data(), (size_t)Wctx * 4, cudaMemcpyHostToDevice);
   }
   CK(cudaMallocHost(&S.bstep_h, kMaxBatch * kBRec * sizeof(int)));
-  S.step_d = dalloc<int>(32), S.rng = dalloc<int>(4 * kSpecT);  // decode uses [0..3]; speculative verify the rest
+  S.step_d = dalloc<int>(kStepInts), S.rng = dalloc<int>(4 * kSpecT);  // decode uses [0..3]; speculative verify the rest
+  S.samp_scr = dalloc<int>(16 * kMaxBV);
   for (int i = 0; i < NL; ++i)
     if (kMixer[i] == 'b' && dev_of(i) == my && !S.far_ws) S.far_ws = dalloc<char>(ak_far_decode_ws_bytes(Wctx));
-  CK(cudaMallocHost(&S.step_h, 32 * sizeof(int)));
+  CK(cudaMallocHost(&S.step_h, kStepInts * sizeof(int)));
+  memset(S.step_h, 0, kStepInts * sizeof(int));
   CK(cudaMallocHost(&S.tok_h, kMaxBatch * sizeof(int)));
   {
     auto it = W.find("rope.cos_sin_cache." + std::to_string(S.dev));
@@ -2327,6 +2748,49 @@ int ak_m1_prefill(const int* ids, int n, int* next) {
     if (release) ak_bridge_torch_reserved(1);  // AGENS_M1_TORCH_RELEASE=1: the far-extend temporaries back each chunk
   }
   return 0;
+}
+
+// Prefill with image inputs: rpos3 [3][n] int64 rope positions (MRoPE rows T, H, W; null = position +
+// the session's rope delta), emb [rows][HID] bf16 host (the vision tower's output), emb_row [n] (-1 = the token's own
+// embedding, else its row of emb). Chunked like ak_m1_prefill; the session's rope delta afterwards = that of the last
+// token (text at the end of a prompt).
+int ak_m1_prefill_mm(const int* ids, int n, const long long* rpos3, const void* emb, const int* emb_row, int* next) {
+  if (g_ndev != 1 && emb_row) return (int)cudaErrorNotSupported;  // the embedding rows go to device 0 only
+  MmIn m{rpos3, (const bf16*)emb, emb_row, n, 0};
+  g_mm = (rpos3 || emb_row) ? &m : nullptr;
+  int e = 0;
+  for (int s = 0; s < n && !e; s += g_chunk) {
+    m.s = s;
+    e = forward(ids + s, std::min(g_chunk, n - s), true, next);
+  }
+  g_mm = nullptr;
+  return e;
+}
+int ak_m1_rope_delta() { return g_sess[g_cur].rdelta; }
+int ak_m1_set_rope_delta(int d) {
+  g_sess[g_cur].rdelta = d;
+  return 0;
+}
+// vision tower (kernels/oracle/bridge/vision.cpp) on device 0's stream
+int ak_m1_vis_register(const char* name, void* host, const long long* shape, int ndim) {
+  return ak_vis_register(name, host, shape, ndim);
+}
+int ak_m1_vis_ready() { return ak_vis_ready(); }
+int ak_m1_vis_encode(const uint8_t* rgb, const uint8_t* jpeg, long long jlen, int h, int w, int rh, int rw, void* out) {
+  use(0);
+  return ak_vis_encode(rgb, jpeg, jlen, h, w, rh, rw, out, S.s);
+}
+int ak_m1_vis_pixels(const uint8_t* rgb, const uint8_t* jpeg, long long jlen, int h, int w, int rh, int rw, float* out) {
+  use(0);
+  return ak_vis_pixels(rgb, jpeg, jlen, h, w, rh, rw, out, S.s);
+}
+int ak_m1_vis_encode_pixels(const float* pv, int gh, int gw, void* out) {
+  use(0);
+  return ak_vis_encode_pixels(pv, gh, gw, out, S.s);
+}
+long long ak_m1_vis_peak_bytes() {
+  use(0);
+  return ak_vis_peak_bytes();
 }
 
 // Speculative decoding setup (one device): batch-invariant decode on (bi = 1; decode and verify then share
@@ -2393,9 +2857,10 @@ long long ak_m1_mtp_setup(int max_rows, int window) {
   return (long long)m1mtp::bytes();
 }
 // Sampled speculative accept: temperature (0 = greedy) and seed (Philox stream per step and position).
-int ak_m1_spec_sampling(float temperature, int seed) {
+int ak_m1_spec_sampling(float temperature, int top_k, float top_p, float min_p, int seed) {
   const float t = temperature > 0.f ? temperature : 0.f;
-  if (t != g_temp) {  // the accept rule and temperature are baked into the verify graphs
+  g_topk = top_k > 0 ? top_k : 0, g_topp = top_p > 0.f && top_p < 1.f ? top_p : 1.f, g_minp = min_p > 0.f ? min_p : 0.f;
+  if ((t > 0.f) != (g_temp > 0.f)) {  // the accept rule (greedy / sampled) is baked into the verify graphs; its parameters are data
     for (auto& g : g_vgraphs)
       for (auto ex : g.second) cudaGraphExecDestroy(ex);
     g_vgraphs.clear(), g_vwarm.clear();
@@ -2439,6 +2904,13 @@ int ak_m1_spec_batch_init(int max_b) {
   use(0);
   if (max_b < 1 || max_b > kMaxBV || S.kst.empty()) return (int)cudaErrorInvalidValue;
   if (S.bv_max >= max_b) return 0;
+  // the verify's logits land in big0 ([rows][VOCAB]): B x 8 rows exceed a 1024-token chunk's scratch from B = 7
+  // (1.0.0 wrote past it at the 48gb profile's B = 16 with tiered KV -- into other per-step scratch, by luck)
+  if ((size_t)max_b * kSpecT * VOCAB > S.big0_elems) {
+    cudaFree(S.big0);
+    S.big0_elems = (size_t)max_b * kSpecT * VOCAB;
+    if (!(S.big0 = dalloc<bf16>(S.big0_elems))) return (int)cudaErrorMemoryAllocation;
+  }
   for (bf16* p : S.kstb) cudaFree(p);
   S.kstb.assign(NL, nullptr);
   const size_t MR = (size_t)max_b * kSpecT;
@@ -2455,6 +2927,15 @@ int ak_m1_spec_batch_init(int max_b) {
   return (int)cudaDeviceSynchronize();
 }
 int ak_m1_spec_batch_max() { return SD[0].bv_max; }
+// the sampling of a session's batched verify steps (its own Philox stream: seed, step from 0); temperature 0 = greedy
+int ak_m1_session_sampling(int sess, float temperature, int top_k, float top_p, float min_p, int seed) {
+  if (sess < 0 || sess >= (int)g_sess.size() || !g_sess[sess].live) return (int)cudaErrorInvalidValue;
+  Session& ss = g_sess[sess];
+  ss.samp_t = temperature > 0.f ? temperature : 0.f, ss.samp_k = top_k > 0 ? top_k : 0;
+  ss.samp_p = top_p > 0.f && top_p < 1.f ? top_p : 1.f, ss.samp_minp = min_p > 0.f ? min_p : 0.f;
+  ss.samp_seed = seed, ss.samp_step = 0;
+  return 0;
+}
 // One batched step: sequence b = session sess[b] with anchor bonus[b]; emitted[b * 8 ..] = its n[b] tokens.
 int ak_m1_spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n) {
   return spec_batch(sess, B, bonus, emitted, n);
@@ -2540,6 +3021,7 @@ int ak_m1_snapshot(void* dst) {
   h.n_layers = NL;
   h.seq = g_seq;
   h.kda_dim = KDIM;
+  h.reserved = g_sess[g_cur].rdelta;  // the rope delta (0 for text-only sessions: the v1 blob unchanged)
   strncpy(h.mixers, kMixer.c_str(), sizeof(h.mixers) - 1);
   use(0);
   CK(cudaMemcpyAsync(h.engram_prev, S.prev, 8, cudaMemcpyDeviceToHost, S.s));
@@ -2568,6 +3050,7 @@ int ak_m1_restore(const void* src) {
   if ((int)g_free.size() < pages_needed(ss, h.seq)) return (int)cudaErrorMemoryAllocation;
   for (int t = 0; t < h.seq; ++t) alloc_row(ss);
   g_seq = h.seq;
+  ss.rdelta = h.reserved;
   for (int d = 0; d < g_ndev; ++d) {
     use(d);
     CK(cudaMemcpy(S.prev, h.engram_prev, 8, cudaMemcpyHostToDevice));
@@ -2623,7 +3106,7 @@ int ak_m1_session_fork(int src) {
   g_cur = cur;
   if (id < 0) return -1;
   Session &a = g_sess[src], &b = g_sess[id];
-  b.seq = a.seq, b.rows = a.rows;
+  b.seq = a.seq, b.rows = a.rows, b.rdelta = a.rdelta;
   for (int k = 0; k < (int)b.rows.size(); k += 4) ++g_ref[b.rows[k] >> 2];
   int from = -1, to = -1;  // a partial last block moves to a page of the child's own (both branches append to it)
   if (part) {

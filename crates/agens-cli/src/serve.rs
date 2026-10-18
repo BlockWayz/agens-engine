@@ -26,10 +26,16 @@
 //! tokens); otherwise it starts over (a recurrent state cannot be rolled back).
 //!
 //! Memory: --budget-gib plans the KV pool from what is left after weights + scratch (plan.rs) and prints the plan.
+//!
+//! Images: a request with images carries their decoded pixels; at admission the images whose spans
+//! fall in the part to prefill are encoded (vision tower, one at a time) into pinned host memory, and every prefill
+//! chunk of the request passes its rope positions and image-embedding rows. Conversation prefixes are compared on
+//! keys that include each image's hash.
 
 use crate::sampler::{is_greedy, needs_logits, Budget, BudgetAct, Sampler};
 use agens_server::backend::{Backend, BackendError, SessionHint, TokenStream};
 use agens_server::sampling::SamplingParams;
+use agens_server::vision::MmInput;
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,31 +47,48 @@ const CHUNK: usize = 4096;
 const SPEC_T: usize = 8; // verify block (bonus + 7 drafts)
 const VOCAB_VALID: usize = 248077;
 
-/// Speculative decoding for this request: Some(temperature) (0 = greedy) when its sampling is greedy or plain
-/// temperature over the whole vocabulary, which the on-device accept rules reproduce exactly.
-fn spec_temperature(p: &SamplingParams) -> Option<f32> {
+/// The sampling a speculative verify reproduces on the device (kernels/m1 samp_pos): temperature (0 = greedy), top-k
+/// (0 = whole vocabulary), top-p, min-p -- the host sampler's filters, in its order.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct SpecSampling {
+    t: f32,
+    k: i32,
+    p: f32,
+    min_p: f32,
+}
+
+/// Speculative decoding for this request: Some(sampling) when it is greedy, or temperature sampling with any top-k /
+/// top-p / min-p (1.0.1: the on-device accept samples the same filtered distribution as the host sampler; 1.0.0 took
+/// plain temperature only, so the default generation_config -- top_k 20, top_p 0.95 -- never used the drafter).
+/// Penalties, logit bias, suppressed ids and the reasoning budget need the host sampler: no speculation.
+fn spec_sampling(p: &SamplingParams) -> Option<SpecSampling> {
     if p.reasoning_budget.is_some() {
         return None;
     }
     if !needs_logits(p, VOCAB_VALID, 0) {
-        return Some(0.0);
+        return Some(SpecSampling { t: 0.0, k: 0, p: 1.0, min_p: 0.0 });
     }
-    let plain = !is_greedy(p)
-        && p.top_k.map(|k| k == 0).unwrap_or(true)
-        && p.top_p >= 1.0
-        && p.min_p <= 0.0
+    let ok = !is_greedy(p)
         && p.logit_bias.is_empty()
         && p.repetition_penalty == 1.0
         && p.frequency_penalty == 0.0
         && p.presence_penalty == 0.0
         && (p.min_new_tokens == 0 || p.stop_token_ids.is_empty())
         && !p.suppress_tokens.iter().any(|&t| (t as usize) < VOCAB_VALID);
-    plain.then_some(p.temperature as f32)
+    ok.then_some(SpecSampling {
+        t: p.temperature as f32,
+        k: p.top_k.map(|k| k.min(i32::MAX as u32) as i32).unwrap_or(0),
+        p: p.top_p as f32,
+        min_p: p.min_p as f32,
+    })
 }
 
 struct Job {
     id: u64,
     prompt: Vec<u32>,
+    /// prefix-comparison keys of the prompt (token ids; image tokens carry their image's hash)
+    key: Vec<u64>,
+    mm: Option<Arc<MmInput>>,
     sp: SamplingParams,
     conv: Option<String>,
     tx: mpsc::Sender<Result<Vec<u32>, BackendError>>,
@@ -77,12 +100,19 @@ pub struct EngineBackend {
     next_id: AtomicU64,
 }
 
-impl Backend for EngineBackend {
-    fn generate(&self, prompt_ids: Vec<u32>, sampling: SamplingParams, session: Option<SessionHint>) -> TokenStream {
+impl EngineBackend {
+    fn submit(&self, prompt: Vec<u32>, mm: Option<Arc<MmInput>>, sampling: SamplingParams, session: Option<SessionHint>)
+              -> TokenStream {
         let (tx, rx) = mpsc::channel(256);
+        let key = match &mm {
+            Some(m) => agens_server::vision::prefix_keys(&prompt, &m.spans, &m.images),
+            None => prompt.iter().map(|&t| t as u64).collect(),
+        };
         let job = Job {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
-            prompt: prompt_ids,
+            prompt,
+            key,
+            mm,
             sp: sampling,
             conv: session.map(|s| s.session_id),
             tx: tx.clone(),
@@ -91,6 +121,19 @@ impl Backend for EngineBackend {
             let _ = tx.try_send(Err(BackendError("engine thread is gone".into())));
         }
         rx
+    }
+}
+
+impl Backend for EngineBackend {
+    fn generate(&self, prompt_ids: Vec<u32>, sampling: SamplingParams, session: Option<SessionHint>) -> TokenStream {
+        self.submit(prompt_ids, None, sampling, session)
+    }
+    fn supports_images(&self) -> bool {
+        crate::m1::VISION.load(Ordering::Relaxed)
+    }
+    fn generate_mm(&self, prompt_ids: Vec<u32>, mm: Arc<MmInput>, sampling: SamplingParams,
+                   session: Option<SessionHint>) -> TokenStream {
+        self.submit(prompt_ids, Some(mm), sampling, session)
     }
     fn context_length(&self) -> usize {
         self.ctx
@@ -107,15 +150,22 @@ impl Drop for HostBuf {
 
 struct Conv {
     main: i32,
-    held: Vec<u32>,
+    held: Vec<u64>, // prefix keys of what the main session holds
     parked: Option<HostBuf>,
     busy: bool,
     last: Instant,
 }
 
+/// Image inputs of a prefill feed: rope positions [3][feed len], embedding rows per feed token (-1 = text).
+struct MmFeed {
+    rpos: Vec<i64>,
+    rows: Vec<i32>,
+    emb: crate::mm::HostEmb,
+}
+
 enum Phase {
     /// prefilling `feed` into `sess`; then fork (conversation) or decode
-    Prefill { sess: i32, feed: Vec<i32>, done: usize },
+    Prefill { sess: i32, feed: Vec<i32>, done: usize, mm: Option<MmFeed> },
     /// prefill the prompt's last token on the conversation's fork
     Last { fork: i32 },
     Decode { sess: i32, last: i32 },
@@ -126,16 +176,22 @@ struct Act {
     phase: Phase,
     produced: usize,
     sampler: Sampler,
-    spec: Option<f32>, // speculative decoding at this temperature
+    spec: Option<SpecSampling>, // speculative decoding with this sampling
     fed: Vec<u32>,     // tokens fed to the session after the prompt (--no-fork: what the session holds)
     t0: Instant,
     lk: Option<crate::lookup::Lookup>, // copy-from-context proposals (hybrid drafting), built at the first verify
+    bset: bool,                         // its session's batched-verify sampling is set (server mode)
+    vsteps: u64,                        // verify steps of this request (bs = 1 or batched) (AGENS_SERVE_REQ_STATS=1 log)
 }
 
 /// The request's lookup index (prompt + the bonus token), built on first use.
-fn lookup_of<'a>(lk: &'a mut Option<crate::lookup::Lookup>, prompt: &[u32], last: i32) -> &'a mut crate::lookup::Lookup {
+fn lookup_of<'a>(lk: &'a mut Option<crate::lookup::Lookup>, prompt: &[u32], last: i32, copy: bool)
+                 -> &'a mut crate::lookup::Lookup {
     lk.get_or_insert_with(|| {
         let mut l = crate::lookup::Lookup::new();
+        if copy {
+            l = l.copy_only();
+        }
         let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
         l.reset(&ids);
         l.extend(&[last]);
@@ -153,7 +209,8 @@ struct Engine {
     stats: (u64, u64, f64), // decode steps, row-steps, decode seconds
     bstats: (u64, u64, f64, u64), // batched speculation since the last report: steps, tokens, seconds, sequences
     pstats: (u64, f64, Option<Instant>), // prefill chunks + seconds since the last report, and when it began
-    spec: bool,             // a drafter is loaded (personal mode)
+    spec: bool,             // a drafter is loaded (personal mode), or copy-only drafting
+    copy: bool,             // copy-only drafting (--spec-copy 1 without a drafter); sampled requests decode on the host without a proposal
     fork: bool,             // conversations generate on a fork of their main session (false: --no-fork)
 }
 
@@ -217,7 +274,7 @@ impl Engine {
         let ids: Vec<i32> = job.prompt.iter().map(|&t| t as i32).collect();
         // a conversation that is not busy: reuse its main session if its tokens prefix the prompt
         let conv = job.conv.clone().filter(|k| self.convs.get(k).map(|c| !c.busy).unwrap_or(true));
-        let reuse = conv.as_ref().and_then(|k| self.convs.get(k)).map(|c| c.held.len() < n && job.prompt.starts_with(&c.held));
+        let reuse = conv.as_ref().and_then(|k| self.convs.get(k)).map(|c| c.held.len() < n && job.key.starts_with(&c.held));
         let held = match (&conv, reuse) {
             (Some(k), Some(true)) => self.convs[k].held.len(),
             _ => 0,
@@ -240,10 +297,11 @@ impl Engine {
         if let Some(n) = job.sp.reasoning_budget {
             sampler.budget = Some(Budget::new(n, job.sp.reasoning_budget_soft_bias, &job.prompt, self.think.0, self.think.1));
         }
-        let spec = if self.spec { spec_temperature(&job.sp) } else { None };
+        let spec = if self.spec { spec_sampling(&job.sp) } else { None };
         let t0 = Instant::now();
         let mk = |phase| Act {
-            job: Job { id: job.id, prompt: job.prompt.clone(), sp: job.sp.clone(), conv: conv.clone(), tx: job.tx.clone() },
+            job: Job { id: job.id, prompt: job.prompt.clone(), key: job.key.clone(), mm: job.mm.clone(), sp: job.sp.clone(),
+                       conv: conv.clone(), tx: job.tx.clone() },
             phase,
             produced: 0,
             sampler,
@@ -251,10 +309,16 @@ impl Engine {
             fed: Vec::new(),
             t0,
             lk: None,
+            bset: false,
+            vsteps: 0,
         };
         let Some(k) = conv.clone() else {
+            let mm = match Self::mm_feed(job, 0, n) {
+                Ok(m) => m,
+                Err(e) => return Ok(Admit::Fail(format!("{e:#}"))),
+            };
             let s = m1::session_new()?;
-            return Ok(Admit::Ok(mk(Phase::Prefill { sess: s, feed: ids, done: 0 })));
+            return Ok(Admit::Ok(mk(Phase::Prefill { sess: s, feed: ids, done: 0, mm })));
         };
         if reuse != Some(true) {
             if let Some(old) = self.convs.remove(&k) {
@@ -263,16 +327,43 @@ impl Engine {
             let main = m1::session_new()?;
             self.convs.insert(k.clone(), Conv { main, held: Vec::new(), parked: None, busy: false, last: Instant::now() });
         }
+        // fork: the main session takes the prompt but its last token (that one goes to the fork); no fork: all of it
+        let end = if self.fork { n - 1 } else { n };
+        let from = self.convs[&k].held.len();
+        let mm = match Self::mm_feed(job, from, end) {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(old) = self.convs.remove(&k) {
+                    self.free_session(old.main)?;
+                }
+                return Ok(Admit::Fail(format!("{e:#}")));
+            }
+        };
         let c = self.convs.get_mut(&k).unwrap();
         if let Some(buf) = c.parked.take() {
             m1::session_unpark(c.main, buf.0)?;
         }
         c.busy = true;
-        // fork: the main session takes the prompt but its last token (that one goes to the fork); no fork: all of it
-        let end = if self.fork { n - 1 } else { n };
-        let feed = ids[c.held.len()..end].to_vec();
-        c.held = job.prompt[..end].to_vec();
-        Ok(Admit::Ok(mk(Phase::Prefill { sess: c.main, feed, done: 0 })))
+        let feed = ids[from..end].to_vec();
+        c.held = job.key[..end].to_vec();
+        Ok(Admit::Ok(mk(Phase::Prefill { sess: c.main, feed, done: 0, mm })))
+    }
+
+    /// The image inputs of prompt[from..to): the images whose spans overlap it are encoded now.
+    fn mm_feed(job: &Job, from: usize, to: usize) -> Result<Option<MmFeed>> {
+        let Some(mm) = &job.mm else { return Ok(None) };
+        let which: Vec<bool> = (0..mm.images.len())
+            .map(|i| mm.spans.iter().any(|sp| sp.image == i && sp.start < to && sp.start + sp.len > from))
+            .collect();
+        let t = Instant::now();
+        let emb = crate::mm::encode(&mm.images, &which)?;
+        if which.iter().any(|&w| w) {
+            eprintln!("serve: request {} encoded {} image(s), {} image tokens, in {:.2} s", job.id,
+                      which.iter().filter(|&&w| w).count(), emb.rows, t.elapsed().as_secs_f64());
+        }
+        let n = job.prompt.len();
+        let rp = agens_server::vision::rope_positions(n, &mm.spans, &mm.images);
+        Ok(Some(MmFeed { rpos: crate::mm::rope_slice(&rp, n, from, to), rows: crate::mm::emb_rows(from, to, &mm.spans, &emb), emb }))
     }
 
     /// The token of a row: the reasoning budget may force one; otherwise the GPU argmax for plain greedy rows, else the
@@ -323,7 +414,7 @@ impl Engine {
                 c.busy = false;
                 c.last = Instant::now();
                 if !self.fork {
-                    c.held.extend_from_slice(&act.fed); // the session generated in place
+                    c.held.extend(act.fed.iter().map(|&t| t as u64)); // the session generated in place
                 }
             }
             while self.convs.len() > self.max_convs {
@@ -377,14 +468,20 @@ impl Engine {
             if let Some(i) = acts.iter().position(|a| !matches!(a.phase, Phase::Decode { .. })) {
                 let a = &mut acts[i];
                 match &mut a.phase {
-                    Phase::Prefill { sess, feed, done } => {
+                    Phase::Prefill { sess, feed, done, mm } => {
                         let s = *sess;
                         m1::session_use(s)?;
                         let end = (*done + CHUNK).min(feed.len());
                         let mut greedy = 0;
                         if end > *done {
                             let tp = Instant::now();
-                            greedy = m1::prefill(&feed[*done..end])?;
+                            greedy = match mm {
+                                Some(f) => {
+                                    let rp = crate::mm::rope_slice(&f.rpos, feed.len(), *done, end);
+                                    m1::prefill_mm(&feed[*done..end], Some(&rp), Some((f.emb.as_ptr(), &f.rows[*done..end])))?
+                                }
+                                None => m1::prefill(&feed[*done..end])?,
+                            };
                             self.pstats.0 += 1;
                             self.pstats.1 += tp.elapsed().as_secs_f64();
                         }
@@ -427,12 +524,23 @@ impl Engine {
                 (0..acts.len()).filter(|&i| matches!(acts[i].phase, Phase::Decode { .. }) && !done_ids.contains(&acts[i].job.id)).collect();
             // server mode with the drafter (batched speculation): greedy rows verify together, one step for all
             let bspec = agens_cuda::m1::spec_batch_max();
-            let spec_rows: Vec<usize> = if rows.len() > 1 && bspec > 0 {
-                rows.iter().copied().filter(|&i| acts[i].spec == Some(0.0)).take(bspec).collect()
+            // (1.0.1) sampled rows too, each on its own filtered distribution and Philox stream; a sampled row verifies
+            // batched even alone (its sample stream lives in its session), a lone greedy row takes the bs = 1 step
+            let spec_rows: Vec<usize> = if bspec > 0 {
+                rows.iter().copied().filter(|&i| acts[i].spec.is_some()).take(bspec).collect()
             } else {
                 Vec::new()
             };
-            let rows: Vec<usize> = if spec_rows.len() > 1 {
+            let batched = spec_rows.len() > 1 || spec_rows.iter().any(|&i| acts[i].spec.map_or(false, |s| s.t > 0.0));
+            for &i in &spec_rows {
+                let a = &mut acts[i];
+                if batched && !a.bset {
+                    let (Phase::Decode { sess, .. }, Some(s)) = (&a.phase, a.spec) else { unreachable!() };
+                    m1::session_sampling(*sess, s.t, s.k, s.p, s.min_p, a.job.sp.seed.unwrap_or(a.job.id) as i32)?;
+                    a.bset = true;
+                }
+            }
+            let rows: Vec<usize> = if batched {
                 let (sess, last): (Vec<i32>, Vec<i32>) = spec_rows
                     .iter()
                     .map(|&i| match acts[i].phase {
@@ -445,7 +553,7 @@ impl Engine {
                     .zip(&last)
                     .map(|(&i, &l)| {
                         let a = &mut acts[i];
-                        lookup_of(&mut a.lk, &a.job.prompt, l).propose()
+                        lookup_of(&mut a.lk, &a.job.prompt, l, false).propose()
                     })
                     .collect();
                 let td = Instant::now();
@@ -469,6 +577,7 @@ impl Engine {
                 self.bstats.3 += sess.len() as u64;
                 for (j, &i) in spec_rows.iter().enumerate() {
                     let a = &mut acts[i];
+                    a.vsteps += 1;
                     a.fed.push(last[j] as u32);
                     a.fed.extend(em[j][..em[j].len() - 1].iter().map(|&t| t as u32));
                     for &t in &em[j] {
@@ -504,11 +613,24 @@ impl Engine {
                 m1::session_use(sess)?;
                 if a.produced == 1 {
                     // first verify step of the request: accept rule, seed, and the step counter of its sample stream
-                    m1::spec_sampling(a.spec.unwrap(), a.job.sp.seed.unwrap_or(a.job.id) as i32)?;
+                    let s = a.spec.unwrap();
+                    m1::spec_sampling_filtered(s.t, s.k, s.p, s.min_p, a.job.sp.seed.unwrap_or(a.job.id) as i32)?;
                 }
-                let hint = lookup_of(&mut a.lk, &a.job.prompt, last).propose();
+                let copy = self.copy;
+                let l = lookup_of(&mut a.lk, &a.job.prompt, last, copy);
+                let hint = l.propose();
                 let td = Instant::now();
-                let (em, _) = if hint.is_empty() { m1::spec_step(last)? } else { m1::spec_step_hint(last, &hint)? };
+                let em = if copy && hint.is_empty() && a.spec.map_or(false, |s| s.t > 0.0) {
+                    // copy-only drafting, no proposal, sampled request: a plain decode step sampled on the host
+                    let g = m1::decode(last)?;
+                    vec![Self::choose(a, g, 0)?]
+                } else if copy {
+                    crate::lookup::copy_step(last, &hint)?
+                } else if hint.is_empty() {
+                    m1::spec_step(last)?.0
+                } else {
+                    m1::spec_step_hint(last, &hint)?.0
+                };
                 if let Some(l) = a.lk.as_mut() {
                     l.record(&em);
                 }
@@ -517,6 +639,7 @@ impl Engine {
                 self.stats.0 += 1;
                 self.stats.1 += em.len() as u64;
                 self.stats.2 += td.elapsed().as_secs_f64();
+                a.vsteps += 1;
                 for &t in &em {
                     if let Phase::Decode { last, .. } = &mut a.phase {
                         *last = t;
@@ -580,6 +703,11 @@ impl Engine {
             for i in (0..acts.len()).rev() {
                 if done_ids.contains(&acts[i].job.id) || acts[i].job.tx.is_closed() {
                     let a = acts.swap_remove(i);
+                    if a.vsteps > 0 && std::env::var("AGENS_SERVE_REQ_STATS").map_or(false, |v| v == "1") {
+                        // per-request acceptance (benchmarks): tokens generated, verify steps
+                        eprintln!("serve: request {} done: prompt {} tokens, {} new tokens, {} verify steps",
+                                  a.job.id, a.job.prompt.len(), a.produced, a.vsteps);
+                    }
                     self.finish(a)?;
                 }
             }
@@ -589,7 +717,7 @@ impl Engine {
 
 pub fn run(args: &[String]) -> Result<()> {
     let usage = "agens serve <ckpt_dir> [--model-dir DIR] [--host 0.0.0.0] [--port 30000] [--served-model-name NAME] \
-                 [--mode personal|server] [--max-batch 8] [--max-convs 64] [--budget-gib N] [--spec-drafter DIR] [--no-fork 1] \
+                 [--mode personal|server] [--max-batch 8] [--max-convs 64] [--budget-gib N] [--spec-drafter DIR] [--spec-copy 1] [--no-fork 1] \
                  [m1 flags: --wctx --pool --sessions --gpu-gib --device]";
     let ckpt = args.first().context(usage)?.clone();
     let (mut model_dir, mut host, mut port, mut name) = (ckpt.clone(), "0.0.0.0".to_string(), 30000u16, None);
@@ -623,16 +751,22 @@ pub fn run(args: &[String]) -> Result<()> {
                 bail!("--max-batch must be 1..16");
             }
             std::env::set_var("AGENS_M1_BATCH_INVARIANT", "1");
+            // one set of numerics for server mode, with or without --spec-drafter (1.0.1): the verify's batch-invariant
+            // kernels (AGENS_M1_BI) for every decode row, and prefill chunks of up to 128 tokens on the batched W4
+            // kernels (short prompts: no dequantized-weight GEMM). 1.0.0 set the second only with a drafter and decoded
+            // without one on the AGENS_M1_BATCH_INVARIANT GEMV, so greedy replies differed with and without the drafter
+            // (3 of the 13 gate prompts; tools/serve_gate.py). Now spec == non-spec in server mode, at every concurrency.
+            for (k, v) in [("AGENS_M1_BI", "1"), ("AGENS_M1_W4_BATCH_MAX", "128")] {
+                if std::env::var(k).is_err() {
+                    std::env::set_var(k, v);
+                }
+            }
         }
         m => bail!("--mode {m}: personal or server"),
     }
     if drafter.is_some() && mode != "personal" && std::env::var("AGENS_SPEC_BATCH_MAX").is_err() {
-        // server mode: batched speculative decoding of up to --max-batch greedy requests per step; prefill chunks of
-        // up to 128 tokens on the batched W4 kernels (short prompts: no dequantized-weight GEMM)
+        // server mode: batched speculative decoding of up to --max-batch greedy requests per step
         std::env::set_var("AGENS_SPEC_BATCH_MAX", max_batch.min(16).to_string());
-        if std::env::var("AGENS_M1_W4_BATCH_MAX").is_err() {
-            std::env::set_var("AGENS_M1_W4_BATCH_MAX", "128");
-        }
     }
     if !fork && mode != "personal" {
         bail!("--no-fork 1: personal mode only");
@@ -645,6 +779,10 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let mut o = crate::m1::parse_opts(&rest, usage)?;
     o.drafter = drafter.clone();
+    let copy = o.copy;
+    if copy && drafter.is_none() && mode != "personal" {
+        bail!("--spec-copy 1 without a drafter: personal mode only");
+    }
     let wctx = o.wctx;
     let think = {  // reasoning-budget markers, as the image (VOLUNDR_THINK_START_ID / _END_ID override)
         let tok = agens_server::tokenizer::Tokenizer::from_model_dir(&model_dir)?;
@@ -664,7 +802,7 @@ pub fn run(args: &[String]) -> Result<()> {
             agens_cuda::m1::session_park(anchor, buf)?;
             crate::tp::start()?; // tensor parallel: followers execute the leader's calls from here (no HTTP)
             Ok(Engine { think, max_batch, max_convs, wctx: wctx - CHUNK, anchor, convs: HashMap::new(), stats: (0, 0, 0.0),
-                        spec: drafter.is_some(), fork, bstats: (0, 0, 0.0, 0), pstats: (0, 0.0, None) })
+                        spec: drafter.is_some() || copy, copy: copy && drafter.is_none(), fork, bstats: (0, 0, 0.0, 0), pstats: (0, 0.0, None) })
         })();
         match r {
             Ok(mut e) => {

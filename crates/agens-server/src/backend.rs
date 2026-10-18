@@ -16,6 +16,7 @@
 //! * Report failures as `Err(BackendError)` items; the server ends the request with an error.
 
 use crate::sampling::SamplingParams;
+use crate::vision::MmInput;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -43,6 +44,21 @@ pub trait Backend: Send + Sync + 'static {
     /// Start generating for `prompt_ids` (the full rendered prompt). Must not block.
     fn generate(&self, prompt_ids: Vec<u32>, sampling: SamplingParams, session: Option<SessionHint>) -> TokenStream;
 
+    /// Whether [`Backend::generate_mm`] accepts images (the model has a vision tower and it is loaded).
+    fn supports_images(&self) -> bool {
+        false
+    }
+
+    /// As [`Backend::generate`] for a prompt with images: `prompt_ids` has every `<|image_pad|>` expanded to the image's
+    /// token count, `mm.spans` locate them. Must not block.
+    fn generate_mm(&self, prompt_ids: Vec<u32>, mm: Arc<MmInput>, sampling: SamplingParams,
+                   session: Option<SessionHint>) -> TokenStream {
+        let _ = (prompt_ids, mm, sampling, session);
+        let (tx, rx) = mpsc::channel(1);
+        let _ = tx.try_send(Err(BackendError("this backend does not accept images".into())));
+        rx
+    }
+
     /// Longest prompt + completion the backend accepts (`max_model_len` in `/v1/models`).
     fn context_length(&self) -> usize;
 }
@@ -51,6 +67,7 @@ pub trait Backend: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct MockCall {
     pub prompt_ids: Vec<u32>,
+    pub mm: Option<Arc<MmInput>>,
     pub sampling: SamplingParams,
     pub session: Option<SessionHint>,
 }
@@ -65,6 +82,8 @@ pub struct MockBackend {
     context_length: usize,
     /// Tokens per step (>1 imitates speculative decoding).
     pub step_size: usize,
+    /// Accept images (`generate_mm`).
+    pub images: bool,
 }
 
 impl MockBackend {
@@ -80,6 +99,7 @@ impl MockBackend {
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             context_length: 262_144,
             step_size: 1,
+            images: false,
         }
     }
 
@@ -89,9 +109,29 @@ impl MockBackend {
 }
 
 impl Backend for MockBackend {
+    fn supports_images(&self) -> bool {
+        self.images
+    }
+
+    fn generate_mm(&self, prompt_ids: Vec<u32>, mm: Arc<MmInput>, sampling: SamplingParams,
+                   session: Option<SessionHint>) -> TokenStream {
+        self.run(prompt_ids, Some(mm), sampling, session)
+    }
+
     fn generate(&self, prompt_ids: Vec<u32>, sampling: SamplingParams, session: Option<SessionHint>) -> TokenStream {
+        self.run(prompt_ids, None, sampling, session)
+    }
+
+    fn context_length(&self) -> usize {
+        self.context_length
+    }
+}
+
+impl MockBackend {
+    fn run(&self, prompt_ids: Vec<u32>, mm: Option<Arc<MmInput>>, sampling: SamplingParams, session: Option<SessionHint>)
+           -> TokenStream {
         let tokens = (self.script.lock().unwrap())(&prompt_ids);
-        self.calls.lock().unwrap().push(MockCall { prompt_ids, sampling: sampling.clone(), session });
+        self.calls.lock().unwrap().push(MockCall { prompt_ids, mm, sampling: sampling.clone(), session });
         let (tx, rx) = mpsc::channel(16);
         let step = self.step_size.max(1);
         tokio::spawn(async move {
@@ -116,9 +156,5 @@ impl Backend for MockBackend {
             }
         });
         rx
-    }
-
-    fn context_length(&self) -> usize {
-        self.context_length
     }
 }

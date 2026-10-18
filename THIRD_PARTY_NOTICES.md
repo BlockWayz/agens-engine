@@ -15,7 +15,7 @@ texts are reproduced or referenced at the end of this file.
 | Triton | compiler of the embedded KDA prefill binaries (`tools/triton_aot.py`) | build tool | MIT License |
 | PyTorch (libtorch) | linked by the far-branch bridge (`kernels/oracle/bridge`) | runtime library (not redistributed in source form) | BSD 3-Clause |
 | Rust crates (crates.io) | dependencies in `Cargo.lock` | libraries | each crate's license (MIT and/or Apache-2.0 for the crates used) |
-| NVIDIA CUDA runtime, cuBLAS, driver API | the container image | runtime | NVIDIA CUDA Toolkit EULA |
+| NVIDIA CUDA runtime, cuBLAS, nvJPEG (image input), driver API | the container image | runtime | NVIDIA CUDA Toolkit EULA |
 
 Files derived from the projects above carry a header naming their source.
 

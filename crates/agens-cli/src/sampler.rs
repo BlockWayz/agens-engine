@@ -95,7 +95,13 @@ impl Sampler {
             let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
             t ^ request_id.wrapping_mul(0x9e3779b97f4a7c15)
         });
-        Sampler { rng: seed | 1, counts: Default::default(), produced: 0, budget: None }
+        // splitmix64 of the seed (1.0.1): xorshift64* started straight from a small seed (1, 2, 3, ...) draws
+        // correlated, low first uniforms, so per-request seeds 1..N biased the first sampled tokens
+        let mut z = seed.wrapping_add(0x9e3779b97f4a7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^= z >> 31;
+        Sampler { rng: z | 1, counts: Default::default(), produced: 0, budget: None }
     }
 
     fn uniform(&mut self) -> f64 {

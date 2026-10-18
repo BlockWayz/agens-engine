@@ -21,6 +21,8 @@ mod tp;
 mod m1;
 #[cfg(feature = "m1")]
 mod spec;
+#[cfg(feature = "m1")]
+mod mm;
 
 const USAGE: &str = "usage:
   agens inspect  <ckpt_dir>             layer map + byte budget

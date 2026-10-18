@@ -155,7 +155,8 @@ fn follow() -> Result<()> {
                     let h: Vec<Vec<i32>> = a[3].split('/').map(split).collect();
                     drop(m1::spec_batch_hint(&split(a[1]), &split(a[2]), &h)?)
                 }
-                "spec_sampling" => m1::spec_sampling(a[1].parse()?, int(2)?)?,
+                "spec_sampling" => m1::spec_sampling_filtered(a[1].parse()?, int(3)?, a[4].parse()?, a[5].parse()?, int(2)?)?,
+                "session_sampling" => m1::session_sampling(int(1)?, a[2].parse()?, int(3)?, a[4].parse()?, a[5].parse()?, int(6)?)?,
                 "session_new" => drop(m1::session_new()?),
                 "session_use" => m1::session_use(int(1)?)?,
                 "session_fork" => drop(m1::session_fork(int(1)?)?),

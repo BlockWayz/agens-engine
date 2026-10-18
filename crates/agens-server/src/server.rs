@@ -32,6 +32,8 @@ pub struct AppState {
     pub think_end_ids: Vec<u32>,
     /// Logit rows of the model (`config.json` vocab_size), for range checks.
     pub vocab_size: usize,
+    /// Image sizing when the backend takes images (preprocessor_config.json + the engine's caps), else None.
+    pub vision: Option<crate::vision::ImageCfg>,
 }
 
 impl AppState {
@@ -47,7 +49,10 @@ impl AppState {
             .with_context(|| format!("{}/chat_template.jinja", dir.display()))?;
         let template = ChatTemplate::new(source).map_err(|e| anyhow::anyhow!("chat template: {e}"))?;
         let defaults = GenerationDefaults::from_model_dir(&dir, tokenizer.len())?;
-        Ok(Self::new(tokenizer, template, defaults, backend, model_name.unwrap_or_else(|| dir.display().to_string())))
+        let vision = if backend.supports_images() { crate::vision::ImageCfg::from_model_dir(&dir) } else { None };
+        let mut st = Self::new(tokenizer, template, defaults, backend, model_name.unwrap_or_else(|| dir.display().to_string()));
+        st.vision = vision;
+        Ok(st)
     }
 
     pub fn new(
@@ -69,6 +74,7 @@ impl AppState {
             created: now(),
             think_end_ids,
             vocab_size,
+            vision: None,
         }
     }
 }
@@ -165,6 +171,7 @@ fn engine_request(
     require_reasoning: bool,
     budget: (Option<i64>, Option<f64>),
     session: Option<SessionHint>,
+    mm: Option<Arc<crate::vision::MmInput>>,
 ) -> Result<EngineRequest, ApiError> {
     let (temperature, top_k) = rs.finalize(st.vocab_size).map_err(ApiError::bad_request)?;
     let n = prompt_ids.len();
@@ -210,12 +217,40 @@ fn engine_request(
         think_end_ids: st.think_end_ids.clone(),
         vocab_size: st.vocab_size,
         session,
+        mm,
     })
 }
 
 /// Server-wide defaults of the chat endpoint's reasoning budget, as the reference image reads them.
 fn env_num(name: &str) -> Option<f64> {
     std::env::var(name).ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| *v != 0.0)
+}
+
+/// Decode the request's images (CPU, off the async workers) and expand their placeholders in `plan.prompt_ids`.
+async fn images(st: &AppState, plan: &mut openai::ChatPlan) -> Result<Option<Arc<crate::vision::MmInput>>, ApiError> {
+    use crate::vision;
+    if plan.prompt_ids.contains(&vision::VIDEO_PAD) {
+        return Err(ApiError::bad_request("video input is not supported"));
+    }
+    if plan.image_urls.is_empty() {
+        return Ok(None);
+    }
+    let Some(cfg) = st.vision else {
+        return Err(ApiError::bad_request("this model does not accept image input"));
+    };
+    if plan.image_urls.len() > cfg.max_images {
+        return Err(ApiError::bad_request(format!("at most {} images per request", cfg.max_images)));
+    }
+    let urls = std::mem::take(&mut plan.image_urls);
+    let imgs = tokio::task::spawn_blocking(move || {
+        urls.iter().map(|u| vision::load_url(u, &cfg).map(Arc::new)).collect::<Result<Vec<_>, String>>()
+    })
+    .await
+    .map_err(|e| ApiError::bad_request(format!("image decoding failed: {e}")))?
+    .map_err(ApiError::bad_request)?;
+    let (ids, spans) = vision::expand(&plan.prompt_ids, &imgs).map_err(ApiError::bad_request)?;
+    plan.prompt_ids = ids;
+    Ok(Some(Arc::new(vision::MmInput { images: imgs, spans })))
 }
 
 async fn chat(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
@@ -229,7 +264,8 @@ async fn chat_inner(st: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Resul
     check_json(&headers)?;
     let mut req = ChatRequest::parse(&body)?;
     openai::validate_chat(&req, st.context_length)?;
-    let plan = openai::plan_chat(&mut req, &st.template, &st.tokenizer, &st.defaults)?;
+    let mut plan = openai::plan_chat(&mut req, &st.template, &st.tokenizer, &st.defaults)?;
+    let mm = images(&st, &mut plan).await?;
     let er = engine_request(
         &st,
         plan.prompt_ids.clone(),
@@ -246,6 +282,7 @@ async fn chat_inner(st: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Resul
             req.reasoning_budget_soft_bias.or_else(|| env_num("VOLUNDR_REASONING_BUDGET_SOFT_BIAS")),
         ),
         session(&headers, req.session_id.clone()),
+        mm,
     )?;
     let meta = RespMeta {
         id: req.rid.clone().unwrap_or_else(openai::new_request_id),
@@ -351,6 +388,7 @@ async fn completions_inner(st: Arc<AppState>, headers: HeaderMap, body: Bytes) -
         false,
         (None, None),
         session(&headers, req.session_id.clone()),
+        None,
     )?;
     let meta = RespMeta {
         id: req.rid.clone().unwrap_or_else(openai::new_request_id),

@@ -255,6 +255,10 @@ pub mod tp {
     pub fn activate() {
         ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    /// Tensor parallel calls are being forwarded (leader of a --tp run).
+    pub fn active() -> bool {
+        ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn fwd(line: &str) {
         if !ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -309,10 +313,11 @@ pub mod m1 {
                                 drafts: *mut c_int) -> c_int;
         fn ak_m1_spec_batch_init(max_b: c_int) -> c_int;
         fn ak_m1_spec_batch_max() -> c_int;
+        fn ak_m1_session_sampling(sess: c_int, temperature: f32, top_k: c_int, top_p: f32, min_p: f32, seed: c_int) -> c_int;
         fn ak_m1_spec_batch_hint(sess: *const c_int, b: c_int, bonus: *const c_int, hint: *const c_int, nh: *const c_int,
                                  emitted: *mut c_int, n: *mut c_int) -> c_int;
         fn ak_m1_spec_batch(sess: *const c_int, b: c_int, bonus: *const c_int, emitted: *mut c_int, n: *mut c_int) -> c_int;
-        fn ak_m1_spec_sampling(temperature: f32, seed: c_int) -> c_int;
+        fn ak_m1_spec_sampling(temperature: f32, top_k: c_int, top_p: f32, min_p: f32, seed: c_int) -> c_int;
         fn ak_m1_tp_config(rank: c_int, size: c_int) -> c_int;
         fn ak_tp_region_alloc(bytes: usize, dev_ptr: *mut *mut c_void, ipc_handle: *mut c_void) -> c_int;
         fn ak_tp_region_open(ipc_handle: *const c_void, dev_ptr: *mut *mut c_void) -> c_int;
@@ -326,6 +331,18 @@ pub mod m1 {
                       e2b: *mut c_void, e22a: *mut c_void, e22b: *mut c_void, ndev: c_int, devs: *const c_int,
                       split: c_int, pool_rows: c_int, nslots: c_int) -> c_int;
         fn ak_m1_prefill(ids: *const c_int, n: c_int, next: *mut c_int) -> c_int;
+        fn ak_m1_prefill_mm(ids: *const c_int, n: c_int, rpos3: *const i64, emb: *const c_void, emb_row: *const c_int,
+                            next: *mut c_int) -> c_int;
+        fn ak_m1_rope_delta() -> c_int;
+        fn ak_m1_set_rope_delta(d: c_int) -> c_int;
+        fn ak_m1_vis_register(name: *const c_char, host: *mut c_void, shape: *const i64, ndim: c_int) -> c_int;
+        fn ak_m1_vis_ready() -> c_int;
+        fn ak_m1_vis_encode(rgb: *const u8, jpeg: *const u8, jlen: i64, h: c_int, w: c_int, rh: c_int, rw: c_int,
+                            out: *mut c_void) -> c_int;
+        fn ak_m1_vis_pixels(rgb: *const u8, jpeg: *const u8, jlen: i64, h: c_int, w: c_int, rh: c_int, rw: c_int,
+                            out: *mut f32) -> c_int;
+        fn ak_m1_vis_encode_pixels(pv: *const f32, gh: c_int, gw: c_int, out: *mut c_void) -> c_int;
+        fn ak_m1_vis_peak_bytes() -> i64;
         fn ak_m1_decode(token: c_int, next: *mut c_int) -> c_int;
         fn ak_m1_reset() -> c_int;
         fn ak_m1_state_bytes() -> usize;
@@ -529,10 +546,14 @@ pub mod m1 {
         if b < 0 { anyhow::bail!("m1_mtp_setup failed") }
         Ok(b as usize)
     }
-    /// Sampled speculative accept (sglang's target-only rule): temperature 0 = greedy; Philox seed.
+    /// Sampled speculative accept (target-only rule over the filtered distribution: temperature, top-k (0 = all),
+    /// top-p, min-p as the host sampler applies them): temperature 0 = greedy; Philox seed.
     pub fn spec_sampling(temperature: f32, seed: i32) -> Result<()> {
-        crate::tp::fwd(&format!("spec_sampling {temperature} {seed}"));
-        check(unsafe { ak_m1_spec_sampling(temperature, seed) }, "m1_spec_sampling")
+        spec_sampling_filtered(temperature, 0, 1.0, 0.0, seed)
+    }
+    pub fn spec_sampling_filtered(temperature: f32, top_k: i32, top_p: f32, min_p: f32, seed: i32) -> Result<()> {
+        crate::tp::fwd(&format!("spec_sampling {temperature} {seed} {top_k} {top_p} {min_p}"));
+        check(unsafe { ak_m1_spec_sampling(temperature, top_k, top_p, min_p, seed) }, "m1_spec_sampling")
     }
     /// Tensor parallel: this process is rank `rank` of `size` (before init).
     pub fn tp_config(rank: usize, size: usize) -> Result<()> {
@@ -594,6 +615,12 @@ pub mod m1 {
     pub fn spec_batch_max() -> usize {
         unsafe { ak_m1_spec_batch_max() }.max(0) as usize
     }
+    /// The sampling of a session's batched verify steps (spec_batch): temperature 0 = greedy, else the filtered
+    /// distribution (top-k 0 = all, top-p, min-p); its own Philox stream (seed, steps from 0).
+    pub fn session_sampling(sess: i32, temperature: f32, top_k: i32, top_p: f32, min_p: f32, seed: i32) -> Result<()> {
+        crate::tp::fwd(&format!("session_sampling {sess} {temperature} {top_k} {top_p} {min_p} {seed}"));
+        check(unsafe { ak_m1_session_sampling(sess, temperature, top_k, top_p, min_p, seed) }, "m1_session_sampling")
+    }
     /// One batched step: sequence b = session `sessions[b]` drafts after `bonus[b]`, verifies, commits; -> the emitted
     /// tokens of each (each exactly its own spec_step).
     pub fn spec_batch(sessions: &[i32], bonus: &[i32]) -> Result<Vec<Vec<i32>>> {
@@ -649,6 +676,75 @@ pub mod m1 {
         let mut next = 0;
         check(unsafe { ak_m1_prefill(ids.as_ptr(), ids.len() as i32, &mut next) }, "m1_prefill")?;
         Ok(next)
+    }
+    /// Prefill with image inputs: `rpos3` = [3][n] rope positions (MRoPE rows T, H, W) or None
+    /// (position + the session's rope delta); `emb` = image embedding rows ([rows][5120] bf16, host), `emb_row[t]` =
+    /// the row replacing token t's embedding (-1 = its own). One device, no tensor parallelism.
+    pub fn prefill_mm(ids: &[i32], rpos3: Option<&[i64]>, emb: Option<(*const c_void, &[i32])>) -> Result<i32> {
+        if crate::tp::active() {
+            anyhow::bail!("image inputs are not supported with --tp");
+        }
+        if let Some(r) = rpos3 {
+            assert_eq!(r.len(), 3 * ids.len());
+        }
+        if let Some((_, rows)) = emb {
+            assert_eq!(rows.len(), ids.len());
+        }
+        let mut next = 0;
+        let (ep, er) = match emb {
+            Some((p, rows)) => (p, rows.as_ptr()),
+            None => (std::ptr::null(), std::ptr::null()),
+        };
+        check(unsafe { ak_m1_prefill_mm(ids.as_ptr(), ids.len() as i32, rpos3.map(|r| r.as_ptr()).unwrap_or(std::ptr::null()),
+                                        ep, er, &mut next) }, "m1_prefill_mm")?;
+        Ok(next)
+    }
+    /// The active session's rope delta (rope position - token position of its next text token).
+    pub fn rope_delta() -> i32 {
+        unsafe { ak_m1_rope_delta() }
+    }
+    pub fn set_rope_delta(d: i32) -> Result<()> {
+        check(unsafe { ak_m1_set_rope_delta(d) }, "m1_set_rope_delta")
+    }
+    /// A vision tower tensor (bf16, row-major) in pinned host memory that stays alive for the process.
+    pub fn vis_register(name: &str, host: *mut c_void, shape: &[usize]) -> Result<()> {
+        let n = CString::new(name)?;
+        let sh: Vec<i64> = shape.iter().map(|&x| x as i64).collect();
+        check(unsafe { ak_m1_vis_register(n.as_ptr(), host, sh.as_ptr(), sh.len() as c_int) }, "m1_vis_register")
+    }
+    pub fn vis_ready() -> bool {
+        unsafe { ak_m1_vis_ready() != 0 }
+    }
+    /// One image: RGB8 h x w -> resized rh x rw (multiples of 32) -> (rh / 32) * (rw / 32) embeddings of 5120 bf16 into
+    /// `out` (host, pinned or not).
+    /// `jpeg`: the encoded JPEG, decoded on the GPU with nvJPEG when it can (the reference's path), else `rgb` is used.
+    pub fn vis_encode(rgb: &[u8], jpeg: Option<&[u8]>, h: usize, w: usize, rh: usize, rw: usize, out: *mut c_void)
+                      -> Result<()> {
+        assert_eq!(rgb.len(), h * w * 3);
+        let (jp, jl) = jpeg.map(|j| (j.as_ptr(), j.len() as i64)).unwrap_or((std::ptr::null(), 0));
+        check(unsafe { ak_m1_vis_encode(rgb.as_ptr(), jp, jl, h as c_int, w as c_int, rh as c_int, rw as c_int, out) },
+              "m1_vis_encode")
+    }
+    /// The preprocessed pixel values of one image ([(rh / 16) * (rw / 16)][1536] fp32).
+    pub fn vis_pixels(rgb: &[u8], jpeg: Option<&[u8]>, h: usize, w: usize, rh: usize, rw: usize) -> Result<Vec<f32>> {
+        assert_eq!(rgb.len(), h * w * 3);
+        let mut out = vec![0f32; (rh / 16) * (rw / 16) * 1536];
+        let (jp, jl) = jpeg.map(|j| (j.as_ptr(), j.len() as i64)).unwrap_or((std::ptr::null(), 0));
+        check(unsafe { ak_m1_vis_pixels(rgb.as_ptr(), jp, jl, h as c_int, w as c_int, rh as c_int, rw as c_int,
+                                        out.as_mut_ptr()) }, "m1_vis_pixels")?;
+        Ok(out)
+    }
+    /// The tower on given pixel values ([gh * gw][1536] fp32) -> [gh * gw / 4][5120] bf16.
+    pub fn vis_encode_pixels(pv: &[f32], gh: usize, gw: usize) -> Result<Vec<u16>> {
+        assert_eq!(pv.len(), gh * gw * 1536);
+        let mut out = vec![0u16; gh * gw / 4 * 5120];
+        check(unsafe { ak_m1_vis_encode_pixels(pv.as_ptr(), gh as c_int, gw as c_int, out.as_mut_ptr() as *mut c_void) },
+              "m1_vis_encode_pixels")?;
+        Ok(out)
+    }
+    /// Peak bytes torch's allocator reserved since the last call (resets the peak).
+    pub fn vis_peak_bytes() -> i64 {
+        unsafe { ak_m1_vis_peak_bytes() }
     }
     pub fn decode(tok: i32) -> Result<i32> {
         crate::tp::fwd(&format!("decode {tok}"));

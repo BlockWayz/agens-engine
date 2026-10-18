@@ -22,6 +22,13 @@ for lib in $(closure $R/opt/agens/lib/*.so*); do
   [ -e $R/opt/agens/lib/$(basename $lib) ] || [ -e $R/usr/lib/x86_64-linux-gnu/$(basename $lib) ] || {
     case $lib in /lib/x86_64-linux-gnu/*|/usr/lib/x86_64-linux-gnu/*) cp -L $lib $R/usr/lib/x86_64-linux-gnu/;; *) cp -L $lib $R/opt/agens/lib/;; esac; }
 done
+# cuDNN's dispatcher (in the closure when libtorch_cuda links it) dlopens its sub-libraries; torch's cuDNN probe
+# (cudnnGetVersion) needs the graph library. Same copy torch resolves: the pip nvidia/cudnn one first.
+if ls $R/opt/agens/lib/libcudnn.so.* >/dev/null 2>&1; then
+  for g in /usr/local/lib/python3*/dist-packages/nvidia/cudnn/lib/libcudnn_graph.so.9 /usr/lib/x86_64-linux-gnu/libcudnn_graph.so.9; do
+    [ -e "$g" ] && { cp -L $g $R/opt/agens/lib/; break; }
+  done
+fi
 cp -L /bin/bash $R/usr/bin/bash
 for lib in $(closure /bin/bash); do cp -L $lib $R/usr/lib/x86_64-linux-gnu/; done
 cp -L /lib64/ld-linux-x86-64.so.2 $R/lib64/

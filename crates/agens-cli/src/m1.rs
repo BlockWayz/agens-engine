@@ -116,10 +116,12 @@ pub(crate) struct Opts {
     pub(crate) drafter: Option<String>, // DFlash2 drafter dir (speculative decoding): loaded inside the budget
     pub(crate) tp: usize,               // tensor parallel ranks (processes, one GPU each: --device + rank)
     pub(crate) mtp: Option<String>,     // MTP head dir (docs/mtp.md): a draft source of speculative decoding
+    pub(crate) copy: bool,              // copy-only speculative decoding (no drafter model): verify buffers only
+    pub(crate) vision: Option<bool>,    // --vision 0|1: load the vision tower (default: when the checkpoint has one)
 }
 
 pub(crate) fn parse_opts(args: &[String], usage: &str) -> Result<Opts> {
-    let mut o = Opts { gpu_gib: 40.0, device: 0, devices: vec![], new_tokens: 64, wctx: 36868, cuts: 50, tier: "host".into(), seed: 1, pool: 0, sessions: 1, budget_gib: 0.0, drafter: None, tp: 1, mtp: None };
+    let mut o = Opts { gpu_gib: 40.0, device: 0, devices: vec![], new_tokens: 64, wctx: 36868, cuts: 50, tier: "host".into(), seed: 1, pool: 0, sessions: 1, budget_gib: 0.0, drafter: None, tp: 1, mtp: None, copy: false, vision: None };
     let mut i = 0;
     while i < args.len() {
         let v = args.get(i + 1).context(usage.to_string())?;
@@ -137,6 +139,8 @@ pub(crate) fn parse_opts(args: &[String], usage: &str) -> Result<Opts> {
             "--budget-gib" => o.budget_gib = v.parse()?,
             "--tp" => o.tp = v.parse()?,
             "--mtp" => o.mtp = Some(v.clone()),
+            "--spec-copy" => o.copy = v == "1",
+            "--vision" => o.vision = Some(v != "0"),
             f => bail!("unknown flag {f}\n{usage}"),
         }
         i += 2;
@@ -156,11 +160,37 @@ pub fn run(args: &[String]) -> Result<()> {
     let prompts: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(prompts_path)?)?;
     let mut results = Vec::new();
     let mut hc = HeadCmp::default();
+    let base = std::path::Path::new(prompts_path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
     for p in prompts.as_array().context("prompts must be a JSON list")? {
         let name = p["name"].as_str().unwrap_or("?").to_string();
-        let ids: Vec<i32> = p["ids"].as_array().context("ids")?.iter().map(|x| x.as_i64().unwrap() as i32).collect();
+        let mut ids: Vec<i32> = p["ids"].as_array().context("ids")?.iter().map(|x| x.as_i64().unwrap() as i32).collect();
         let n_new = p.get("new_tokens").and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(new_tokens);
         agens_cuda::m1::reset()?;
+        // image case: "images": [files] next to one <|image_pad|> per image (or expanded runs)
+        let mm = match p.get("images").and_then(|x| x.as_array()) {
+            Some(files) => {
+                let files: Vec<String> = files.iter().filter_map(|f| f.as_str().map(str::to_string)).collect();
+                let (x, images, spans) = crate::mm::case_images(&ids, &files, &base)?;
+                ids = x.iter().map(|&t| t as i32).collect();
+                if let Ok(dir) = std::env::var("AGENS_VIS_DUMP") {
+                    vis_dump(&dir, &name, &images, p.get("ref_pixels").and_then(|x| x.as_array()), &base)?;
+                }
+                Some((images, spans))
+            }
+            None => None,
+        };
+        let prefill = |ids: &[i32]| -> Result<i32> {
+            match &mm {
+                Some((images, spans)) => {
+                    let u: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
+                    // "emb_override": per image an embedding file used instead of the tower (gate experiments)
+                    let ov: Option<Vec<String>> = p.get("emb_override").and_then(|x| x.as_array())
+                        .map(|a| a.iter().filter_map(|f| f.as_str().map(|f| base.join(f).to_string_lossy().into_owned())).collect());
+                    crate::mm::prefill_prompt_with(&u, images, spans, ov.as_deref())
+                }
+                None => agens_cuda::m1::prefill(ids),
+            }
+        };
         if let Some(force) = p.get("force").and_then(|x| x.as_array()) {
             // teacher-forced: feed the reference continuation, record the engine's greedy pick at every position
             let force: Vec<i32> = force.iter().map(|x| x.as_i64().unwrap() as i32).collect();
@@ -179,7 +209,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 }
                 Ok(())
             };
-            let mut out = vec![agens_cuda::m1::prefill(&ids)?];
+            let mut out = vec![prefill(&ids)?];
             dump_row(&mut dump)?;
             if cmp {
                 head_cmp(&mut hc)?;
@@ -198,7 +228,7 @@ pub fn run(args: &[String]) -> Result<()> {
             continue;
         }
         let t = Instant::now();
-        let mut tok = agens_cuda::m1::prefill(&ids)?;
+        let mut tok = prefill(&ids)?;
         let t_prefill = t.elapsed().as_secs_f64();
         if std::env::var("AGENS_M1_MEM_TRACE").is_ok() {
             report_mem(&format!("after the prefill of {name} ({} tokens)", ids.len()));
@@ -250,7 +280,75 @@ pub fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// AGENS_VIS_DUMP=dir (vision gate): per image of a case, the engine's pixel values
+/// (`{name}_{i}.pv.f32`, [N][1536]) and image embeddings (`{name}_{i}.emb.bf16`, [N/4][5120]); with "ref_pixels"
+/// (the reference processor's pixel values, f32 files) also the tower's output on those (`{name}_{i}.emb_refpv.bf16`).
+fn vis_dump(dir: &str, name: &str, images: &[std::sync::Arc<agens_server::vision::MmImage>],
+            refpv: Option<&Vec<serde_json::Value>>, base: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let w16 = |f: String, v: &[u16]| std::fs::write(f, v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+    for (i, im) in images.iter().enumerate() {
+        let pv = agens_cuda::m1::vis_pixels(&im.rgb, im.jpeg.as_deref().map(|v| v.as_slice()), im.h, im.w, im.rh, im.rw)?;
+        std::fs::write(format!("{dir}/{name}_{i}.pv.f32"), pv.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+        let mut which = vec![false; images.len()];
+        which[i] = true;
+        let _ = agens_cuda::m1::vis_peak_bytes();
+        let e = crate::mm::encode(images, &which)?;
+        eprintln!("vision: {name} image {i}: {}x{} -> {}x{} ({} tokens), encode peak {:.0} MB", im.w, im.h, im.rw, im.rh,
+                  im.tokens(), agens_cuda::m1::vis_peak_bytes() as f64 / (1u64 << 20) as f64);
+        w16(format!("{dir}/{name}_{i}.emb.bf16"), e.image(i, im.tokens()))?;
+        if let Some(f) = refpv.and_then(|r| r.get(i)).and_then(|f| f.as_str()) {
+            let b = std::fs::read(base.join(f))?;
+            let v: Vec<f32> = b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let out = agens_cuda::m1::vis_encode_pixels(&v, im.rh / 16, im.rw / 16)?;
+            w16(format!("{dir}/{name}_{i}.emb_refpv.bf16"), &out)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) const EOT: i32 = 248046;
+/// The vision tower is loaded (image inputs accepted).
+pub(crate) static VISION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// GPU workspace of one image encode: the streamed tower's activations at the largest image
+/// (`AGENS_IMAGE_MAX_PIXELS`, default agens_server::vision::DEFAULT_MAX_PIXELS), two layers' weights, row tiles.
+/// AGENS_VISION_WS_MB overrides (measured: ak_vis_peak_bytes).
+pub(crate) fn vision_ws_bytes() -> usize {
+    if let Some(mb) = std::env::var("AGENS_VISION_WS_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return mb << 20;
+    }
+    let px: usize = std::env::var("AGENS_IMAGE_MAX_PIXELS").ok().and_then(|v| v.parse().ok())
+        .unwrap_or(agens_server::vision::DEFAULT_MAX_PIXELS);
+    let n = px / 256; // patches
+    // x, q, k, v, attention out (bf16 rows of 1152) + bf16 patches (1536); fp32 rotary tile (1024 rows); MLP tile
+    // (fc1 + gelu); block weights x 2 (prefetch; the merger comes after the blocks, in two parts); allocator slack
+    n * (5 * 1152 * 2 + 1536 * 2) + 1024 * 1152 * 4 * 4 + 2 * 1024 * 4304 * 2 + 2 * (30 << 20) + (32 << 20)
+}
+
+/// The checkpoint's vision tower (model.visual.*) into pinned host memory, registered with the engine (streamed to the
+/// GPU per layer at encode time). -> host bytes.
+fn load_vision(ck: &Checkpoint) -> Result<usize> {
+    let mut bytes = 0usize;
+    for (name, _) in ck.index.iter() {
+        if !name.starts_with("model.visual.") {
+            continue;
+        }
+        let info = ck.info(name).context("vision tensor info")?;
+        if info.dtype != agens_core::safetensors::Dtype::BF16 {
+            bail!("{name}: vision tensors must be bf16 (got {:?})", info.dtype);
+        }
+        let b = ck.bytes(name)?;
+        let host = agens_cuda::host_alloc(b.len())?;
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), host as *mut u8, b.len()) };
+        agens_cuda::m1::vis_register(name, host, &info.shape)?;
+        bytes += b.len();
+    }
+    if !agens_cuda::m1::vis_ready() {
+        bail!("the checkpoint's vision tower is incomplete");
+    }
+    Ok(bytes)
+}
 /// Bytes of the hard-cap ballast (0 = no cap): device use reports subtract it.
 pub(crate) static CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -644,14 +742,23 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     };
     let cap_rows = crate::plan::chunk();
     let n_kda = ck.config.layers.iter().filter(|l| l.mixer == agens_core::Mixer::Kda).count();
-    let mut reserve = if draft.is_some() || mtp.is_some() {
+    let mut reserve = if draft.is_some() || mtp.is_some() || o.copy {
         crate::spec::spec_reserve(cap_rows, n_kda, draft.as_ref().map(|d| d.w4).unwrap_or(false), wctx,
-                                  ck.config.layers.iter().filter(|l| l.mixer == agens_core::Mixer::Bcsa).count())
+                                  ck.config.layers.iter().filter(|l| l.mixer == agens_core::Mixer::Bcsa).count(),
+                                  draft.is_some())
     } else {
         Vec::new()
     };
     if mtp.is_some() {
         reserve.push(crate::spec::mtp_reserve(cap_rows, o.sessions));
+    }
+    let has_tower = ck.index.iter().any(|(n, _)| n.starts_with("model.visual."));
+    let vision = o.vision.unwrap_or(has_tower) && tp == 1 && devs.len() == 1;
+    if o.vision == Some(true) && !vision {
+        bail!("--vision 1: {}", if !has_tower { "the checkpoint has no vision tower" } else { "one GPU, no --tp" });
+    }
+    if vision {
+        reserve.push(("vision tower workspace (one image encode, streamed weights)".to_string(), vision_ws_bytes()));
     }
     let t_weights = t0.elapsed().as_secs_f64();
     let mut pool = o.pool;
@@ -684,6 +791,15 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     crate::tp::setup_allreduce(chunk * 5120)?;
     if let Some(d) = &draft {
         crate::spec::finish_drafter(d, cap_rows)?;
+    }
+    if o.copy && draft.is_none() && mtp.is_none() {
+        agens_cuda::m1::spec_init(true, None, cap_rows)?;  // verify buffers (KDA stash) for copy-only drafting
+    }
+    if vision {
+        let hb = load_vision(&ck)?;
+        VISION.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("m1: vision tower {:.2} GB in pinned host memory (streamed per layer), workspace {:.0} MB planned",
+                  hb as f64 / 1e9, vision_ws_bytes() as f64 / (1u64 << 20) as f64);
     }
     if let Some(m) = &mtp {
         if draft.is_none() {
@@ -763,6 +879,7 @@ pub fn session_test(args: &[String]) -> Result<()> {
     load(dir, &o)?;
     let prompts: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(prompts_path)?)?;
     let plist = prompts.as_array().context("prompts")?;
+    let base = std::path::Path::new(prompts_path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let ids_of = |p: &serde_json::Value| -> Vec<i32> {
         p["ids"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect()
     };
@@ -770,7 +887,7 @@ pub fn session_test(args: &[String]) -> Result<()> {
     let mut refs = Vec::new();
     for p in plist {
         agens_cuda::m1::reset()?;
-        let mut tok = agens_cuda::m1::prefill(&ids_of(p))?;
+        let mut tok = crate::mm::case_prefill(p, &ids_of(p), &base)?.0;  // "images": image cases
         let mut out = vec![tok];
         while out.len() < o.new_tokens {
             tok = agens_cuda::m1::decode(tok)?;
@@ -793,7 +910,7 @@ pub fn session_test(args: &[String]) -> Result<()> {
         let cut = 1 + next() % (o.new_tokens - 1);  // tokens produced before the snapshot
         let ids = ids_of(&plist[pi]);
         agens_cuda::m1::reset()?;
-        let mut tok = agens_cuda::m1::prefill(&ids)?;
+        let mut tok = crate::mm::case_prefill(&plist[pi], &ids, &base)?.0;
         let mut out = vec![tok];
         while out.len() < cut {
             tok = agens_cuda::m1::decode(tok)?;

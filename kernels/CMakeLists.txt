@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
-# Targets: sm89 (Ada), sm90 (H200), sm120 (RTX 5090 / PRO 6000 Blackwell, T9). All three always build.
+# Targets: sm86 (built, not validated on hardware), sm89, sm90, sm120. All four build by default.
 # Must be set before project(): enabling CUDA defines a (sm_52) default otherwise.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89 90 120)
+  set(CMAKE_CUDA_ARCHITECTURES 86 89 90 120)
 endif()
 project(agens_kernels LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
@@ -102,7 +102,7 @@ if(AGENS_BUILD_ORACLE AND AGENS_TORCH_PREFIX)
     COMMAND ${CMAKE_COMMAND} -S ${CMAKE_CURRENT_SOURCE_DIR}/oracle/bridge -B ${BRIDGE_DIR}
             -DCMAKE_PREFIX_PATH=${AGENS_TORCH_PREFIX} -DCMAKE_BUILD_TYPE=Release
     COMMAND ${CMAKE_COMMAND} --build ${BRIDGE_DIR} -j
-    DEPENDS oracle/bridge/far_bridge.cpp oracle/bridge/CMakeLists.txt)
+    DEPENDS oracle/bridge/far_bridge.cpp oracle/bridge/vision.cpp oracle/bridge/CMakeLists.txt)
   add_custom_target(agens_oracle_bridge_build DEPENDS ${BRIDGE_DIR}/libagens_oracle_bridge.so)
   add_library(agens_oracle_bridge SHARED IMPORTED)
   set_target_properties(agens_oracle_bridge PROPERTIES IMPORTED_LOCATION ${BRIDGE_DIR}/libagens_oracle_bridge.so)

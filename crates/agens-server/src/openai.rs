@@ -541,10 +541,13 @@ fn process_tool_call(tc: &PyValue) -> R<PyValue> {
 pub struct PreparedMessages {
     pub messages: Vec<PyValue>,
     pub assistant_prefix: Option<String>,
+    /// `image_url` urls in message / part order (= the order the template renders their placeholders)
+    pub image_urls: Vec<String>,
 }
 
 pub fn prepare_messages(req: &ChatRequest) -> R<PreparedMessages> {
     let mut out = Vec::new();
+    let mut image_urls = Vec::new();
     for m in &req.messages {
         let PyValue::Dict(_) = m else { return Err(invalid("messages", "entries must be objects")) };
         let raw_role = m.get("role").and_then(|r| r.as_str()).ok_or_else(|| invalid("messages.role", "is required"))?;
@@ -572,6 +575,11 @@ pub fn prepare_messages(req: &ChatRequest) -> R<PreparedMessages> {
             Some(PyValue::List(parts)) => {
                 let mut items = Vec::new();
                 for p in parts {
+                    if p.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                        if let Some(u) = p.get("image_url").and_then(|i| i.get("url")).and_then(|u| u.as_str()) {
+                            image_urls.push(u.to_string());
+                        }
+                    }
                     if let Some(x) = process_part(p, &role)? {
                         items.push(x);
                     }
@@ -641,12 +649,14 @@ pub fn prepare_messages(req: &ChatRequest) -> R<PreparedMessages> {
             }
         }
     }
-    Ok(PreparedMessages { messages: out, assistant_prefix })
+    Ok(PreparedMessages { messages: out, assistant_prefix, image_urls })
 }
 
 /// Everything the serving path derives from a chat request before generation.
 pub struct ChatPlan {
     pub prompt_ids: Vec<u32>,
+    /// `image_url` urls in placeholder order (server.rs decodes them and expands `prompt_ids`)
+    pub image_urls: Vec<String>,
     pub prompt_text: String,
     pub sampling: RequestSampling,
     pub require_reasoning: bool,
@@ -757,6 +767,7 @@ pub fn plan_chat(req: &mut ChatRequest, tmpl: &ChatTemplate, tok: &Tokenizer, ge
         };
     }
     let prepared = prepare_messages(req)?;
+    let image_urls = prepared.image_urls;
     let messages = PyValue::List(prepared.messages);
     let tools_v = template_tools.map(PyValue::List);
     let rendered = match tmpl.render(&messages, tools_v.as_ref(), true, &kwargs) {
@@ -812,6 +823,7 @@ pub fn plan_chat(req: &mut ChatRequest, tmpl: &ChatTemplate, tok: &Tokenizer, ge
         .is_some_and(|(_, v)| v == &PyValue::Bool(true));
     Ok(ChatPlan {
         prompt_ids,
+        image_urls,
         prompt_text: rendered,
         sampling,
         require_reasoning: reasoning_enabled(req),

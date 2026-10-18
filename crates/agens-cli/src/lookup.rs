@@ -9,6 +9,10 @@
 //! drafts accepted per step, kept for the drafter and for the lookup per match-length bucket (the longer the matched
 //! suffix, the likelier the copy continues), with priors that favour the drafter until a bucket has shown it wins.
 //! AGENS_SPEC_LOOKUP=0 turns it off; AGENS_SPEC_LOOKUP_LOG=1 prints the per-bucket means at the end of a prompt.
+//!
+//! Copy-only drafting (`copy_step`, no drafter weights; `m1-spec --copy`, `serve --spec-copy 1`): a step with a
+//! proposal verifies [bonus, copy..] (padded to the 8-row verify graph), a step without one is a plain decode step.
+//! Greedy only (a plain decode step is the greedy token).
 
 use std::collections::HashMap;
 
@@ -43,6 +47,7 @@ pub struct Lookup {
     pub acc_lookup: usize, // drafts accepted on lookup steps
     pub acc_draft: usize,  // drafts accepted on drafter steps
     pending: Option<(bool, usize)>, // the last proposal: (lookup?, bucket)
+    fixed_dr: bool,                 // copy-only drafting: the alternative is a plain decode step, its value fixed
 }
 
 fn bucket(m: usize) -> usize {
@@ -60,7 +65,17 @@ impl Lookup {
             *m = Mean { v: p, n: PRIOR_W };
         }
         Lookup { on, hist: Vec::new(), idx: HashMap::new(), indexed: 0, lk, dr: Mean { v: 2.0, n: PRIOR_W }, used: 0,
-                 steps: 0, acc_lookup: 0, acc_draft: 0, pending: None }
+                 steps: 0, acc_lookup: 0, acc_draft: 0, pending: None, fixed_dr: false }
+    }
+
+    /// Copy-only drafting (no drafter model): a proposal is verified when its expected accepted run beats `min` drafts
+    /// (the extra cost of a verify step over a plain decode step, in tokens); otherwise the step is a plain decode.
+    /// AGENS_SPEC_COPY_MIN overrides min.
+    pub fn copy_only(mut self) -> Self {
+        let min = std::env::var("AGENS_SPEC_COPY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+        self.dr = Mean { v: min, n: PRIOR_W };
+        self.fixed_dr = true;
+        self
     }
 
     /// A new sequence (prompt): the history starts over; the running means are kept (they describe the drafter and the
@@ -148,7 +163,9 @@ impl Lookup {
                 self.acc_lookup += acc;
             }
             Some((false, _)) => {
-                self.dr.add(acc as f64);
+                if !self.fixed_dr {
+                    self.dr.add(acc as f64);
+                }
                 self.acc_draft += acc;
             }
             None => {}
@@ -168,4 +185,17 @@ impl Lookup {
             lk.join(" ")
         )
     }
+}
+
+/// One copy-only step after `bonus` (greedy): the emitted tokens (accepted copies + the target's next token).
+pub fn copy_step(bonus: i32, hint: &[i32]) -> anyhow::Result<Vec<i32>> {
+    if hint.is_empty() {
+        return Ok(vec![agens_cuda::m1::decode(bonus)?]);
+    }
+    let mut chain = Vec::with_capacity(1 + MAX_DRAFT);
+    chain.push(bonus);
+    chain.extend_from_slice(&hint[..hint.len().min(MAX_DRAFT)]);
+    let pad = *chain.last().unwrap();
+    chain.resize(1 + MAX_DRAFT, pad); // the 8-row verify graph; padding is only ever rejected or a lucky match
+    Ok(agens_cuda::m1::verify(&chain)?.0)
 }

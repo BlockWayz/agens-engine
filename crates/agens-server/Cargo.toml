@@ -20,6 +20,10 @@ minijinja = { version = "2", features = ["preserve_order", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 uuid = { version = "1", features = ["v4"] }
+# image inputs (src/vision.rs): data-URL decoding
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+sha2.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

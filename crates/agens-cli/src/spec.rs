@@ -19,6 +19,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let out_path = args.get(2).context(usage)?;
     let (mut oracle, mut corrupt, mut drafter, mut rest) = (None, 3usize, None, Vec::new());
     let (mut temperature, mut seed) = (0f32, 1i32);
+    let (mut top_k, mut top_p, mut min_p) = (0i32, 1f32, 0f32); // sampled verify filters (samp_pos), with --temperature
     let mut i = 3;
     while i < args.len() {
         let v = args.get(i + 1).context(usage)?.clone();
@@ -28,6 +29,9 @@ pub fn run(args: &[String]) -> Result<()> {
             "--drafter" => drafter = Some(v),
             "--temperature" => temperature = v.parse()?,
             "--seed" => seed = v.parse()?,
+            "--top-k" => top_k = v.parse()?,
+            "--top-p" => top_p = v.parse()?,
+            "--min-p" => min_p = v.parse()?,
             _ => {
                 rest.push(args[i].clone());
                 rest.push(v);
@@ -39,14 +43,18 @@ pub fn run(args: &[String]) -> Result<()> {
     o.drafter = drafter.clone();
     // draft sources: the DFlash2 drafter and / or the MTP head (hybrid drafting with copy-from-context), or the oracle
     let drafting = drafter.is_some() || o.mtp.is_some();
-    if oracle.is_some() == drafting {
-        bail!("{usage}: pass --oracle, or --drafter and / or --mtp");
+    let copy = o.copy && !drafting; // --spec-copy 1 alone: copy-only drafting (greedy)
+    if copy && temperature > 0.0 {
+        bail!("--spec-copy without a drafter is greedy only");
+    }
+    if oracle.is_some() == (drafting || copy) {
+        bail!("{usage}: pass --oracle, or --drafter and / or --mtp, or --spec-copy 1");
     }
     crate::m1::load(dir, &o)?;
-    if !drafting {
+    if !drafting && !copy {
         agens_cuda::m1::spec_init(true, None, 0)?;
     }
-    agens_cuda::m1::spec_sampling(temperature, seed)?;
+    agens_cuda::m1::spec_sampling_filtered(temperature, top_k, top_p, min_p, seed)?;
     crate::tp::start()?; // tensor parallel: followers execute the leader's calls from here
     // reference tokens (oracle drafts; with the drafter: optional comparison, AGENS_SPEC_REF=ref.json)
     let ref_path = oracle.clone().or_else(|| std::env::var("AGENS_SPEC_REF").ok());
@@ -63,6 +71,7 @@ pub fn run(args: &[String]) -> Result<()> {
         None => BTreeMap::new(),
     };
     let prompts: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(prompts_path)?)?;
+    let base = std::path::Path::new(prompts_path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let mut results = Vec::new();
     let (mut all_steps, mut all_tok) = (0usize, 0usize);
     let mut by_class: BTreeMap<String, Vec<(usize, f64, usize, usize)>> = BTreeMap::new();  // (new, s, steps, prompt)
@@ -71,6 +80,9 @@ pub fn run(args: &[String]) -> Result<()> {
     // unless it was one, then the case's ids (which start with the newline after the end-of-turn token).
     let mut last_full: Option<i32> = None;
     let mut lk = crate::lookup::Lookup::new(); // copy-from-context proposals (hybrid drafting)
+    if copy {
+        lk = lk.copy_only();
+    }
     let mut by_class_lk: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new(); // lookup steps, steps, acc
     for p in prompts.as_array().context("prompts must be a JSON list")? {
         let name = p["name"].as_str().unwrap_or("?").to_string();
@@ -91,9 +103,10 @@ pub fn run(args: &[String]) -> Result<()> {
         if !append {
             agens_cuda::m1::reset()?;
         }
-        agens_cuda::m1::spec_sampling(temperature, seed)?; // per prompt: the same prompt samples the same way
+        agens_cuda::m1::spec_sampling_filtered(temperature, top_k, top_p, min_p, seed)?; // per prompt: the same prompt samples the same way
         let t0 = Instant::now();
-        let mut bonus = agens_cuda::m1::prefill(&ids)?;
+        let (mut bonus, fed) = crate::mm::case_prefill(p, &ids, &base)?;  // "images": image cases
+        ids = fed;
         let t_prefill = t0.elapsed().as_secs_f64();
         if std::env::var("AGENS_M1_MEM_TRACE").is_ok() {
             crate::m1::report_mem(&format!("after the prefill of {name} ({} tokens)", ids.len()));
@@ -112,7 +125,12 @@ pub fn run(args: &[String]) -> Result<()> {
                     agens_cuda::m1::profiler(steps == 8)?;
                 }
             }
-            let emitted = if drafting {
+            let emitted = if copy {
+                let hint = lk.propose();
+                let em = crate::lookup::copy_step(bonus, &hint)?;
+                lk.record(&em);
+                em
+            } else if drafting {
                 let hint = lk.propose();
                 let em = if hint.is_empty() {
                     agens_cuda::m1::spec_step(bonus)?.0
@@ -162,7 +180,7 @@ pub fn run(args: &[String]) -> Result<()> {
         );
         all_steps += steps;
         all_tok += out.len() - 1;
-        if drafting {
+        if drafting || copy {
             let e = by_class_lk.entry(class.clone()).or_default();
             e.0 += lk.used - lk0.0;
             e.1 += lk.steps - lk0.1;
@@ -390,7 +408,8 @@ pub(crate) fn batch_max() -> usize {
     std::env::var("AGENS_SPEC_BATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(16)
 }
 /// Device bytes finish_drafter will allocate (for the memory plan): kernels/m1 spec_init + m1_draft.cu setup.
-pub(crate) fn spec_reserve(cap_rows: usize, kda_layers: usize, w4: bool, wctx: usize, bcsa_layers: usize)
+/// `drafter` false (copy-only drafting, MTP alone): no drafter ring / buffers and no target capture.
+pub(crate) fn spec_reserve(cap_rows: usize, kda_layers: usize, w4: bool, wctx: usize, bcsa_layers: usize, drafter: bool)
                             -> Vec<(String, usize)> {
     let (hid, kdim) = (5120usize, 2 * 16 * 128 + 48 * 128);
     let nb = wctx / 4;
@@ -399,7 +418,7 @@ pub(crate) fn spec_reserve(cap_rows: usize, kda_layers: usize, w4: bool, wctx: u
     let cap: usize = std::env::var("AGENS_SPEC_FAR_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
     let means = std::env::var("AGENS_KV_TIER").map(|v| v == "2").unwrap_or(false);
     let cache = if union && means && cap > 0 { bcsa_layers * (cap * (8 + 2 * 2048) + nb * 4 + 4096) } else { 0 };
-    vec![
+    let mut v = vec![
         (format!("spec: far-branch union cache ({cap} blocks x {bcsa_layers} layers)"), cache),
         // ak_far_decode_multi_ws_bytes(wctx, 8): block keys + marks + union block means + one query's scratch
         ("spec: far-branch union workspace".to_string(),
@@ -418,11 +437,17 @@ pub(crate) fn spec_reserve(cap_rows: usize, kda_layers: usize, w4: bool, wctx: u
         ("drafter: batched rings + buffers".to_string(), if batch_max() > 0 {
             2 * batch_max() * 2 * 5 * 4096 * 1024 * 2 + 8 * batch_max() * (248320 * 2 + 2 * 17408 * 2 + 32 * 9 * 128 * 4)
         } else { 0 }),
+        // the batched verify's logits ([8 B][VOCAB] bf16) beyond the prefill chunk's scratch (1024 x 24 x 512 bf16)
+        ("spec: batched verify logits".to_string(), (8 * batch_max() * 248320 * 2).saturating_sub(1024 * 24 * 512 * 2)),
         ("attention: batched verify slots".to_string(), if batch_max() > 0 {
             let r = 8 * batch_max().max(2);
             r * (4104 + wctx) * 4 + 2 * r * 66 * (24 * 256 * 2 + 24 * 4)
         } else { 0 }),
-    ]
+    ];
+    if !drafter {
+        v.retain(|(n, _)| !n.starts_with("drafter") && !n.starts_with("spec: target capture"));
+    }
+    v
 }
 
 /// bf16 [n][k] -> W4 g128 in the compressed-tensors layout (packed I32 [n][k/8], scales BF16 [n][k/128]) by
@@ -519,6 +544,7 @@ pub fn run_batch(args: &[String]) -> Result<()> {
     agens_cuda::m1::spec_sampling(0.0, 1)?;
     crate::tp::start()?;
     let prompts: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(prompts_path)?)?;
+    let base = std::path::Path::new(prompts_path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let prompts = prompts.as_array().context("prompts must be a JSON list")?;
     let mut results = vec![serde_json::Value::Null; prompts.len()];
     let mut by_class: BTreeMap<String, Vec<(usize, f64, usize)>> = BTreeMap::new();
@@ -534,7 +560,7 @@ pub fn run_batch(args: &[String]) -> Result<()> {
             let ids: Vec<i32> = p["ids"].as_array().context("ids")?.iter().map(|x| x.as_i64().unwrap() as i32).collect();
             let id = agens_cuda::m1::session_new()?;
             agens_cuda::m1::session_use(id)?;
-            let b = agens_cuda::m1::prefill(&ids)?;
+            let (b, ids) = crate::mm::case_prefill(p, &ids, &base)?;
             sess.push(id);
             let mut l = crate::lookup::Lookup::new();
             l.reset(&ids);

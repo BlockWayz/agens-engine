@@ -11,8 +11,9 @@ constexpr int kFeat = 5;     // target context features (layers 8, 21, 35, 53, 6
 //   [1] P (anchor position)  [2] anchor (bonus) token  [3..9] the 7 drafts (written by propose_b)
 //   [10..17] pool rows of the 8 verify positions  [18] KDA slot  [19] drafter ring  [20..21] r2t ptr  [22..23] Engram
 //   prev ptr  [24..25] far-cache tag  [26] host proposal length nh  [27..33] host proposal (hybrid drafting: replaces
-//   the first nh drafts after propose_b)
-constexpr int kRecInts = 40;
+//   the first nh drafts after propose_b)  [34..39] sampling (T, top-k, top-p, min-p, seed, step)  [40] rope delta
+//   (image input)
+constexpr int kRecInts = 44;
 
 int register_weight(const char* name, void* ptr);  // bf16 device pointers, checkpoint names (gate_up merged)
 // a linear as W4 instead (k-tiled layout of ak_w4_repack_kt), under the name of its bf16 weight

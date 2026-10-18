@@ -38,6 +38,11 @@ struct AotLaunch {
 #include "../aot/kda_prefill_aot_sm90.inc"
 #define AGENS_AOT_SM90 1
 #endif
+// sm86 cubins (AOT_TARGET=86, recorded on an sm89 card with the sm89 pins; built, not tested on 8.6 hardware)
+#if __has_include("../aot/kda_prefill_aot_sm86.inc")
+#include "../aot/kda_prefill_aot_sm86.inc"
+#define AGENS_AOT_SM86 1
+#endif
 // tensor-parallel rank shares (AOT_HEADS=8 / 4 in tools/triton_aot.py): 8 q / k heads + 24 v heads (tp2), 4 + 12 (tp4)
 #if __has_include("../aot/kda_prefill_aot_sm89_h8.inc")
 #include "../aot/kda_prefill_aot_sm89_h8.inc"
@@ -151,6 +156,9 @@ const AotLaunch* find(const std::string& cls, int idx) {
 #endif
 #ifdef AGENS_AOT_SM90
     case 9016: return find_in(kAotKdaPrefill_sm90, cls, idx);
+#endif
+#ifdef AGENS_AOT_SM86
+    case 8616: return find_in(kAotKdaPrefill_sm86, cls, idx);
 #endif
 #ifdef AGENS_AOT_SM89_H8
     case 8908: return find_in(kAotKdaPrefill_sm89_h8, cls, idx);
@@ -366,6 +374,9 @@ extern "C" int ak_kda_prefill_preload() {
 #endif
 #ifdef AGENS_AOT_SM90
     case 9016: return preload_all(kAotKdaPrefill_sm90);
+#endif
+#ifdef AGENS_AOT_SM86
+    case 8616: return preload_all(kAotKdaPrefill_sm86);
 #endif
 #ifdef AGENS_AOT_SM89_H8
     case 8908: return preload_all(kAotKdaPrefill_sm89_h8);
