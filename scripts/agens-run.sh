@@ -15,7 +15,7 @@
 #   12gb  --budget-gib 12, context and drafter per the measured 12 GB plan (see README), otherwise as 16gb.
 #   24gb / 48gb  --budget-gib 23 / 46, server mode (batched requests and batched speculative decoding).
 set -euo pipefail
-PROFILE=16gb; MODEL=; DRAFTER=; GPU=0; PORT=30000; IMAGE=${AGENS_IMAGE:-agens-engine:rc1}; EXTRA=()
+PROFILE=16gb; MODEL=; DRAFTER=; GPU=0; PORT=30000; IMAGE=${AGENS_IMAGE:-ghcr.io/blockwayz/agens-engine:1.0.0}; EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --profile) PROFILE=$2; shift 2;;

@@ -5,9 +5,9 @@ same quality and speed gates as the current release, and its numbers are measure
 
 ## Next
 
-- **Speculative decoding on 12 GB GPUs.** The 12 GB profile currently uses context-copy drafting only, which needs
-  no extra memory. A lightweight multi-token-prediction (MTP) head, about one decoder layer that shares the model's
-  output layer, will bring model-based drafting to 12 GB.
+- **12 GB GPUs.** 12 GB support is in development and is not released yet. It will start with context-copy drafting,
+  which needs no extra memory; a lightweight multi-token-prediction (MTP) head, about one decoder layer that shares the
+  model's output layer, will then bring model-based drafting to 12 GB.
 - **MTP drafting on all profiles.** MTP joins context-copy and the companion drafter in one drafting chain; the
   engine picks whichever proposes the most accepted tokens.
 - **Measured results on more GPUs.** Native runs and tuned kernels on 12 GB and 16 GB cards, including laptop GPUs and
