@@ -70,8 +70,7 @@ weight including scales):
 | tool calls | 112.1 | 2.77 | 69.0 | 2.42 |
 | agent session (8K context) | 139.0 | 3.80 | 75.5 | 2.73 |
 
-The 219K-token prompt took 151 s to prefill; the conversation then grew to 239K tokens of context. Device memory
-peaked at 16.64 GB, inside the 17.18 GB (16 GiB) cap.
+The 219K-token prompt took 151 s to prefill; the conversation then grew to 239K tokens of context. Device memory peaked at 15.5 GiB (16.64 GB), inside the engine's hard 16 GiB cap. On a 16 GB GPU that also drives a display, less memory is free; use a shorter context there.
 
 Quality of the 16 GB build against the other v1 builds:
 
