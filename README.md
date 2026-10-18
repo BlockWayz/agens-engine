@@ -72,6 +72,8 @@ weight including scales):
 
 The 219K-token prompt took 151 s to prefill; the conversation then grew to 239K tokens of context. Device memory peaked at 15.5 GiB (16.64 GB), inside the engine's hard 16 GiB cap. On a 16 GB GPU that also drives a display, less memory is free; use a shorter context there.
 
+Agens Engine 1.0 serves text only; image input is not supported yet.
+
 Quality of the 16 GB build against the other v1 builds:
 
 | Build | GPQA Diamond (best of 4 runs) | HumanEval (pass@1) |
