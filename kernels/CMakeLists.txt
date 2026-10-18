@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
-# Targets: sm89 (Ada), sm90 (H200), sm120 (RTX 5090 / PRO 6000 Blackwell, T9). All three always build.
+# Targets: sm86 (Ampere, RTX 3090), sm89 (Ada), sm90 (H200), sm120 (RTX 5090 / PRO 6000 Blackwell, T9). All always build.
 # Must be set before project(): enabling CUDA defines a (sm_52) default otherwise.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89 90 120)
+  set(CMAKE_CUDA_ARCHITECTURES 86 89 90 120)
 endif()
 project(agens_kernels LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)

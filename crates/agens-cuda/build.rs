@@ -1,5 +1,5 @@
 // With `--features cuda`, builds kernels/ through CMake and links libagens_kernels + cudart.
-// AGENS_CUDA_ARCHS overrides the target list (default "89;90;120": Ada, H200, Blackwell sm120).
+// AGENS_CUDA_ARCHS overrides the target list (default "86;89;90;120": Ampere, Ada, H200, Blackwell sm120).
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
@@ -21,7 +21,7 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=cudart");
         return;
     }
-    let archs = std::env::var("AGENS_CUDA_ARCHS").unwrap_or_else(|_| "89;90;120".into());
+    let archs = std::env::var("AGENS_CUDA_ARCHS").unwrap_or_else(|_| "86;89;90;120".into());
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("kernels");
     std::fs::create_dir_all(&out).unwrap();
     let run = |args: &[&str]| {

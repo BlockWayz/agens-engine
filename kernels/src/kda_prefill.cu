@@ -55,7 +55,8 @@ struct AotLaunch {
 #include "../aot/kda_prefill_aot_sm90_h4.inc"
 #define AGENS_AOT_SM90_H4 1
 #endif
-// PTX of the sm89 kernels (AOT_PTX=1): JIT-compiled by the driver on GPUs without a table of their own (sm100 / sm120)
+// PTX of the sm89 kernels (AOT_PTX=1): JIT-compiled by the driver on GPUs without a table of their own (sm100 / sm120,
+// and sm80-sm88 after load() retargets the PTX: see retarget_ptx)
 #if __has_include("../aot/kda_prefill_aot_ptx_sm89.inc")
 #include "../aot/kda_prefill_aot_ptx_sm89.inc"
 #define AGENS_AOT_PTX_SM89 1
@@ -70,6 +71,22 @@ struct Loaded {
 };
 std::map<std::pair<int, const unsigned char*>, Loaded> g_loaded;  // modules are per device (context)
 
+// The sm89 PTX declares `.target sm_89`, which the driver refuses to JIT for an older GPU. On Ampere (sm80-sm88) return
+// a copy that targets the device's own arch; the kernels use only sm80 instructions (mma.sync bf16, ldmatrix, cp.async;
+// no fp8). Empty string: not PTX, or no rewrite needed. Validated on sm86 (RTX 3090).
+std::string retarget_ptx(const unsigned char* image) {
+  if (image[0] != '/' && image[0] != '.') return {};  // a cubin (ELF), not PTX text
+  int dev = 0, major = 0, minor = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+  if (major != 8 || minor >= 9) return {};
+  std::string ptx(reinterpret_cast<const char*>(image));
+  const std::string from = ".target sm_89";
+  if (const size_t at = ptx.find(from); at != std::string::npos) ptx.replace(at, from.size(), ".target sm_8" + std::to_string(minor));
+  return ptx;
+}
+
 int load(const AotLaunch& l, CUfunction* out) {
   int dev = 0;
   cudaGetDevice(&dev);
@@ -79,7 +96,8 @@ int load(const AotLaunch& l, CUfunction* out) {
     return 0;
   }
   CUmodule m;
-  if (const CUresult r = cuModuleLoadData(&m, l.cubin); r != CUDA_SUCCESS)  // out of memory is not a bad image
+  const std::string ptx = retarget_ptx(l.cubin);
+  if (const CUresult r = cuModuleLoadData(&m, ptx.empty() ? (const void*)l.cubin : ptx.c_str()); r != CUDA_SUCCESS)  // out of memory is not a bad image
     return r == CUDA_ERROR_OUT_OF_MEMORY ? (int)cudaErrorMemoryAllocation : (int)cudaErrorInvalidKernelImage;
   CUfunction f;
   if (cuModuleGetFunction(&f, m, l.kernel) != CUDA_SUCCESS) return (int)cudaErrorInvalidDeviceFunction;
@@ -166,7 +184,7 @@ const AotLaunch* find(const std::string& cls, int idx) {
 #endif
     default:
 #ifdef AGENS_AOT_PTX_SM89
-      if (major >= 10 && H == 16) return find_in(kAotKdaPrefill_ptx_sm89, cls, idx);
+      if ((major >= 10 || (major == 8 && minor < 9)) && H == 16) return find_in(kAotKdaPrefill_ptx_sm89, cls, idx);
 #endif
       return nullptr;
   }
@@ -381,7 +399,7 @@ extern "C" int ak_kda_prefill_preload() {
 #endif
     default:
 #ifdef AGENS_AOT_PTX_SM89
-      if (major >= 10 && H == 16) return preload_all(kAotKdaPrefill_ptx_sm89);
+      if ((major >= 10 || (major == 8 && minor < 9)) && H == 16) return preload_all(kAotKdaPrefill_ptx_sm89);
 #endif
       return 0;
   }

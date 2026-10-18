@@ -19,6 +19,8 @@ Third-party components keep their own licenses (`NOTICE`, `THIRD_PARTY_NOTICES.m
 
 - A GPU with 16 GB, 24 GB or 48 GB of memory and a CUDA 12.9-capable driver.
   - Prebuilt kernels: compute capability 8.9 and 12.0.
+  - Compute capability 8.6 (RTX 3090) when built from source with `86` in `CMAKE_CUDA_ARCHITECTURES` (see
+    [Building from source](#building-from-source)): the KDA prefill kernels then run from the sm89 PTX, retargeted at load.
 - Host RAM: 32 GB or more for the full 262K context. The tiered KV cache keeps up to ~24 GB in pinned host memory.
 - Docker with the NVIDIA container toolkit.
 - The model checkpoint for your GPU size and, optionally, the drafter checkpoint.
@@ -115,10 +117,13 @@ measured GPUs, and multi-GPU support.
 ## Building from source
 
 ```bash
-cmake -S kernels -B kernels/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89;120" -DAGENS_BUILD_ORACLE=ON \
+cmake -S kernels -B kernels/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="86;89;120" -DAGENS_BUILD_ORACLE=ON \
   -DAGENS_TORCH_PREFIX=$(python3 -c 'import torch;print(torch.utils.cmake_prefix_path)')
 cmake --build kernels/build -j
 cargo build --release --features m1 -p agens-cli
 ```
 
 The build needs CUDA 12.9, CMake 3.27+, Rust stable and libtorch (PyTorch 2.11).
+
+Drop `86` from the list if you do not need Ampere; it only adds build time. `cargo build` passes `AGENS_CUDA_ARCHS`
+(default `86;89;90;120`) to the kernel build when it builds the kernels itself.
