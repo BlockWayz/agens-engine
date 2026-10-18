@@ -74,6 +74,8 @@ The 219K-token prompt took 151 s to prefill; the conversation then grew to 239K 
 
 Agens Engine 1.0 serves text only; image input is not supported yet.
 
+In 1.0, speculative decoding (drafter and context copy) runs for greedy requests (`temperature: 0`); sampled requests decode one token per step. All speeds above are greedy. Speculative sampling is planned for 1.0.1.
+
 Quality of the 16 GB build against the other v1 builds:
 
 | Build | GPQA Diamond (best of 4 runs) | HumanEval (pass@1) |
