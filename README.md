@@ -24,8 +24,9 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md).
 ## Requirements
 
 - A GPU with 16 GB, 24 GB or 48 GB of memory and a CUDA 12.9-capable driver.
-  - Prebuilt kernels: compute capability 8.9 and 9.0 (validated), 12.0 and 8.6 (built, not yet validated on
-    hardware).
+  - Prebuilt kernels: compute capability 8.6, 8.9 and 9.0 (validated; 8.6 by community contributor
+    [@mmssix](https://github.com/mmssix) on a 24 GB card, see [Community results](#community-results)), 12.0 (built,
+    not yet validated on hardware).
 - Host RAM: 32 GB or more for the full 262K context. The tiered KV cache keeps up to ~24 GB in pinned host memory.
 - Docker with the NVIDIA container toolkit.
 - The model checkpoint for your GPU size and, optionally, the drafter checkpoint and the MTP head
@@ -333,6 +334,26 @@ Every completion was identical at every concurrency level. In server mode, greed
 without the drafter (13 test prompts, 1 to 16 concurrent requests). Above 4
 concurrent requests the `48gb` profile gains little: batched verify over the KV cache tiered to host memory is the
 limit (see the roadmap).
+
+## Community results
+
+Measured by users on their own hardware and reported in this repository. Thank you.
+
+**Compute capability 8.6, 24 GB GPU** ([@mmssix](https://github.com/mmssix), [#1](https://github.com/BlockWayz/agens-engine/pull/1)):
+image 1.1.0, unmodified, `--profile 24gb`, Engine-16GB build with the DFlash2 drafter. Healthy in about 35 s,
+17.3 GiB used after start. Prefill: 26,365-token prompt at 744 tok/s. Decode, one stream, 400 tokens, thinking off,
+mean of 2 runs (tok/s):
+
+| prompt | greedy, drafter | greedy, no drafter | T 0.6, drafter | T 0.6, no drafter |
+|---|---|---|---|---|
+| chat | 65.0 | 44.9 | 49.0 | 43.5 |
+| code | 52.9 | 44.1 | 50.6 | 42.5 |
+| reasoning | 79.0 | 44.3 | 63.8 | 41.0 |
+
+Tool calls, the reasoning split, the reasoning budget and session continuation were also checked: a follow-up turn on
+a 54K-token conversation took 5.7 s with a session ID and 77 s without one.
+
+If you run the engine on another GPU, please open an issue with your numbers.
 
 ## Roadmap
 
