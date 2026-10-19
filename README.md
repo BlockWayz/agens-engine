@@ -25,8 +25,8 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md).
 
 - A GPU with 16 GB, 24 GB or 48 GB of memory and a CUDA 12.9-capable driver.
   - Prebuilt kernels: compute capability 8.6, 8.9 and 9.0 (validated; 8.6 by community contributor
-    [@mmssix](https://github.com/mmssix) on a 24 GB card, see [Community results](#community-results)), 12.0 (built,
-    not yet validated on hardware).
+    [@mmssix](https://github.com/mmssix) on a 24 GB card, see [Community results](#community-results)), 12.0 (built; runs on a 96 GB card in a first community report,
+    bf16 weights).
 - Host RAM: 32 GB or more for the full 262K context. The tiered KV cache keeps up to ~24 GB in pinned host memory.
 - Docker with the NVIDIA container toolkit.
 - The model checkpoint for your GPU size and, optionally, the drafter checkpoint and the MTP head
@@ -52,7 +52,7 @@ The same flags work on the image directly:
 ```bash
 docker run --gpus device=0 --ipc=host -p 30000:30000 \
   -v /path/to/model:/model:ro -v /path/to/drafter:/drafter:ro \
-  ghcr.io/blockwayz/agens-engine:1.3.0 --profile 16gb --model /model --drafter /drafter
+  ghcr.io/blockwayz/agens-engine:1.3.1 --profile 16gb --model /model --drafter /drafter
 ```
 
 ## Profiles
@@ -399,6 +399,13 @@ mean of 2 runs (tok/s):
 
 Tool calls, the reasoning split, the reasoning budget and session continuation were also checked: a follow-up turn on
 a 54K-token conversation took 5.7 s with a session ID and 77 s without one.
+
+The same card on image 1.3.0 with the DFlash2 drafter and the MTP head (`--mtp`), greedy, one stream: chat 70.7, code
+59.4, reasoning 93.5 tok/s.
+
+**Compute capability 12.0, 96 GB GPU** ([@mmssix](https://github.com/mmssix)): image 1.3.0 runs with the bf16 v1
+weights, the DFlash2 drafter and the MTP head (`--profile 48gb ... -- --budget-gib 90`). On 1.3.0, add `--gpu-gib 90`
+after the `--` as well, or part of the weights is placed in host memory and decoding is slow (fixed in 1.3.1).
 
 If you run the engine on another GPU, please open an issue with your numbers.
 

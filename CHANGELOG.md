@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.1
+
+### Fixes
+
+- **Weights placed in host memory under a large `--budget-gib`.** In budget mode the weights' own GPU limit stayed at
+  the `--gpu-gib` default of 40 GiB, so weights larger than that (the bf16 build, ~63 GB) put the rest of their layers in
+  host memory and decoded at a few tokens per second, while the KV cache took the GPU memory they should have used. The
+  weights now go first: in budget mode they may use everything the budget leaves after the CUDA context, and the KV
+  cache is planned from what remains. Only the embedding and lookup tables stay in host memory, by design. On 1.3.0,
+  passing `--gpu-gib` equal to `--budget-gib` works around it. The 4-bit profiles were not affected.
+
+### Docs
+
+- README: community results for compute capability 8.6 with MTP and a first 12.0 report.
+
 ## 1.3.0
 
 ### New

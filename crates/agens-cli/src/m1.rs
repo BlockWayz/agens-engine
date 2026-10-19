@@ -102,7 +102,7 @@ fn to_f32_bytes(bf16: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) struct Opts {
-    pub(crate) gpu_gib: f64,
+    pub(crate) gpu_gib: f64,           // GPU budget for the weights (GiB); 0: the --budget-gib cap's room, else 40
     pub(crate) device: usize,
     pub(crate) devices: Vec<i32>,
     pub(crate) new_tokens: usize,
@@ -121,7 +121,7 @@ pub(crate) struct Opts {
 }
 
 pub(crate) fn parse_opts(args: &[String], usage: &str) -> Result<Opts> {
-    let mut o = Opts { gpu_gib: 40.0, device: 0, devices: vec![], new_tokens: 64, wctx: 36868, cuts: 50, tier: "host".into(), seed: 1, pool: 0, sessions: 1, budget_gib: 0.0, drafter: None, tp: 1, mtp: None, copy: false, vision: None };
+    let mut o = Opts { gpu_gib: 0.0, device: 0, devices: vec![], new_tokens: 64, wctx: 36868, cuts: 50, tier: "host".into(), seed: 1, pool: 0, sessions: 1, budget_gib: 0.0, drafter: None, tp: 1, mtp: None, copy: false, vision: None };
     let mut i = 0;
     while i < args.len() {
         let v = args.get(i + 1).context(usage.to_string())?;
@@ -521,8 +521,25 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     };
     let mut by_type: std::collections::BTreeMap<String, (usize, usize)> = Default::default(); // type -> (bytes, params)
     let mut gpu_kinds: std::collections::BTreeMap<&str, usize> = Default::default();
+    // 1.3.1: weights first. In budget mode (no --gpu-gib) the weights may take everything the cap leaves after the CUDA
+    // context, less a 256 MiB margin: they spill to host-mapped memory only when they do not fit under the cap at all, and
+    // the KV pool is planned from what is left (1.3.0 used --gpu-gib's 40 GiB default here, so bf16 weights (~63 GB) under
+    // --budget-gib 90 host-mapped ~13 GB of compute linears while the plan gave the room to a 505K-row KV pool).
+    let weight_budget = if gpu_gib > 0.0 {
+        (gpu_gib * (1u64 << 30) as f64) as usize
+    } else if o.budget_gib > 0.0 {
+        agens_cuda::synchronize()?;
+        let (free, total) = agens_cuda::mem_info()?;
+        let cap = ((o.budget_gib * (1u64 << 30) as f64) as usize).min(total);
+        // with the ballast in place the free memory is the cap's room (total - free counts the ballast); without it
+        // (AGENS_M1_NO_CAP=1) the room is the cap less what is in use
+        let room = if ballast > 0 { free } else { cap.saturating_sub(total - free).min(free) };
+        room.saturating_sub(256 << 20)
+    } else {
+        40usize << 30
+    };
     let mut pl = Placer {
-        gpu_budget: (gpu_gib * (1u64 << 30) as f64) as usize,
+        gpu_budget: weight_budget,
         devs: devs.clone(),
         on_gpu: vec![0; devs.len()],
         on_host: 0,
