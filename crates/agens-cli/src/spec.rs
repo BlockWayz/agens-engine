@@ -304,7 +304,7 @@ pub(crate) fn upload_drafter(dir: &str) -> Result<Drafter> {
 }
 
 /// MTP head checkpoint (docs/mtp.md: train_mtp.py export, `mtp.*` tensor names): bf16 weights to
-/// the GPU (gate + up merged), or W4 g128 RTN at load with AGENS_DRAFT_W4=1 / AGENS_MTP_W4=1 (linears with k % 128 == 0).
+/// the GPU (gate + up merged) as W4 g128 RTN at load (linears with k % 128 == 0; the default), or bf16 with AGENS_MTP_W4=0.
 pub(crate) struct Mtp {
     dir: String,
     bytes: usize,
@@ -318,7 +318,8 @@ pub(crate) fn upload_mtp(dir: &str) -> Result<Mtp> {
         bail!("mtp {dir}: expected hidden 5120 and one layer");
     }
     let flag = |k: &str| std::env::var(k).map(|v| v == "1").unwrap_or(false);
-    let w4 = flag("AGENS_MTP_W4") || flag("AGENS_DRAFT_W4");
+    // W4 by default (1.2: the measured configuration; 0.23 GB instead of 0.85); AGENS_MTP_W4=0 keeps bf16
+    let w4 = std::env::var("AGENS_MTP_W4").map(|v| v != "0").unwrap_or(true) || flag("AGENS_DRAFT_W4");
     let mut names: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -367,18 +368,37 @@ pub(crate) fn upload_mtp(dir: &str) -> Result<Mtp> {
     }
     Ok(Mtp { dir: dir.to_string(), bytes, window, w4 })
 }
+/// The MTP chain's shortlist head (1.2): its first AGENS_MTP_VOCAB (default 32768; 0 = the whole head) token ids, by
+/// frequency in Volundr V1's own generations (tools/mtp_vocab.py; 6.1% of held-out output tokens fall outside the first
+/// 32768, and the chain also scores the DFlash2 drafter's 16 candidates of each slot). A chain step then reads 0.17 GB
+/// of the INT8 head instead of 1.27 GB.
+static MTP_VOCAB: &[u8] = include_bytes!("mtp_vocab.bin");
+pub(crate) fn mtp_vocab_n() -> usize {
+    std::env::var("AGENS_MTP_VOCAB").ok().and_then(|v| v.parse().ok()).unwrap_or(32768).min(MTP_VOCAB.len() / 4)
+}
 pub(crate) fn finish_mtp(m: &Mtp, cap_rows: usize) -> Result<()> {
+    let n = mtp_vocab_n();
+    let ids: Vec<i32> = MTP_VOCAB.chunks_exact(4).take(n).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i32).collect();
+    agens_cuda::m1::mtp_shortlist(&ids)?;
     let own = agens_cuda::m1::mtp_setup(cap_rows, m.window)?;
-    eprintln!("mtp {}: weights {:.2} GB ({}), buffers {:.2} GB (window {}, {cap_rows}-row context calls)", m.dir,
-              m.bytes as f64 / 1e9, if m.w4 { "W4 g128 linears + bf16" } else { "bf16" }, own as f64 / 1e9, m.window);
+    eprintln!("mtp {}: weights {:.2} GB ({}), buffers {:.2} GB (window {}, context in passes of <= 256 rows), head {}", m.dir,
+              m.bytes as f64 / 1e9, if m.w4 { "W4 g128 linears + bf16" } else { "bf16" }, own as f64 / 1e9, m.window,
+              if n > 0 { format!("shortlist {n} ids + the drafter's candidates (INT8 head)") } else { "whole".to_string() });
     Ok(())
 }
-/// Device bytes finish_mtp allocates (memory plan): rings per session slot + context-row buffers + chain buffers.
+/// Device bytes finish_mtp allocates (memory plan, kernels/m1/m1_mtp.cu setup): a KV ring + pending row per KDA slot
+/// (sessions + 1), context-row buffers for a 256-row pass of a prefill chunk (or a batched verify's 8 B rows), chain buffers per
+/// sequence of a batched verify (AGENS_SPEC_BATCH_MAX; 1 without), the W4 dequant tile.
 pub(crate) fn mtp_reserve(cap_rows: usize, sessions: usize) -> (String, usize) {
-    let rows = cap_rows + 1;
-    ("mtp: KV rings + context buffers".to_string(),
-     (sessions + 1) * (2 * 4096 * 1024 * 2 + 5120 * 2) + rows * (5120 * 2 * 5 + 2 * 1024 * 2 + 8)
-         + 248320 * 2 + 2 * 17408 * 2 * 2 + (24 * 16 * 256 * 4) + (16 << 20))
+    let ns = batch_max().max(1);
+    let rows = cap_rows.clamp(8, 256).max(8 * ns);  // m1_mtp.cu kMatRows
+    let hid = 5120usize;
+    let per_row = 7 * hid * 2 + 2 * 1024 * 2 + 8;
+    let per_seq = 2 * hid * 2 + 2 * 6144 * 2 + 3 * 6144 * 2 + 7 * 2 * 1024 * 2 + 3 * 17408 * 2 + 248320 * 2
+        + 24 * 16 * (256 + 2) * 4 + 32;
+    (format!("mtp: KV rings x {} + {rows}-row context passes + chain x {ns}", sessions + 1),
+     (sessions + 1) * (2 * 4096 * 1024 * 2 + hid * 2 + 4) + rows * per_row + ns * per_seq + (16 << 20)
+         + mtp_vocab_n() * 4 * (1 + ns) + ns * 16 * 4)
 }
 
 /// After the target's init: speculative buffers (capture of cap_rows tokens = the prefill chunk, KDA stash) and the
@@ -512,7 +532,8 @@ pub(crate) fn quantize_w4(b: &[u8], n: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
 /// with AGENS_M1_BI=1: compare with tools/compare_tokens.py). Prints per class the per-sequence tok/s and acceptance,
 /// and the aggregate tok/s of each batch.
 pub fn run_batch(args: &[String]) -> Result<()> {
-    let usage = "agens m1-spec-batch <ckpt_dir> <prompts.json> <out.json> --drafter DIR [--batch B] [m1 flags]";
+    let usage = "agens m1-spec-batch <ckpt_dir> <prompts.json> <out.json> --drafter DIR and / or --mtp DIR [--batch B] \
+                 [m1 flags]";
     let dir = args.first().context(usage)?;
     let prompts_path = args.get(1).context(usage)?;
     let out_path = args.get(2).context(usage)?;
@@ -530,7 +551,6 @@ pub fn run_batch(args: &[String]) -> Result<()> {
         }
         i += 2;
     }
-    let drafter = drafter.context(usage)?;
     if std::env::var("AGENS_SPEC_BATCH_MAX").is_err() {
         std::env::set_var("AGENS_SPEC_BATCH_MAX", bsz.to_string());
     }
@@ -539,7 +559,10 @@ pub fn run_batch(args: &[String]) -> Result<()> {
         rest.push((bsz + 1).to_string());
     }
     let mut o = crate::m1::parse_opts(&rest, usage)?;
-    o.drafter = Some(drafter);
+    if drafter.is_none() && o.mtp.is_none() {
+        bail!("{usage}");
+    }
+    o.drafter = drafter;
     crate::m1::load(dir, &o)?;
     agens_cuda::m1::spec_sampling(0.0, 1)?;
     crate::tp::start()?;

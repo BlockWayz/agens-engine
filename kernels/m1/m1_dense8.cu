@@ -1,5 +1,5 @@
-// INT8 KV for the dense attention layer (AGENS_KV_INT8_DENSE=1; one device, personal mode): K/V stored int8 + one fp32
-// scale per (token, kv head) with the INT8 KV quantizer of the BCSA layers (ak_kv_quant_store: scale = amax / 127,
+// INT8 KV for the dense attention layer (AGENS_KV_INT8_DENSE=1; one device per rank, personal mode): K/V stored int8 + one fp32
+// scale per (token, kv head; a tensor-parallel rank holds its head share, m1d8::set_heads) with the INT8 KV quantizer of the BCSA layers (ak_kv_quant_store: scale = amax / 127,
 // q = rint(x / scale)), read as bf16(q * scale). 2,080 instead of 4,096 bytes per token (0.53 GB at 262K).
 // flashinfer reads bf16 K/V, so attention runs over tiles of TILE positions: a tile is dequantized into a bf16 staging
 // buffer, attended (decode / verify: the engine's multi-query attention, one bs = 1 plan per query -- every tile is <=
@@ -28,7 +28,8 @@ int ak_prefill_staged_lse(void* q, void* kc, void* vc, int* indices, int T, int 
 namespace m1d8 {
 namespace {
 using bf16 = __nv_bfloat16;
-constexpr int KVH = 4, HD = 256, QH = 24, MAXT = 1024;  // MAXT: prefill chunk rows
+constexpr int KVH_FULL = 4, HD = 256, QH_FULL = 24, MAXT = 1024;  // MAXT: prefill chunk rows
+int KVH = KVH_FULL, QH = QH_FULL;  // this rank's heads (tensor parallel: set_heads before alloc)
 constexpr int MSLOT1 = 3, MSLOT8 = 4;                     // multi-attention slots: decode (T = 1) / verify (T <= 8)
 
 #define CK(x)                                                                          \
@@ -66,7 +67,7 @@ __global__ void iota_k(int* p, int n) {
 }
 // staging[j] = dequant(row r2t[k0 + j]) for j < n, n = clamp(len - k0, 0, TILE) with len = *len_dev or len_host
 __global__ void dequant_tile_k(const int8_t* q, const float* sc, const int* r2t, int k0, const long long* last_pos,
-                               int len_host, bf16* dst) {
+                               int len_host, bf16* dst, int KVH) {
   const int len = last_pos ? (int)(*last_pos + 1) : len_host;
   const int n = min(max(len - k0, 0), TILE);
   const int per_row = KVH * HD / 8;
@@ -91,7 +92,7 @@ __global__ void tile_ranges_k(const long long* pos, int T, int k0, int* rng) {
 }
 // running merge of normalized tile results: (acc, al) <- merge((acc, al), (o_k, l_k)) in fp32, tile order; first: copy.
 // An empty tile (l_k = -inf) leaves the state as it is.
-__global__ void merge_k(const bf16* to, const float* tl, float* acc, float* al, int rows, int first) {
+__global__ void merge_k(const bf16* to, const float* tl, float* acc, float* al, int rows, int first, int QH) {
   const long n = (long)rows * QH * HD;
   for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x) {
     const long r = i / HD;  // (token, head)
@@ -112,7 +113,7 @@ __global__ void merge_k(const bf16* to, const float* tl, float* acc, float* al, 
   }
 }
 // lse update after the o update of the same tile (one thread per (token, head) row)
-__global__ void merge_lse_k(const float* tl, float* al, int rows) {
+__global__ void merge_lse_k(const float* tl, float* al, int rows, int QH) {
   const int n = rows * QH;
   for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < n; r += gridDim.x * blockDim.x) {
     const float la = al[r], lk = tl[r];
@@ -128,8 +129,8 @@ __global__ void final_k(const float* acc, bf16* o, long n) {
 }
 int grid(long n) { return (int)std::min<long>((n + 255) / 256, 4096); }
 int merge(int rows, bool first, cudaStream_t s) {
-  merge_k<<<grid((long)rows * QH * HD), 256, 0, s>>>(g.to, g.tl, g.acc, g.al, rows, first ? 1 : 0);
-  if (!first) merge_lse_k<<<grid((long)rows * QH), 256, 0, s>>>(g.tl, g.al, rows);
+  merge_k<<<grid((long)rows * QH * HD), 256, 0, s>>>(g.to, g.tl, g.acc, g.al, rows, first ? 1 : 0, QH);
+  if (!first) merge_lse_k<<<grid((long)rows * QH), 256, 0, s>>>(g.tl, g.al, rows, QH);
   return (int)cudaGetLastError();
 }
 }  // namespace
@@ -139,6 +140,11 @@ bool on() {
   return v;
 }
 size_t bytes() { return g.bytes; }
+int set_heads(int qh, int kvh) {
+  if (g.kq || qh < 1 || kvh < 1 || qh > QH_FULL || kvh > KVH_FULL) return (int)cudaErrorInvalidValue;
+  QH = qh, KVH = kvh;
+  return 0;
+}
 size_t scratch_bytes() {
   return (size_t)2 * TILE * KVH * HD * 2 + (size_t)TILE * 4 + (size_t)MAXT * QH * HD * (2 + 4) + (size_t)MAXT * QH * 8 + 4096;
 }
@@ -166,8 +172,8 @@ int attend_dec(void* q, const long long* pos, const int* r2t, int T, int ntiles,
   const int ms = T == 1 ? MSLOT1 : (T == 8 ? MSLOT8 : MSLOT8 + 1);  // a multi slot is sized for one T
   for (int k = 0; k < ntiles; ++k) {
     const int k0 = k * TILE;
-    dequant_tile_k<<<grid((long)TILE * KVH * HD / 8), 256, 0, s>>>(g.kq, g.ks, r2t, k0, pos + T - 1, 0, g.kst);
-    dequant_tile_k<<<grid((long)TILE * KVH * HD / 8), 256, 0, s>>>(g.vq, g.vs, r2t, k0, pos + T - 1, 0, g.vst);
+    dequant_tile_k<<<grid((long)TILE * KVH * HD / 8), 256, 0, s>>>(g.kq, g.ks, r2t, k0, pos + T - 1, 0, g.kst, KVH);
+    dequant_tile_k<<<grid((long)TILE * KVH * HD / 8), 256, 0, s>>>(g.vq, g.vs, r2t, k0, pos + T - 1, 0, g.vst, KVH);
     tile_ranges_k<<<1, 32, 0, s>>>(pos, T, k0, g.rng);
     CK(ak_attn_decode_multi_plan_mode(ms, T, g.rng, 4, g.iota, TILE, QH, KVH, nullptr, 1, s));
     CK(ak_attn_decode_multi(ms, q, g.kst, g.vst, QH, KVH, scale, g.to, g.tl, s));
@@ -182,15 +188,15 @@ int attend_prefill(void* q, int seq0, int T, const int* r2t, float scale, void* 
   bool first = true;
   for (int k0 = 0; k0 < seq0; k0 += TILE) {  // keys before the chunk: every query sees all of them (no mask)
     const int n = std::min(TILE, seq0 - k0);
-    dequant_tile_k<<<grid((long)n * KVH * HD / 8), 256, 0, s>>>(g.kq, g.ks, r2t, k0, nullptr, seq0, g.kst);
-    dequant_tile_k<<<grid((long)n * KVH * HD / 8), 256, 0, s>>>(g.vq, g.vs, r2t, k0, nullptr, seq0, g.vst);
+    dequant_tile_k<<<grid((long)n * KVH * HD / 8), 256, 0, s>>>(g.kq, g.ks, r2t, k0, nullptr, seq0, g.kst, KVH);
+    dequant_tile_k<<<grid((long)n * KVH * HD / 8), 256, 0, s>>>(g.vq, g.vs, r2t, k0, nullptr, seq0, g.vst, KVH);
     CK(ak_prefill_staged_lse(q, g.kst, g.vst, g.iota, T, n, 0, QH, KVH, scale, g.to, g.tl, s));
     CK(merge(T, first, s));
     first = false;
   }
   // the chunk's own keys (positions seq0 .. seq0 + T - 1): causal
-  dequant_tile_k<<<grid((long)T * KVH * HD / 8), 256, 0, s>>>(g.kq, g.ks, r2t, seq0, nullptr, seq0 + T, g.kst);
-  dequant_tile_k<<<grid((long)T * KVH * HD / 8), 256, 0, s>>>(g.vq, g.vs, r2t, seq0, nullptr, seq0 + T, g.vst);
+  dequant_tile_k<<<grid((long)T * KVH * HD / 8), 256, 0, s>>>(g.kq, g.ks, r2t, seq0, nullptr, seq0 + T, g.kst, KVH);
+  dequant_tile_k<<<grid((long)T * KVH * HD / 8), 256, 0, s>>>(g.vq, g.vs, r2t, seq0, nullptr, seq0 + T, g.vst, KVH);
   CK(ak_prefill_staged_lse(q, g.kst, g.vst, g.iota, T, T, 1, QH, KVH, scale, g.to, g.tl, s));
   CK(merge(T, first, s));
   final_k<<<grid((long)T * QH * HD), 256, 0, s>>>(g.acc, static_cast<bf16*>(o), (long)T * QH * HD);

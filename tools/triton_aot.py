@@ -139,7 +139,7 @@ def main():
                     e = {"fn": name, "key": list(eval(k)), "config": v}
                     if e not in pins.setdefault("by_key", []):
                         pins["by_key"].append(e)
-        pins["source"] = "pin-from-run on " + torch.cuda.get_device_name(0)
+        pins["source"] = "pin-from-run, " + ARCH0
         json.dump(pins, open(PINS, "w"), indent=1)
     pf = json.load(open(PINS))
     pins = pf if "by_key" in pf else pf["pins"]

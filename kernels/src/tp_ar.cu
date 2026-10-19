@@ -32,6 +32,7 @@ struct TpDev {
   unsigned char* region[kMaxTp];  // every rank's region as this device sees it
   unsigned* epoch;                // this rank's counter (device)
   unsigned* arrive;               // [2] this rank's per-parity block counters (device)
+  int local;                      // 1: this rank's own share is read from x (its slot copy may sit in host memory)
 };
 TpDev g_tp{};
 bool g_tp_ok = false;
@@ -73,7 +74,7 @@ __global__ void __launch_bounds__(256) ar_kernel(bf16* __restrict__ x, long n, c
       st_release_sys(flag_of(d, d.rank), e + 1);
     }
     for (int r = 0; r < d.size; ++r)
-      while ((int)(ld_acquire_sys(flag_of(d, r)) - (e + 1)) < 0) {
+      while ((!d.local || r != d.rank) && (int)(ld_acquire_sys(flag_of(d, r)) - (e + 1)) < 0) {
       }
   }
   __syncthreads();
@@ -81,7 +82,9 @@ __global__ void __launch_bounds__(256) ar_kernel(bf16* __restrict__ x, long n, c
     for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n / 8; i += stride) {
       float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
       for (int r = 0; r < d.size; ++r) {
-        const uint4 u = __ldcv(reinterpret_cast<const uint4*>(slot_of(d, r, p)) + i);
+        // own share: x itself (the same bf16 values as the slot copy, so the rank-order sum is unchanged)
+        const uint4 u = d.local && r == d.rank ? reinterpret_cast<const uint4*>(x)[i]
+                                               : __ldcv(reinterpret_cast<const uint4*>(slot_of(d, r, p)) + i);
         const bf16* b = reinterpret_cast<const bf16*>(&u);
 #pragma unroll
         for (int j = 0; j < 8; ++j) acc[j] += __bfloat162float(b[j]);
@@ -96,7 +99,8 @@ __global__ void __launch_bounds__(256) ar_kernel(bf16* __restrict__ x, long n, c
     for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += stride) {
       float acc = 0.f;
       for (int r = 0; r < d.size; ++r) {
-        const unsigned short u = __ldcv(reinterpret_cast<const unsigned short*>(slot_of(d, r, p)) + i);
+        const unsigned short u = d.local && r == d.rank ? __bfloat16_as_ushort(x[i])
+                                                        : __ldcv(reinterpret_cast<const unsigned short*>(slot_of(d, r, p)) + i);
         acc += __bfloat162float(__ushort_as_bfloat16(u));
       }
       x[i] = __float2bfloat16_rn(acc);
@@ -156,6 +160,8 @@ extern "C" int ak_tp_setup(int rank, int size, void* const* regions, long slot_e
   if (cudaMalloc(&c, 64) != cudaSuccess) return (int)cudaErrorMemoryAllocation;
   cudaMemset(c, 0, 64);
   g_tp.epoch = static_cast<unsigned*>(c), g_tp.arrive = static_cast<unsigned*>(c) + 4;
+  // AGENS_TP_AR_LOCAL=0: read the own share back from the slot as well (the pre-1.2 kernel; same results)
+  g_tp.local = !(getenv("AGENS_TP_AR_LOCAL") && getenv("AGENS_TP_AR_LOCAL")[0] == '0');
   int dev = 0, sms = 0;
   cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
@@ -205,6 +211,24 @@ __global__ void st_check(const bf16* x, long n, int size, int it, unsigned* bad)
   }
 }
 }  // namespace
+// Timing (AGENS_TP_AR_BENCH): mean microseconds per all-reduce of n elements over `iters` back-to-back calls (after 20
+// warm-up calls); every rank runs the same calls.
+extern "C" double ak_tp_bench(int iters, long n) {
+  bf16* x = nullptr;
+  if (cudaMalloc(&x, n * 2) != cudaSuccess) return -1;
+  cudaMemset(x, 0, n * 2);
+  for (int i = 0; i < 20; ++i) ak_tp_allreduce(x, n, nullptr);
+  cudaEvent_t a, b;
+  cudaEventCreate(&a), cudaEventCreate(&b);
+  cudaEventRecord(a);
+  for (int i = 0; i < iters; ++i) ak_tp_allreduce(x, n, nullptr);
+  cudaEventRecord(b);
+  cudaEventSynchronize(b);
+  float ms = 0;
+  cudaEventElapsedTime(&ms, a, b);
+  cudaFree(x);
+  return 1000.0 * ms / iters;
+}
 extern "C" long ak_tp_selftest(int iters, long n) {
   bf16* x = nullptr;
   unsigned* bad = nullptr;

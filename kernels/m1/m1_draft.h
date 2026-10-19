@@ -50,4 +50,8 @@ int propose_b(const Target& t, int B, int* rec);
 // n_dev[b * n_stride] of them), positions pos [B * rows_per], ring of each sequence from its record
 int materialize_b(const Target& t, const __nv_bfloat16* cap, int B, const int* n_dev, int n_stride, const long long* pos,
                   const int* rec, int rows_per = kBlock);
+// The selector's candidates of the last propose / propose_b: [B * 7][kCandK] token ids (row b * 7 + slot), device;
+// nullptr before setup. The MTP chain also scores these (1.2: its shortlist head, m1_mtp.cu).
+constexpr int kCandK = 16;
+const int* cand_ids();
 }  // namespace m1draft

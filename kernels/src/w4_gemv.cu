@@ -16,7 +16,7 @@
 //          into tiles of 1024 inputs; tile t of row o is one contiguous 512-byte record at [(t * n + o) * 512], its 8
 //          group scales at [(t * n + o) * 8]. In one k-step all warps of all blocks read one contiguous slab instead
 //          of n scattered row streams — DRAM row-buffer friendly (measured: contiguous segments read ~880 GB/s on a
-//          4090 vs ~860 for strided streams). Same per-lane chunk order as CT, so results are bit-identical.
+//          sm89 vs ~860 for strided streams). Same per-lane chunk order as CT, so results are bit-identical.
 //          The KT path takes the group size as a parameter (64 or 128: 16 or 8 scales per tile record; the 3-bit probe
 //          writes g64 into the same int4 container). Entry points (ak_w4_*): m = 1 GEMV, m <= 16 batched GEMV (rows
 //          bit-identical to m = 1), and dequant-to-bf16 for the prefill path (scratch + cuBLAS).
@@ -619,7 +619,7 @@ extern "C" int ak_w4g128_gemv_kt_tune(int r, int u, int warps, int bps, const vo
 namespace {
 // production m = 1 / multi / batched dispatch: group 64 or 128, exact or bf16-rounded weights (bf16w).
 // Rows per warp / unroll by shape (every variant gives the same bits: per-row order is fixed), from bench_gemv on a
-// 4090: k >= 16K (down_proj, 35 KB of x in smem per block) R1U2 897 vs 787 GB/s for R2U1; >= 10K rows R2U2
+// sm89: k >= 16K (down_proj, 35 KB of x in smem per block) R1U2 897 vs 787 GB/s for R2U1; >= 10K rows R2U2
 // (gate_up 992, KDA qkv 892 GB/s); else R2U1 (5120/6144-row shapes 807-817 GB/s).
 template <int G, bool BW, int BITS = 4>
 int gemv_shape(const void* x, const KtSegs& g, int k, cudaStream_t s) {
@@ -871,7 +871,7 @@ extern "C" int ak_w4g128_gemv_bf16(const void* x, const int32_t* packed, const v
 
 // ---------------------------------------------------------------------------------------------- tensor-core path
 // The exact GEMV spends ~5 ALU instructions per weight (nibble -> fp32, fma), which caps it near 1.5 TB/s on an
-// H200 (it is bandwidth-bound on Ada/Blackwell-consumer parts). This path reads the same k-tiled layout and does the
+// sm90 (it is bandwidth-bound on sm89 / sm120 parts). This path reads the same k-tiled layout and does the
 // dot products on tensor cores (mma.m16n8k16 bf16 -> fp32): a lop3 + one bf16x2 subtract turn two nibbles into the
 // exact bf16 pair (q - 8) (~1.4 instructions per weight), the products are exact, sums are fp32 in the tensor core,
 // and each group's partial sum is scaled in fp32 (y = sum_g s_g * sum_{k in g} x_k q_k, as the exact path).
@@ -1464,7 +1464,7 @@ int launch_gemm(const void* x, int m, const KtSegs& segs, int k, cudaStream_t s)
   return (int)cudaGetLastError();
 }
 // AGENS_W4_GEMM=0: the NT register kernel instead (x from L1 per token tile). Default on sm90: 16-token tiles
-// (RB 2, 8 warps) up to 16 rows (H200 W4 g128 m = 16: gate_up 58 us vs 100 with 32-token tiles), 32-token tiles above
+// (RB 2, 8 warps) up to 16 rows (sm90 W4 g128 m = 16: gate_up 58 us vs 100 with 32-token tiles), 32-token tiles above
 int gemm_ntt(int m) {
   static int v = -2, major = 0;
   if (v == -2) {
@@ -1669,7 +1669,7 @@ int launch_gsnt_any(const void* x, int m, const KtSegs& segs, int k, cudaStream_
   const int NTT = m > 16 && (size_t)32 * ntile * 256 <= 96 * 1024 ? 4 : 2;  // tokens per block: x of a slot <= 96 KB
   const int tok = 8 * NTT, ntt = (m + tok - 1) / tok, items = (nblk + 7) / 8;
   const size_t smem = (size_t)tok * ntile * 256;
-  // the device's opt-in shared memory per block (H200 227 KB; sm89 / sm120 99 KB): larger x stages fall back
+  // the device's opt-in shared memory per block (sm90 227 KB; sm89 / sm120 99 KB): larger x stages fall back
   static std::map<int, int> optin;
   if (!optin.count(dev)) {
     int v = 0;
@@ -1732,7 +1732,7 @@ template <bool G64, int BITS>
 int nt_segs(const void* x, int m, const KtSegs& g, int k, cudaStream_t s) {
   // few row blocks (n < 2 x SMs x 16 rows): the group-split kernel (AGENS_W4_GSNT=0: off)
   static const bool gs_on = [] { const char* e = getenv("AGENS_W4_GSNT"); return !(e && e[0] == '0'); }();
-  // (also long k with < 6 x SMs row blocks: the MLP down projection, 320 row blocks x 17 k-tiles; H200 m = 32:
+  // (also long k with < 6 x SMs row blocks: the MLP down projection, 320 row blocks x 17 k-tiles; sm90 m = 32:
   // 48 us vs 52 for the GEMM)
   const int nb_ = g.end[g.nseg - 1] >> 4;
   if (gs_on && (nb_ < 2 * num_sms() || (k >= 12288 && nb_ < 6 * num_sms()))) {
@@ -1789,7 +1789,7 @@ int launch_mma(const void* x, int m, const KtSegs& segs, int k, cudaStream_t s) 
 // chain and sum order (warp w takes group w of every k-tile in tile order; warp-order sum), so bit-identical to it,
 // without its per-step predicates and padding moves (all loads in bounds; the x row of a column >= m is row 0, whose
 // MMA column is never stored) and with RB row blocks per work item sharing the warp's x fragment of a tile (x is 2 KB
-// of L1 / L2 reads per 1 KB of weights at 8 tokens; ncu on H200: L1 82% busy, long-scoreboard stalls).
+// of L1 / L2 reads per 1 KB of weights at 8 tokens; ncu on sm90: L1 82% busy, long-scoreboard stalls).
 template <int RB>
 __global__ void __launch_bounds__(256)
 w4_lean_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant__ KtSegs segs, int k) {
@@ -1895,7 +1895,7 @@ w4_lean_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant
 // group sums of a row block are added in group order (0 .. 7, from 0) by the item's last block to finish (atomic
 // count), as w4_mma_kernel's warp-order sum: bit-identical. The block's 8 warps share one x fragment per tile (the same
 // group), staged once per tile in shared memory already in MMA B order (x_pair applied), so x costs 1 / 8 of the L1
-// traffic of the register path, where x reads were ~90% of its L1 wavefronts (L1 85% busy on H200).
+// traffic of the register path, where x reads were ~90% of its L1 wavefronts (L1 85% busy on sm90).
 // Scratch per (device, stream): group sums [rb][8][32][4] fp32 and a counter per item.
 struct GsScratch {
   float* part = nullptr;
@@ -2043,7 +2043,7 @@ bool lean_ok(const KtSegs& g, int k) {
   return true;
 }
 // AGENS_W4_LEAN=RB (1 / 2 / 4, 8 = group split; 0 = off); default on sm90: group split for k >= 12288, RB 2 for
-// >= 5 x SMs row blocks (gate_up, attention q), else 1 (H200 m = 8: gate_up 40.8 -> 37.3 us, down 26.1 -> 23.5, KDA qkv 17.2 -> 13.2); ak_w4_set_lean overrides
+// >= 5 x SMs row blocks (gate_up, attention q), else 1 (sm90 m = 8: gate_up 40.8 -> 37.3 us, down 26.1 -> 23.5, KDA qkv 17.2 -> 13.2); ak_w4_set_lean overrides
 int g_lean = -1;
 int lean_rb(int nblk, int k) {
   static int v = -2;
@@ -2058,13 +2058,13 @@ int lean_rb(int nblk, int k) {
   // auto: the group split for long k (MLP down, k = 17408: 23.5 -> 21.1 us), else RB 2 / 1 by row blocks
   return v == -1 ? (k >= 12288 ? 8 : nblk >= 5 * num_sms() ? 2 : 1) : v;
 }
-// sm90 (Hopper) g128 W4 path: the same MMA chain and accumulation order as w4_mma_kernel<8, 1> -- warp w takes group
+// sm90 g128 W4 path: the same MMA chain and accumulation order as w4_mma_kernel<8, 1> -- warp w takes group
 // i = w of every k-tile in increasing tile order, then the 8 warps' sums in warp order -- so every output is bit-identical
 // to it; only the weight movement differs. A producer warp streams each (16-row block, k-tile) record pair (8 KB of
 // nibbles + 256 B of scales, contiguous in the KT layout) into a STAGES-deep shared-memory ring with cp.async.bulk
 // (mbarrier complete_tx), so the bytes in flight per SM no longer depend on registers (the register path saturates at
-// ~2.2 TB/s on H200: more steps in flight per warp cost occupancy). x stays on __ldg (L1 / L2 hits).
-// Opt-in (AGENS_W4_TMA=1; not faster than the register path at 8 tokens on H200 so far), AGENS_W4_TMA_STAGES=2|4|8.
+// ~2.2 TB/s on sm90: more steps in flight per warp cost occupancy). x stays on __ldg (L1 / L2 hits).
+// Opt-in (AGENS_W4_TMA=1; not faster than the register path at 8 tokens on sm90 so far), AGENS_W4_TMA_STAGES=2|4|8.
 constexpr int kTmaW = 8;                       // consumer warps (= w4_mma_kernel's WARPS: the step-to-warp mapping)
 constexpr int kTmaRec = 16 * 512, kTmaSc = 16 * 16;  // bytes per stage: 16 rows x one k-tile record / its 8 scales
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -2079,7 +2079,7 @@ __device__ __forceinline__ void mbar_wait(uint32_t a, uint32_t par) {
 }
 // RB 16-row blocks per work item: each consumer warp reuses its x fragment of a tile for all RB of them (the register
 // path re-reads x from L1 / L2 per row block: 2 KB of x per 1 KB of weights at 8 tokens, which bounds it near
-// 2.2 TB/s on H200). Per row block the MMA chain and the order of every sum are those of w4_mma_kernel<8, 1>.
+// 2.2 TB/s on sm90). Per row block the MMA chain and the order of every sum are those of w4_mma_kernel<8, 1>.
 template <int STAGES, int RB>
 __global__ void __launch_bounds__((kTmaW + 1) * 32)
 w4_tma_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant__ KtSegs segs, int k) {
@@ -2419,7 +2419,7 @@ int mma64_segs_u(const void* x, int m, const KtSegs& g, int k, cudaStream_t s) {
   return 0;
 }
 int launch_gsnt_any(const void* x, int m, const KtSegs& segs, int k, cudaStream_t s, int bits, bool g64);
-// AGENS_W4_GS8=1: small-n W4 at <= 8 tokens on the group-split kernel (bit-identical; off by default: slower on H200
+// AGENS_W4_GS8=1: small-n W4 at <= 8 tokens on the group-split kernel (bit-identical; off by default: slower on sm90
 // at 8 tokens, 8.2 vs 7.6 us per call)
 bool gs8_on() {
   static const int on = [] { const char* e = getenv("AGENS_W4_GS8"); return e && e[0] == '1'; }();
@@ -2461,7 +2461,7 @@ bool mma_on(int group, int bf16w) {
   }
   return g_mma_mode == 1;
 }
-// launch shape (warps per 16-row block, steps per load batch): AGENS_W4_MMA_CFG="W,U" (bench), default 8,1 (H200 sweep:
+// launch shape (warps per 16-row block, steps per load batch): AGENS_W4_MMA_CFG="W,U" (bench), default 8,1 (sm90 sweep:
 // 8,1 best on every decode shape; gate_up 2.84 TB/s, down 2.17, KDA qkv 1.93, out 1.70 vs 1.62 / 1.07 / 1.16 / 0.90 exact)
 template <int BITS>
 int mma_launch(const void* x, int m, const KtSegs& g, int k, cudaStream_t s) {
@@ -2530,7 +2530,7 @@ int mma128_segs(const void* x, int m, const KtSegs& g, int k, cudaStream_t s) {
 // ---------------------------------------------------------------------------------------------- W4 g128 KF layout
 // KF ("fragment-major") layout of a W4 g128 weight, n % 16 == 0 (AGENS_W4F=1 at repack time): the bytes a warp needs
 // for one 16-row block x 64 inputs are one contiguous 512 B record, lane-major, so a warp streams its row block with
-// whole-sector loads (the KT layout's 64 B per row per load runs at ~3 TB/s on H200 even without any math; contiguous
+// whole-sector loads (the KT layout's 64 B per row per load runs at ~3 TB/s on sm90 even without any math; contiguous
 // records stream at ~4.3). The k order inside an MMA step is KT's (the same B fragments, x_pair), so a lane's word for
 // step q of group G holds rows g and g + 8: nibbles {0, 4} = row g (KT nibbles j0, j0 + 4 of word q / 2 of chunk
 // 4 (G % 8) + t4), {1, 5} = row g + 8 (same), {2, 6} = row g (j1, j1 + 4), {3, 7} = row g + 8, j0 = 2 (q & 1).

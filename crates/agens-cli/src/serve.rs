@@ -20,6 +20,12 @@
 //! The drafter's context (KV ring of the last 4096 positions) is engine-wide: interleaved conversations cost
 //! acceptance, never exactness.
 //!
+//! MTP drafting (1.2, --mtp DIR, docs/mtp.md): the model's MTP head chains drafts from the target's own last hidden
+//! state. It joins the drafting chain of every speculative step, personal and server (batched) mode, greedy and
+//! sampled: the copy-from-context proposal fills the first slots it covers, the MTP chain the next ones (up to
+//! AGENS_MTP_STEPS, default 4 with the drafter, 7 alone), the DFlash2 drafter the rest. Its context is per KDA slot,
+//! like the drafter's in server mode. Drafts only propose, so the output is the same with or without it.
+//!
 //! --no-fork (personal mode): a conversation generates in its main session instead of a fork, so it holds one KDA
 //! state slot (and window ring) instead of two (0.3 GB on a 16 GB card: ~25K tokens of tiered KV). The next turn
 //! reuses the session when the new prompt starts with everything the session has consumed (prompt + generated
@@ -210,8 +216,8 @@ struct Engine {
     stats: (u64, u64, f64), // decode steps, row-steps, decode seconds
     bstats: (u64, u64, f64, u64), // batched speculation since the last report: steps, tokens, seconds, sequences
     pstats: (u64, f64, Option<Instant>), // prefill chunks + seconds since the last report, and when it began
-    spec: bool,             // a drafter is loaded (personal mode), or copy-only drafting
-    copy: bool,             // copy-only drafting (--spec-copy 1 without a drafter); sampled requests decode on the host without a proposal
+    spec: bool,             // a drafter and / or the MTP head is loaded, or copy-only drafting
+    copy: bool,             // copy-only drafting (--spec-copy 1 without a drafter or MTP head); sampled requests decode on the host without a proposal
     fork: bool,             // conversations generate on a fork of their main session (false: --no-fork)
     think_guard: Option<(usize, u32, usize)>, // --think-guard n-gram, repeats, window (None: off)
 }
@@ -795,12 +801,13 @@ impl Engine {
 
 pub fn run(args: &[String]) -> Result<()> {
     let usage = "agens serve <ckpt_dir> [--model-dir DIR] [--host 0.0.0.0] [--port 30000] [--served-model-name NAME] \
-                 [--mode personal|server] [--max-batch 8] [--max-convs 64] [--budget-gib N] [--spec-drafter DIR] [--spec-copy 1] [--no-fork 1] \
-                 [--max-tokens-default 32768] [--think-guard 32,20,8192|off] \
+                 [--mode personal|server] [--max-batch 8] [--max-convs 64] [--budget-gib N] [--spec-drafter DIR] [--mtp DIR] \
+                 [--spec-copy 1] [--no-fork 1] [--max-tokens-default 32768] [--think-guard 32,20,8192|off] \
                  [m1 flags: --wctx --pool --sessions --gpu-gib --device]";
     let ckpt = args.first().context(usage)?.clone();
     let (mut model_dir, mut host, mut port, mut name) = (ckpt.clone(), "0.0.0.0".to_string(), 30000u16, None);
     let (mut mode, mut max_batch, mut max_convs, mut drafter) = ("server".to_string(), 8usize, 64usize, None);
+    let mut mtp: Option<String> = None;
     let mut fork = true;
     // 1.1.1: new tokens of a request without max_tokens (0 = up to the context); thinking repetition guard
     let mut max_tokens_default = 32768usize;
@@ -818,6 +825,11 @@ pub fn run(args: &[String]) -> Result<()> {
             "--max-batch" => max_batch = v.parse()?,
             "--max-convs" => max_convs = v.parse()?,
             "--spec-drafter" => drafter = Some(v),
+            "--mtp" => {  // the MTP head (an m1 flag: crate::m1::load uploads it)
+                mtp = Some(v.clone());
+                rest.push(args[i].clone());
+                rest.push(v);
+            }
             "--no-fork" => fork = v == "0",
             "--max-tokens-default" => max_tokens_default = v.parse()?,
             "--think-guard" => {
@@ -860,7 +872,8 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         m => bail!("--mode {m}: personal or server"),
     }
-    if drafter.is_some() && mode != "personal" && std::env::var("AGENS_SPEC_BATCH_MAX").is_err() {
+    let drafting = drafter.is_some() || mtp.is_some();
+    if drafting && mode != "personal" && std::env::var("AGENS_SPEC_BATCH_MAX").is_err() {
         // server mode: batched speculative decoding of up to --max-batch greedy requests per step
         std::env::set_var("AGENS_SPEC_BATCH_MAX", max_batch.min(16).to_string());
     }
@@ -876,8 +889,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut o = crate::m1::parse_opts(&rest, usage)?;
     o.drafter = drafter.clone();
     let copy = o.copy;
-    if copy && drafter.is_none() && mode != "personal" {
-        bail!("--spec-copy 1 without a drafter: personal mode only");
+    if copy && !drafting && mode != "personal" {
+        bail!("--spec-copy 1 without a drafter or --mtp: personal mode only");
     }
     let think = {  // reasoning-budget markers, as the image (VOLUNDR_THINK_START_ID / _END_ID override)
         let tok = agens_server::tokenizer::Tokenizer::from_model_dir(&model_dir)?;
@@ -898,7 +911,7 @@ pub fn run(args: &[String]) -> Result<()> {
             crate::tp::start()?; // tensor parallel: followers execute the leader's calls from here (no HTTP)
             let wctx = crate::m1::WCTX.load(Ordering::Relaxed); // --wctx, or the clamped context (1.1.1)
             Ok(Engine { think, max_batch, max_convs, wctx: wctx - CHUNK, anchor, convs: HashMap::new(), stats: (0, 0, 0.0),
-                        spec: drafter.is_some() || copy, copy: copy && drafter.is_none(), fork, bstats: (0, 0, 0.0, 0), pstats: (0, 0.0, None), think_guard })
+                        spec: drafting || copy, copy: copy && !drafting, fork, bstats: (0, 0, 0.0, 0), pstats: (0, 0.0, None), think_guard })
         })();
         match r {
             Ok(mut e) => {

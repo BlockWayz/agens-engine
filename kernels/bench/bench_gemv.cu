@@ -1,5 +1,5 @@
 // Microbench: W4 g128 GEMV variants vs cuBLAS bf16 GEMV on Volundr decode shapes.
-// Weights are rotated through >= 512 MB of copies so nothing is served from L2 (4090 L2 = 72 MB).
+// Weights are rotated through >= 512 MB of copies so nothing is served from L2 (sm89 48 GB card: L2 = 72 MB).
 // Usage: bench_gemv [iters]      Output: one line per (shape, kernel): us/call, effective GB/s, max rel err.
 
 #include "agens_kernels.h"

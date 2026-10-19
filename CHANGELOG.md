@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.2.0
+
+1.2.0 includes every 1.1.1 fix and limit below.
+
+### New
+
+- **MTP drafting.** `--mtp DIR` loads the model's multi-token-prediction (MTP) head, about one decoder layer that
+  drafts from the model's own last hidden state, as a third draft source next to context copy and the companion
+  drafter: in each speculative step the context copy fills the slots it covers, the MTP head the next ones (up to 4
+  with the drafter, all 7 without it) and the drafter the rest. It works in one-conversation and server mode, greedy
+  and sampled; greedy replies stay identical to plain greedy decoding and sampled replies follow the same
+  distribution. The head is stored at 4 bits at load (0.22 GB, plus 0.07 GB of context buffers) and each draft step
+  scores a 32K-token shortlist of the output layer. On a 16 GB budget, short prompts: chat 108.0 vs 98.4 tok/s, code
+  140.7 vs 128.8, tool calls 124.1 vs 122.0 greedy (see the README for every class, sampled rows and 219K context).
+  `scripts/agens-run.sh --mtp DIR` and the image entry point (`-v DIR:/mtp:ro --mtp /mtp`) take it in the `16gb`,
+  `24gb` and `48gb` profiles. With `--mtp` the `16gb` profile runs a ~241K-token context (images off; with
+  `--images on` it ignores `--mtp`), and the `24gb` profile with images on a ~221K-token context.
+- **Multi-GPU (tensor parallel).** `--tp 2` or `--tp 4` splits the model across 2 or 4 GPUs of one machine (one
+  process per GPU; `scripts/agens-run.sh --tp 2 --gpu 0,1`, or `--tp 2` on the image entry point with
+  `--gpus '"device=0,1"' --ipc=host`). The profile's memory budget applies per GPU. Every 1.1 feature works under
+  `--tp`: speculative decoding with the drafter (greedy and sampled), image input (the vision encoder runs on the
+  first GPU), server mode with concurrent requests, conversation prefix reuse and parking, session snapshot /
+  restore, and the INT8 KV cache of the dense attention layer. GPUs with peer access (NVLink-class links, or PCIe
+  peer-to-peer) exchange partial results directly; GPUs without peer-to-peer go through host shared memory.
+- Under `--tp` the KV cache stays on the GPUs (each GPU holds its share of the attention heads), so a pair of GPUs
+  holds more context than one: two 16 GB GPUs run the 4-bit release weights with the drafter and a ~100K-token
+  context; two 24 GB GPUs the full 262K context without host tiering; two 48 GB GPUs the bf16 weights with a 262K
+  context, which do not fit one 48 GB GPU at all.
+- Prebuilt tensor-parallel prefill kernels for compute capability 8.6, 8.9, 9.0 and 12.0 (8.9 and 9.0 validated).
+
+### Limits
+
+- `--mtp` and `--tp` do not combine yet: the engine refuses `--mtp` with `--tp 2|4`, and the image entry point drops
+  `--mtp` (with a message) when `--tp` is set. Tensor parallel runs with context copy and the drafter.
+- With more than 8 concurrent sequences in one batched step, server mode skips the MTP chain for that step (the
+  drafter still runs).
+- Under `--tp`, a failed engine step still ends the server, as in 1.1.0: the 1.1.1 recovery (the request fails, the
+  server keeps serving) is for one GPU.
+
+### Fixes
+
+- The all-reduce between GPUs reads each GPU's own share locally instead of back through the exchange buffer: 25-45%
+  less time per exchange over host shared memory, identical results.
+
 ## 1.1.1
 
 ### Fixes

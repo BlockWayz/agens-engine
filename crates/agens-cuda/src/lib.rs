@@ -282,6 +282,40 @@ pub mod tp {
     pub fn split(s: &str) -> Vec<i32> {
         if s == "-" || s.is_empty() { Vec::new() } else { s.split(',').map(|x| x.parse().unwrap_or(0)).collect() }
     }
+    /// Payload too large for a line (image embeddings): a file in /dev/shm per call, named in the forwarded line; the
+    /// followers each read it and the last one removes it (`take_blob`). Returns the path.
+    pub fn put_blob(bytes: &[u8]) -> std::io::Result<String> {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = std::env::var("AGENS_TP_ID").unwrap_or_else(|_| "0".into());
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = format!("/dev/shm/agens_tp_{id}_blob{k}");
+        std::fs::write(&path, bytes)?;
+        let n = FOLLOWERS.lock().unwrap().len();
+        std::fs::write(format!("{path}.n"), n.to_string())?;
+        Ok(path)
+    }
+    /// A follower reads a blob; the last reader (by the countdown file) removes both files.
+    pub fn take_blob(path: &str) -> std::io::Result<Vec<u8>> {
+        let b = std::fs::read(path)?;
+        let cnt = format!("{path}.n");
+        // countdown under an exclusive lock file (followers run concurrently)
+        let lock = format!("{path}.lock");
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(_) => break,
+                Err(_) => std::thread::sleep(std::time::Duration::from_micros(200)),
+            }
+        }
+        let left = std::fs::read_to_string(&cnt).ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1);
+        if left <= 1 {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&cnt);
+        } else {
+            let _ = std::fs::write(&cnt, (left - 1).to_string());
+        }
+        let _ = std::fs::remove_file(&lock);
+        Ok(b)
+    }
 }
 
 pub mod m1 {
@@ -308,6 +342,7 @@ pub mod m1 {
         fn ak_m1_mtp_register_wq(name: *const c_char, wt: *mut c_void, st: *mut c_void, n: c_int, k: c_int, group: c_int,
                                  bits: c_int) -> c_int;
         fn ak_m1_mtp_setup(max_rows: c_int, window: c_int) -> i64;
+        fn ak_m1_mtp_shortlist(ids: *const c_int, n: c_int) -> c_int;
         fn ak_m1_spec_step(bonus: c_int, emitted: *mut c_int, n: *mut c_int, drafts: *mut c_int) -> c_int;
         fn ak_m1_spec_step_hint(bonus: c_int, hint: *const c_int, nh: c_int, emitted: *mut c_int, n: *mut c_int,
                                 drafts: *mut c_int) -> c_int;
@@ -327,6 +362,7 @@ pub mod m1 {
         fn ak_tp_setup(rank: c_int, size: c_int, regions: *const *mut c_void, slot_elems: i64) -> c_int;
         fn ak_tp_region_bytes(slot_elems: i64) -> usize;
         fn ak_tp_selftest(iters: c_int, n: i64) -> i64;
+        fn ak_tp_bench(iters: c_int, n: i64) -> f64;
         fn ak_m1_init(wctx: c_int, mixers: *const c_char, engram_a: c_int, engram_b: c_int, e2a: *mut c_void,
                       e2b: *mut c_void, e22a: *mut c_void, e22b: *mut c_void, ndev: c_int, devs: *const c_int,
                       split: c_int, pool_rows: c_int, nslots: c_int) -> c_int;
@@ -463,10 +499,14 @@ pub mod m1 {
         unsafe { ak_m1_state_bytes() }
     }
     /// Snapshot the session into `dst` (device or pinned host pointer of at least state_bytes()).
+    /// Snapshot of the active session (Session State v1) into `dst` (host or device, state_bytes()). Tensor parallel:
+    /// every rank snapshots its own share (followers into a host buffer of their own; restore reads it back).
     pub fn snapshot(dst: *mut c_void) -> Result<()> {
+        crate::tp::fwd("snapshot");
         check(unsafe { ak_m1_snapshot(dst) }, "m1_snapshot")
     }
     pub fn restore(src: *const c_void) -> Result<()> {
+        crate::tp::fwd("restore");
         check(unsafe { ak_m1_restore(src) }, "m1_restore")
     }
     pub fn seq() -> usize {
@@ -547,6 +587,10 @@ pub mod m1 {
         check(unsafe { ak_m1_mtp_register_wq(c.as_ptr(), wt, st, n as i32, k as i32, group as i32, bits as i32) },
               "m1_mtp_register_wq")
     }
+    /// Before mtp_setup: the lm_head rows the MTP chain scores (with the INT8 head; empty: the whole head).
+    pub fn mtp_shortlist(ids: &[i32]) -> Result<()> {
+        check(unsafe { ak_m1_mtp_shortlist(ids.as_ptr(), ids.len() as c_int) }, "m1_mtp_shortlist")
+    }
     /// After the MTP weights and spec_init: context buffers for `max_rows` rows per call, attention window. -> bytes.
     pub fn mtp_setup(max_rows: usize, window: usize) -> Result<usize> {
         let b = unsafe { ak_m1_mtp_setup(max_rows as c_int, window as c_int) };
@@ -589,6 +633,10 @@ pub mod m1 {
     }
     pub fn tp_setup(rank: usize, regions: &[*mut c_void], slot_elems: usize) -> Result<()> {
         check(unsafe { ak_tp_setup(rank as c_int, regions.len() as c_int, regions.as_ptr(), slot_elems as i64) }, "tp_setup")
+    }
+    /// Mean microseconds per all-reduce of n elements (every rank must call it with the same arguments).
+    pub fn tp_bench(iters: usize, n: usize) -> f64 {
+        unsafe { ak_tp_bench(iters as c_int, n as i64) }
     }
     pub fn tp_selftest(iters: usize, n: usize) -> i64 {
         unsafe { ak_tp_selftest(iters as c_int, n as i64) }
@@ -689,7 +737,9 @@ pub mod m1 {
     /// the row replacing token t's embedding (-1 = its own). One device, no tensor parallelism.
     pub fn prefill_mm(ids: &[i32], rpos3: Option<&[i64]>, emb: Option<(*const c_void, &[i32])>) -> Result<i32> {
         if crate::tp::active() {
-            anyhow::bail!("image inputs are not supported with --tp");
+            // tensor parallel: the vision tower runs on the leader only; the followers get the same chunk (ids, rope
+            // positions, the embedding rows it uses) through a /dev/shm blob (embeddings are replicated on every rank)
+            crate::tp::fwd(&format!("prefill_mm {}", crate::tp::put_blob(&mm_blob(ids, rpos3, emb))?));
         }
         if let Some(r) = rpos3 {
             assert_eq!(r.len(), 3 * ids.len());
@@ -706,11 +756,63 @@ pub mod m1 {
                                         ep, er, &mut next) }, "m1_prefill_mm")?;
         Ok(next)
     }
+    /// One prefill_mm call as bytes: n, has_rpos, n_emb_rows (i32 each), ids, rpos3 (i64, 3n), rows (i32, n; remapped to
+    /// 0..n_emb_rows), the used embedding rows (bf16, 5120 each).
+    pub fn mm_blob(ids: &[i32], rpos3: Option<&[i64]>, emb: Option<(*const c_void, &[i32])>) -> Vec<u8> {
+        const HID: usize = 5120;
+        let n = ids.len();
+        let mut used: Vec<i32> = Vec::new();
+        let mut rows: Vec<i32> = Vec::new();
+        if let Some((_, r)) = emb {
+            let mut map = std::collections::HashMap::new();
+            for &x in r {
+                rows.push(if x < 0 { -1 } else { *map.entry(x).or_insert_with(|| { used.push(x); used.len() as i32 - 1 }) });
+            }
+        }
+        let mut b = Vec::with_capacity(12 + 4 * n + 24 * n + 4 * n + used.len() * HID * 2);
+        for v in [n as i32, rpos3.is_some() as i32, if emb.is_some() { used.len() as i32 } else { -1 }] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        ids.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+        if let Some(r) = rpos3 {
+            r.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+        }
+        if let Some((p, _)) = emb {
+            rows.iter().for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+            for &u in &used {
+                let src = unsafe { std::slice::from_raw_parts((p as *const u8).add(u as usize * HID * 2), HID * 2) };
+                b.extend_from_slice(src);
+            }
+        }
+        b
+    }
+    /// A follower's prefill_mm from a blob written by mm_blob.
+    pub fn prefill_mm_blob(b: &[u8]) -> Result<i32> {
+        let i32_at = |o: usize| i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let (n, has_r, ne) = (i32_at(0) as usize, i32_at(4) != 0, i32_at(8));
+        let mut o = 12;
+        let ids: Vec<i32> = (0..n).map(|i| i32_at(o + 4 * i)).collect();
+        o += 4 * n;
+        let rpos: Option<Vec<i64>> = has_r.then(|| {
+            let v = (0..3 * n).map(|i| i64::from_le_bytes(b[o + 8 * i..o + 8 * i + 8].try_into().unwrap())).collect();
+            o += 24 * n;
+            v
+        });
+        let (rows, emb): (Vec<i32>, Vec<u8>) = if ne >= 0 {
+            let r = (0..n).map(|i| i32_at(o + 4 * i)).collect();
+            o += 4 * n;
+            (r, b[o..].to_vec())
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        prefill_mm(&ids, rpos.as_deref(), if ne >= 0 { Some((emb.as_ptr() as *const c_void, &rows[..])) } else { None })
+    }
     /// The active session's rope delta (rope position - token position of its next text token).
     pub fn rope_delta() -> i32 {
         unsafe { ak_m1_rope_delta() }
     }
     pub fn set_rope_delta(d: i32) -> Result<()> {
+        crate::tp::fwd(&format!("set_rope_delta {d}"));
         check(unsafe { ak_m1_set_rope_delta(d) }, "m1_set_rope_delta")
     }
     /// A vision tower tensor (bf16, row-major) in pinned host memory that stays alive for the process.

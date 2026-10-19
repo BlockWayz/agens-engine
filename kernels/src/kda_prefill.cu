@@ -60,6 +60,23 @@ struct AotLaunch {
 #include "../aot/kda_prefill_aot_sm90_h4.inc"
 #define AGENS_AOT_SM90_H4 1
 #endif
+// head shares for sm86 (AOT_TARGET=86 with the sm89 head-share pins) and PTX of the sm89 head shares (sm100 / sm120)
+#if __has_include("../aot/kda_prefill_aot_sm86_h8.inc")
+#include "../aot/kda_prefill_aot_sm86_h8.inc"
+#define AGENS_AOT_SM86_H8 1
+#endif
+#if __has_include("../aot/kda_prefill_aot_sm86_h4.inc")
+#include "../aot/kda_prefill_aot_sm86_h4.inc"
+#define AGENS_AOT_SM86_H4 1
+#endif
+#if __has_include("../aot/kda_prefill_aot_ptx_sm89_h8.inc")
+#include "../aot/kda_prefill_aot_ptx_sm89_h8.inc"
+#define AGENS_AOT_PTX_SM89_H8 1
+#endif
+#if __has_include("../aot/kda_prefill_aot_ptx_sm89_h4.inc")
+#include "../aot/kda_prefill_aot_ptx_sm89_h4.inc"
+#define AGENS_AOT_PTX_SM89_H4 1
+#endif
 // PTX of the sm89 kernels (AOT_PTX=1): JIT-compiled by the driver on GPUs without a table of their own (sm100 / sm120)
 #if __has_include("../aot/kda_prefill_aot_ptx_sm89.inc")
 #include "../aot/kda_prefill_aot_ptx_sm89.inc"
@@ -172,9 +189,21 @@ const AotLaunch* find(const std::string& cls, int idx) {
 #ifdef AGENS_AOT_SM90_H4
     case 9004: return find_in(kAotKdaPrefill_sm90_h4, cls, idx);
 #endif
+#ifdef AGENS_AOT_SM86_H8
+    case 8608: return find_in(kAotKdaPrefill_sm86_h8, cls, idx);
+#endif
+#ifdef AGENS_AOT_SM86_H4
+    case 8604: return find_in(kAotKdaPrefill_sm86_h4, cls, idx);
+#endif
     default:
 #ifdef AGENS_AOT_PTX_SM89
       if (major >= 10 && H == 16) return find_in(kAotKdaPrefill_ptx_sm89, cls, idx);
+#endif
+#ifdef AGENS_AOT_PTX_SM89_H8
+      if (major >= 10 && H == 8) return find_in(kAotKdaPrefill_ptx_sm89_h8, cls, idx);
+#endif
+#ifdef AGENS_AOT_PTX_SM89_H4
+      if (major >= 10 && H == 4) return find_in(kAotKdaPrefill_ptx_sm89_h4, cls, idx);
 #endif
       return nullptr;
   }

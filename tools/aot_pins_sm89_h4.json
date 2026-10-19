@@ -1,0 +1,123 @@
+{
+ "by_key": [
+  {
+   "fn": "kda_gate_chunk_cumsum_vector_kernel",
+   "key": [
+    12,
+    128,
+    64,
+    true,
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   "config": "BS: 32, num_warps: 8, num_ctas: 1, num_stages: 3, maxnreg: None"
+  },
+  {
+   "fn": "chunk_kda_fwd_kernel_inter_solve_fused",
+   "key": [
+    12,
+    128,
+    16,
+    128,
+    true,
+    true,
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.int32",
+    "torch.int32"
+   ],
+   "config": "BK: 32, BV: 64, num_warps: 4, num_ctas: 1, num_stages: 3, maxnreg: None"
+  },
+  {
+   "fn": "chunk_gla_fwd_kernel_o",
+   "key": [
+    64,
+    true,
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.int32",
+    "torch.int32"
+   ],
+   "config": "BK: 64, BV: 64, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+  },
+  {
+   "fn": "chunk_kda_fwd_kernel_intra_token_parallel",
+   "key": [
+    128,
+    12,
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.int32"
+   ],
+   "config": "BH: 4, num_warps: 1, num_ctas: 1, num_stages: 3, maxnreg: None"
+  },
+  {
+   "fn": "chunk_kda_fwd_kernel_inter_solve_fused",
+   "key": [
+    12,
+    128,
+    16,
+    0,
+    false,
+    false,
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.int32",
+    "torch.int32"
+   ],
+   "config": "BK: 32, BV: 64, num_warps: 1, num_ctas: 1, num_stages: 3, maxnreg: None"
+  },
+  {
+   "fn": "_recompute_w_u_fwd_kernel",
+   "key": [
+    12,
+    128,
+    128,
+    64,
+    true,
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.int32",
+    "torch.int32"
+   ],
+   "config": "BK: 128, BV: 128, num_warps: 8, num_ctas: 1, num_stages: 2, maxnreg: None"
+  }
+ ],
+ "source": "pin-from-run, sm89"
+}

@@ -1,5 +1,5 @@
 // With `--features cuda`, builds kernels/ through CMake and links libagens_kernels + cudart.
-// AGENS_CUDA_ARCHS overrides the target list (default "89;90;120": Ada, H200, Blackwell sm120).
+// AGENS_CUDA_ARCHS overrides the target list (default "89;90;120": sm89, sm90, sm120).
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {

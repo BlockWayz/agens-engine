@@ -410,7 +410,7 @@ kda_multi_pre_kernel(const __nv_bfloat16* __restrict__ qkv, int qkv_stride, cons
 // kda_multi_pre_kernel with the 32 state rows of a block split over NW warps (32 / NW rows each) and the T tokens'
 // prologue split over the warps (token t on warp t % NW): every row and every token value is produced by exactly the
 // operations of kda_multi_pre_kernel (rows are independent; the prologue is per token), so outputs and state are
-// bit-identical, with NW times the warps in flight (the single-warp kernel runs 1.5 warps per H200 SM: 192 blocks).
+// bit-identical, with NW times the warps in flight (the single-warp kernel runs 1.5 warps per sm90 SM: 192 blocks).
 template <int K, int V, int NW>
 __global__ void __launch_bounds__(32 * NW)
 kda_multi_pre_w_kernel(const __nv_bfloat16* __restrict__ qkv, int qkv_stride, const __nv_bfloat16* __restrict__ a,
@@ -560,7 +560,7 @@ extern "C" int ak_kda_decode_multi(const void* qkv, int qkv_stride, const void* 
   if (K != 128 || V != 128 || HV % H != 0) return (int)cudaErrorInvalidValue;
   static const int pre = [] { const char* e = getenv("AGENS_KDA_MULTI_PRELOAD"); return !(e && e[0] == '0'); }();
   // AGENS_KDA_MULTI_WARPS: warps per 32-row block of the preload kernel (1, 2, 4 or 8; default 8; bit-identical;
-  // H200 verify: 1 warp 21.8 us, 4 warps 9.2, 8 warps 7.4 per call)
+  // sm90 verify: 1 warp 21.8 us, 4 warps 9.2, 8 warps 7.4 per call)
   static const int nw = [] { const char* e = getenv("AGENS_KDA_MULTI_WARPS"); return e ? atoi(e) : 8; }();
   if (pre && T <= 8 && nw > 1) {
     auto kw = nw >= 8 ? kda_multi_pre_w_kernel<128, 128, 8>

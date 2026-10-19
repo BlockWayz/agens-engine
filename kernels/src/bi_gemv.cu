@@ -331,7 +331,7 @@ extern "C" int ak_bf16_gemv_bi(const void* x, const void* w, const void* bias, v
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   static const bool nt = [] { const char* e = getenv("AGENS_W4_NT"); return !(e && e[0] == '0'); }();
   // batched verify, few row blocks (n < 32 x SMs: mHC dyn n = 24, in_proj_b n = 48, indexer projections): the slot split
-  // (AGENS_BI_SPLIT8=1: the split for m <= 8 too, bit-identical; off by default: slower on H200 at 8 tokens)
+  // (AGENS_BI_SPLIT8=1: the split for m <= 8 too, bit-identical; off by default: slower on sm90 at 8 tokens)
   static const bool split8 = [] { const char* e = getenv("AGENS_BI_SPLIT8"); return e && e[0] == '1'; }();
   if ((m > 8 || split8) && nt && (n + 15) / 16 < 2 * sms()) {
     static std::map<std::pair<int, cudaStream_t>, std::pair<float*, unsigned*>> scr;

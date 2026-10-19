@@ -9,9 +9,14 @@
 namespace m1mtp {
 int register_weight(const char* name, void* ptr);  // bf16 device pointers, names without the "mtp." prefix
 int register_w4(const char* name, const void* wt, const void* st, int n, int k, int group, int bits = 4);
+// Before setup: the shortlist head (1.2). With the target's INT8 head, each chain step scores only lm_head rows
+// ids[0..n) plus the DFlash2 drafter's kCandK candidates of its slot (when the drafter is loaded), not all 248K rows.
+// n = 0: the whole head.
+int set_shortlist(const int* ids, int n);
 // After the weights: buffers for max_rows context rows per materialize call (the prefill chunk), one KV ring of the
-// step-1 entries per ring (KDA slot), attention window `window` (the head's training window).
-int setup(int max_rows, int n_rings, int window);
+// step-1 entries per ring (KDA slot), attention window `window` (the head's training window), chain buffers for
+// max_seqs sequences per propose_b call (batched speculation; 1 otherwise).
+int setup(int max_rows, int n_rings, int window, int max_seqs = 1);
 bool ready();
 size_t bytes();
 int max_rows();
@@ -27,4 +32,13 @@ int materialize(const m1draft::Target& t, const void* final_norm, const __nv_bfl
 // The chain from the pending row: anchor token step[2] at position step[1]; step i (0-based) predicts draft slot i
 // (step[3 + i]) and writes it unless the slot is a host proposal (i < step[20]); `steps` chain steps (<= 7).
 int propose(const m1draft::Target& t, int* step, int steps);
+// Batched (server mode): B sequences, records rec[B][m1draft::kRecInts] on device ([1] P, [2] anchor, [3..9] drafts,
+// [18] KDA slot = MTP ring, [26] host proposal length). propose_b: each sequence's chain (steps <= 7) into its record's
+// draft slots beyond its host proposal, all B rows per chain step in one pass over the head. materialize_b: the
+// context entries of the committed rows, H [B * T rows] (sequence b's at b * T, its first n_dev[b * n_stride]
+// committed), ids / pos the verify's [B * T].
+int propose_b(const m1draft::Target& t, int B, int* rec, int steps);
+int materialize_b(const m1draft::Target& t, const void* final_norm, const __nv_bfloat16* H, int ld, int B, int T,
+                  const int* n_dev, int n_stride, const int* ids, const long long* pos, const int* rec);
+int max_seqs();
 }  // namespace m1mtp

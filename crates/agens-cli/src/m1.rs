@@ -1,6 +1,6 @@
 //! `agens m1`: run the M1 standalone forward (bf16 or W4, tp1, one request) on prompts given as token ids and write
 //! the greedy continuations. Weights beyond --gpu-gib go to pinned host memory mapped into the device address space
-//! (slow but exact), so the bf16 model can be checked on a 48 GB card before the H200 run.
+//! (slow but exact), so the bf16 model can be checked on a 48 GB card before the sm90 run.
 //! Load-time conversions mirror sglv23's loader: conv1d / A_log / dt_bias widened to fp32, gate_proj + up_proj
 //! concatenated into gate_up_proj (MergedColumnParallelLinear order), Engram tables and the token embedding table
 //! host-resident (neither is read in full per token).
@@ -144,6 +144,11 @@ pub(crate) fn parse_opts(args: &[String], usage: &str) -> Result<Opts> {
             f => bail!("unknown flag {f}\n{usage}"),
         }
         i += 2;
+    }
+    if o.tp > 1 && o.mtp.is_some() {
+        // 1.2: the MTP chain under tensor parallel (each rank's drafts in the verify graphs, batched speculation) is
+        // not gated yet; DFlash2 and copy-from-context drafting work under --tp
+        bail!("--mtp is not supported with --tp {} in 1.2 (use --tp 1 for MTP drafting, or drop --mtp)", o.tp);
     }
     Ok(o)
 }
@@ -462,6 +467,11 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
                        ("AGENS_FAR_EXTEND_MIN_ROWS", "8"), ("AGENS_FAR_EXTEND_ENGINE", "1"), ("AGENS_KV_TIER", "2"),
                        ("AGENS_KV_IDX_HOST", "1"), ("AGENS_M1_LMHEAD_INT8", "1"), ("AGENS_M1_PREFILL_CHUNK", "1024"),
                        ("AGENS_DRAFT_W4", "1"), ("AGENS_DRAFT_BITS", "3")] {
+            // tensor parallel: KV stays on the GPUs (m1_kv's tiered / INT8 BCSA pools are tp1 only); each rank holds
+            // 1 / tp of the K/V heads, so the pool fits where tp1 needs tiering
+            if tp > 1 && (k == "AGENS_KV_TIER" || k == "AGENS_KV_IDX_HOST") {
+                continue;
+            }
             if std::env::var(k).is_err() {
                 std::env::set_var(k, v);
             }
@@ -519,7 +529,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     };
     let mut engram = [std::ptr::null_mut(); 4];
     // =draft: the INT8 head (1.27 GB more) for the drafter's candidate logits while the target decodes with the bf16
-    // head (drafter numerics move acceptance only). Not the default: ak_i8_gemv at 7 rows took 1.16 ms on H200 vs
+    // head (drafter numerics move acceptance only). Not the default: ak_i8_gemv at 7 rows took 1.16 ms on sm90 vs
     // 0.62 for the bf16 head.
     let lmh_int8 = std::env::var("AGENS_M1_LMHEAD_INT8").unwrap_or_else(|_| "0".into());
     let lm = "model.language_model";
@@ -755,9 +765,11 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         reserve.push(crate::spec::mtp_reserve(cap_rows, o.sessions));
     }
     let has_tower = ck.index.iter().any(|(n, _)| n.starts_with("model.visual."));
-    let vision = o.vision.unwrap_or(has_tower) && tp == 1 && devs.len() == 1;
+    // tensor parallel: the tower runs on the leader only (its embeddings go to the followers with each prefill chunk,
+    // agens_cuda::m1::prefill_mm); every rank reserves the workspace so that the ranks' memory plans stay equal
+    let vision = o.vision.unwrap_or(has_tower) && has_tower && devs.len() == 1;
     if o.vision == Some(true) && !vision {
-        bail!("--vision 1: {}", if !has_tower { "the checkpoint has no vision tower" } else { "one GPU, no --tp" });
+        bail!("--vision 1: {}", if !has_tower { "the checkpoint has no vision tower" } else { "one GPU per process (no --devices)" });
     }
     if vision {
         reserve.push(("vision tower workspace (one image encode, streamed weights)".to_string(), vision_ws_bytes()));
@@ -768,7 +780,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         agens_cuda::synchronize()?;
         let (free, total) = agens_cuda::mem_info()?;
         let budget = ((o.budget_gib * (1u64 << 30) as f64) as usize).min(total);
-        let p = crate::plan::plan(&ck.config, budget, total - free - ballast, o.sessions, wctx, w4_max_nk, &reserve);
+        let p = crate::plan::plan(&ck.config, budget, total - free - ballast, o.sessions, wctx, w4_max_nk, &reserve, tp);
         for l in &p.lines {
             eprintln!("{l}");
         }
@@ -782,6 +794,11 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         pool = p.pool_rows.min(cap.max(4096));
         if pool < p.pool_rows {
             eprintln!("m1: KV pool capped at {pool} rows (plan {}; AGENS_M1_POOL_MAX_ROWS)", p.pool_rows);
+        }
+        let agreed = crate::tp::agree_min("pool", pool)?;  // tp: every rank the same pool (the smallest plan)
+        if agreed < pool {
+            eprintln!("m1: KV pool {agreed} rows (rank {rank} planned {pool}; the ranks take the smallest)");
+            pool = agreed;
         }
         // 1.1.1: one session must fit in the pool at the cap (every other part of the plan is sized for --wctx, so a
         // smaller context only frees memory). 1.1.0 started at the full --wctx with a WARNING, and a request past the
@@ -809,7 +826,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     if o.copy && draft.is_none() && mtp.is_none() {
         agens_cuda::m1::spec_init(true, None, cap_rows)?;  // verify buffers (KDA stash) for copy-only drafting
     }
-    if vision {
+    if vision && rank == 0 {
         let hb = load_vision(&ck)?;
         VISION.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!("m1: vision tower {:.2} GB in pinned host memory (streamed per layer), workspace {:.0} MB planned",
@@ -818,6 +835,11 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     if let Some(m) = &mtp {
         if draft.is_none() {
             agens_cuda::m1::spec_init(true, None, cap_rows)?;
+            // server mode with the MTP head alone (1.2): batched speculation without the drafter
+            let bmax = crate::spec::batch_max();
+            if bmax > 0 {
+                agens_cuda::m1::spec_batch_init(bmax)?;
+            }
         }
         crate::spec::finish_mtp(m, cap_rows)?;
     }
@@ -891,6 +913,7 @@ pub fn session_test(args: &[String]) -> Result<()> {
     let prompts_path = args.get(1).context(usage)?;
     let o = parse_opts(&args[2..], usage)?;
     load(dir, &o)?;
+    crate::tp::start()?;  // tensor parallel: snapshot / restore are forwarded (each rank keeps its own share)
     let prompts: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(prompts_path)?)?;
     let plist = prompts.as_array().context("prompts")?;
     let base = std::path::Path::new(prompts_path).parent().map(|p| p.to_path_buf()).unwrap_or_default();

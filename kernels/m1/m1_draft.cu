@@ -662,4 +662,6 @@ int propose_impl(const Target& t, int B, int* step) {
 }
 int propose(const Target& t, int* step) { return propose_impl(t, 0, step); }
 int propose_b(const Target& t, int B, int* rec) { return propose_impl(t, B, rec); }
+static_assert(TOPK == kCandK, "m1_draft.h kCandK");
+const int* cand_ids() { return D.ready ? D.cid : nullptr; }
 }  // namespace m1draft

@@ -37,7 +37,10 @@ pub fn launch(tp: usize) -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut ins = Vec::new();
     for r in 1..tp {
-        let log = std::fs::File::create(format!("tp_rank{r}.log")).context("tp_rank log")?;
+        // AGENS_TP_LOG_DIR (default: the working directory, else the temp dir when that is not writable)
+        let dir = std::env::var("AGENS_TP_LOG_DIR").unwrap_or_else(|_| ".".into());
+        let log = std::fs::File::create(format!("{dir}/tp_rank{r}.log"))
+            .or_else(|_| std::fs::File::create(std::env::temp_dir().join(format!("tp_rank{r}.log")))).context("tp_rank log")?;
         let mut c = std::process::Command::new(&exe);
         c.args(&args).env("AGENS_TP_RANK", r.to_string()).stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null()).stderr(log);
@@ -63,6 +66,24 @@ fn wait_file(p: &str, what: &str) -> Result<String> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Before m1::init: every rank's value of `what` (e.g. the KV pool rows its memory plan allows), and the minimum of all
+/// of them is returned on every rank (the ranks must agree on pool rows and slots: admissions are decided on the leader
+/// and replayed on the followers). tp1: the value itself.
+pub fn agree_min(what: &str, v: usize) -> Result<usize> {
+    let (r, n, id) = (rank(), size(), id());
+    if n <= 1 {
+        return Ok(v);
+    }
+    let f = |q: usize| format!("/dev/shm/agens_tp_{id}_{what}_{q}");
+    std::fs::write(f(r), format!("{v}\n"))?;
+    let mut m = v;
+    for q in 0..n {
+        m = m.min(wait_file(&f(q), what)?.parse()?);
+    }
+    // everyone has read every file once the all-reduce setup completes; the leader removes them there
+    Ok(m)
 }
 
 /// After m1::init on every rank: exchange regions + ak_tp_setup. `slot_elems`: the largest all-reduce (prefill chunk x
@@ -104,12 +125,23 @@ pub fn setup_allreduce(slot_elems: usize) -> Result<()> {
         let bad = agens_cuda::m1::tp_selftest(it, slot_elems.min(1 << 22));
         eprintln!("tp: rank {r} all-reduce self-test: {it} rounds, {bad} wrong elements");
     }
+    if std::env::var("AGENS_TP_AR_BENCH").map(|v| v == "1").unwrap_or(false) {
+        for n in [5120usize, 8 * 5120, 64 * 5120, 1024 * 5120] {
+            if n <= slot_elems {
+                let us = agens_cuda::m1::tp_bench(500, n);
+                eprintln!("tp: rank {r} all-reduce of {n} elements ({} rows): {us:.1} us", n / 5120);
+            }
+        }
+    }
     // every rank holds every region: the handle files and shm names can go
     std::fs::write(f(r, "ok"), "ok\n")?;
     for q in 0..n {
         wait_file(&f(q, "ok"), "peer setup")?;
     }
     let _ = std::fs::remove_file(f(r, "h"));
+    for w in ["pool"] {
+        let _ = std::fs::remove_file(format!("/dev/shm/agens_tp_{id}_{w}_{r}"));
+    }
     if !peer {
         let _ = std::fs::remove_file(format!("/dev/shm/agens_tp_{id}_{r}"));
     }
@@ -138,6 +170,7 @@ fn follow() -> Result<()> {
     use agens_cuda::tp::split;
     let stdin = std::io::stdin();
     let mut parked: std::collections::HashMap<i32, *mut std::ffi::c_void> = Default::default();
+    let mut snap: (*mut std::ffi::c_void, usize) = (std::ptr::null_mut(), 0); // this rank's Session State snapshot
     for line in stdin.lock().lines() {
         let line = line?;
         let a: Vec<&str> = line.split(' ').collect();
@@ -172,6 +205,24 @@ fn follow() -> Result<()> {
                     m1::session_unpark(id, buf)?
                 }
                 "verify" => drop(m1::verify(&split(a[1]))?),
+                "prefill_mm" => drop(m1::prefill_mm_blob(&agens_cuda::tp::take_blob(a[1])?)?),
+                "set_rope_delta" => m1::set_rope_delta(int(1)?)?,
+                "snapshot" => {
+                    let nb = m1::state_bytes();
+                    if nb > snap.1 {
+                        if !snap.0.is_null() {
+                            agens_cuda::host_free(snap.0)?;
+                        }
+                        snap = (agens_cuda::host_alloc(nb + nb / 4)?, nb + nb / 4);
+                    }
+                    m1::snapshot(snap.0)?
+                }
+                "restore" => {
+                    if snap.0.is_null() {
+                        bail!("tp: restore before any snapshot");
+                    }
+                    m1::restore(snap.0)?
+                }
                 "profiler" => m1::profiler(int(1)? != 0)?,
                 op => bail!("tp: unknown op {op}"),
             }

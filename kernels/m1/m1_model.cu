@@ -200,7 +200,7 @@ constexpr int kMaxBV = 16, kBVRes = 16;
 int g_BV = 0;
 // batched verify length per sequence (2..kSpecT; rows j = g_TV b + t): verifying fewer drafts per sequence at large B
 // trades a little acceptance for a proportionally smaller verify forward (AGENS_SPEC_BATCH_TV: one value, or a list
-// "tv1,tv2,..." for B = 1, 2, ..; the last entry applies to larger B). Default (H200 conc_bench sweep, short prompts):
+// "tv1,tv2,..." for B = 1, 2, ..; the last entry applies to larger B). Default (sm90 conc_bench sweep, short prompts):
 // B x TV at or under 16 rows up to B = 4 (one 16-token GEMM tile), about 30 rows to B = 8, 2 drafts past B = 10
 int g_TV = kSpecT;
 int batch_tv(int B) {
@@ -1790,7 +1790,7 @@ int forward(const int* ids_host, int T, bool prefill, int* next) {
     m1draft::set_ring(ss.kslot);  // the session's drafter context (one ring per KDA slot with batched speculation)
     CK(m1draft::materialize(draft_target(), S.cap, T, nullptr, S.pos));
   }
-  if (m1mtp::ready() && g_ndev == 1 && T <= m1mtp::max_rows()) {  // MTP context entries of the forwarded rows
+  if (m1mtp::ready() && g_ndev == 1) {  // MTP context entries of the forwarded rows (in passes of max_rows)
     m1mtp::set_ring(ss.kslot);
     CK(m1mtp::materialize(draft_target(), WG("model.language_model.norm.weight"), S.H, NS * HID, T, nullptr, S.ids, S.pos));
   }
@@ -2204,11 +2204,12 @@ int plan_verify(int T) {
   }
   return 0;
 }
-// MTP chain steps per drafted verify (AGENS_MTP_STEPS, <= 7): default all 7 slots alone, 3 (its trained chain) with
-// the DFlash2 drafter (whose drafts then fill slots 3..6)
+// MTP chain steps per drafted verify (AGENS_MTP_STEPS, <= 7): default all 7 slots alone, 4 with the DFlash2 drafter
+// (whose drafts then fill slots 4..6; 1.2 sweep on a 48 GB sm89 card, 16 GiB, shortlist head: chain 4 >= chain 3 > chain 2 in
+// tok/s on every class but yue, and the only one ahead of DFlash2 alone on tool calls)
 int mtp_steps() {
   const char* e = getenv("AGENS_MTP_STEPS");
-  const int n = e ? atoi(e) : (m1draft::ready() ? 3 : kSpecT - 1);
+  const int n = e ? atoi(e) : (m1draft::ready() ? 4 : kSpecT - 1);
   return n < 1 ? 1 : (n > kSpecT - 1 ? kSpecT - 1 : n);
 }
 int verify_body(int T, bool draft) {
@@ -2370,8 +2371,15 @@ int spec_commit_b(int B) {
 int verify_body_b(int B) {
   const int R = B * g_TV;
   CK(cudaMemcpyAsync(S.bv_d, S.bv_h, (size_t)B * kRI * sizeof(int), cudaMemcpyHostToDevice, S.s));
-  CK(m1draft::propose_b(draft_target(), B, S.bv_d));  // drafts into each record [3..9]
+  if (m1draft::ready()) CK(m1draft::propose_b(draft_target(), B, S.bv_d));  // drafts into each record [3..9]
   bv_apply_hint<<<B, 32, 0, S.s>>>(S.bv_d);
+  // MTP chains (1.2; hybrid drafting as the single-sequence verify: host proposal, MTP through it, DFlash2 beyond),
+  // at most the batched verify's TV - 1 draft slots
+  // (AGENS_MTP_BATCH_MAX, default 8: larger batched steps skip the chain -- 48gb profile c16 was 4% slower with it --
+  // but every batch keeps the MTP context; the graph key holds B, so a graph never mixes the two)
+  static const int mtp_bmax = getenv("AGENS_MTP_BATCH_MAX") ? atoi(getenv("AGENS_MTP_BATCH_MAX")) : 8;
+  if (m1mtp::ready() && B <= mtp_bmax)
+    CK(m1mtp::propose_b(draft_target(), B, S.bv_d, std::min(mtp_steps(), g_TV - 1)));
   bv_prep<<<B, 32, 0, S.s>>>(S.bv_d, S.Wctx, S.ids, S.pos, S.loc, S.outloc, S.bv_rng, S.bv_slot, g_TV, S.rpos, S.rmax);
   bv_engram<<<B, 32, 0, S.s>>>(S.bv_d, S.ids, S.pos, S.r2, S.r3, g_TV);
   bv_r2t_stage<<<grid((long)B * S.Wctx), 256, 0, S.s>>>(S.bv_d, B, S.Wctx, S.r2t_b);
@@ -2388,6 +2396,9 @@ int verify_body_b(int B) {
   samp_chain<<<1, 32, 0, S.s>>>(S.ids, B, g_TV, S.samp_scr, S.bv_res, kBVRes);
   CK(spec_commit_b(B));
   if (m1draft::ready() && g_capture) CK(m1draft::materialize_b(draft_target(), S.cap, B, S.bv_res, kBVRes, S.pos, S.bv_d, g_TV));
+  if (m1mtp::ready())  // MTP context of each sequence's committed tokens (+ its new pending row)
+    CK(m1mtp::materialize_b(draft_target(), WG("model.language_model.norm.weight"), S.H, NS * HID, B, g_TV, S.bv_res,
+                            kBVRes, S.ids, S.pos, S.bv_d));
   return (int)cudaMemcpyAsync(S.bv_res_h, S.bv_res, (size_t)B * kBVRes * sizeof(int), cudaMemcpyDeviceToHost, S.s);
 }
 // Graphs per (B, TV, regimes). Tiered KV runs each sequence's attention as its own verify layer, whose launches carry
@@ -2400,7 +2411,9 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
                const int* nh = nullptr) {
   const auto t_start = std::chrono::steady_clock::now();
   use(0);
-  if (B < 1 || B > S.bv_max || !m1draft::ready() || g_ndev != 1 || S.kstb.empty()) return (int)cudaErrorInvalidValue;
+  if (B < 1 || B > S.bv_max || !(m1draft::ready() || m1mtp::ready()) || g_ndev != 1 || S.kstb.empty() ||
+      (m1mtp::ready() && B > m1mtp::max_seqs()))
+    return (int)cudaErrorInvalidValue;
   if (m1kv::on() && !(m1kv::graph_safe() && dev_attn() && far_engine())) return (int)cudaErrorNotSupported;
   // tiered / INT8 KV: each sequence's attention runs as its own verify layer, whose single-sequence plans are sized
   // for kSpecT queries -> the full verify length there
@@ -2664,6 +2677,7 @@ int ak_m1_tp_config(int rank, int size) {
   CK(ak_far_set_heads(QH, KVH));
   CK(ak_kda_prefill_set_heads(KH, KHV));
   CK(ak_bridge_set_heads(QH, KVH));
+  CK(m1d8::set_heads(QH, KVH));  // INT8 dense KV: this rank's head share
   return 0;
 }
 // Wctx: sglv23's req_to_token width (its far branch scores Wctx/4 blocks; must match for identical GEMM shapes) and the
@@ -2713,6 +2727,10 @@ int ak_m1_init(int Wctx, const char* mixers, int engram_a, int engram_b, void* e
 }
 
 int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0, void* eng22_t1) {
+  if (m1kv::on() && g_tp > 1) {  // m1_kv (tiered / INT8 BCSA KV) is laid out for the full model's 4 kv heads
+    fprintf(stderr, "m1: AGENS_KV_TIER / AGENS_KV_INT8 (tiered or INT8 BCSA KV) are tp1 only; --tp keeps all KV on the GPUs\n");
+    return (int)cudaErrorNotSupported;
+  }
   const int my = (int)(SP - SD);
   S.Wctx = Wctx;
   S.rows = rows;
@@ -2919,10 +2937,12 @@ int ak_m1_mtp_register(const char* name, void* ptr) { return m1mtp::register_wei
 int ak_m1_mtp_register_wq(const char* name, void* wt, void* st, int n, int k, int group, int bits) {
   return m1mtp::register_w4(name, wt, st, n, k, group, bits);
 }
+int ak_m1_mtp_shortlist(const int* ids, int n) { return m1mtp::set_shortlist(ids, n); }
 long long ak_m1_mtp_setup(int max_rows, int window) {
   use(0);
   if (S.kst.empty() || g_ndev != 1) return -1;  // after ak_m1_spec_init; one device per process
-  if (m1mtp::setup(max_rows, g_nslots + 1, window)) return -1;
+  // batched speculation (ak_m1_spec_batch_init before this): chain buffers for bv_max sequences
+  if (m1mtp::setup(max_rows, g_nslots + 1, window, S.bv_max > 0 ? S.bv_max : 1)) return -1;
   for (int k = 0; k <= g_nslots; ++k) m1mtp::reset_ring(k, S.s);
   g_vgraphs.clear(), g_vwarm.clear();
   return (long long)m1mtp::bytes();
