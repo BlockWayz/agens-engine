@@ -2020,6 +2020,54 @@ void drop_graphs(int id) {  // every graph of session id (any regime / tile coun
     }
   for (auto it = g_vwarm.begin(); it != g_vwarm.end();) it = it->first.first == id ? g_vwarm.erase(it) : std::next(it);
 }
+// INT8 dense KV (16gb / 12gb profiles): a single-sequence graph key holds the dense layer's tile count (one more every
+// TILE = 8192 positions) above its low bits (decode: far, verify: regime + drafted). A sequence never goes back to
+// fewer tiles, so the graph of a new tile count replaces that session's graphs with the same low bits (1.1.1 fix: 1.1.0
+// kept every tile count's graphs, ~4 verify segments each, until the session ended; a ~100K-token generation filled the
+// 16 GiB cap and cudaGraphInstantiate failed with out of memory)
+template <typename G>
+void drop_other_tiles(std::map<std::pair<int, int>, G>& graphs, std::map<std::pair<int, int>, int>& warm,
+                      std::pair<int, int> key, int low_bits, void (*destroy)(G&)) {
+  const int mask = (1 << low_bits) - 1;
+  for (auto it = graphs.begin(); it != graphs.end();)
+    if (it->first.first == key.first && (it->first.second & mask) == (key.second & mask) && it->first != key) {
+      destroy(it->second);
+      warm.erase(it->first);
+      it = graphs.erase(it);
+    } else {
+      ++it;
+    }
+}
+void destroy_exec(cudaGraphExec_t& ex) { cudaGraphExecDestroy(ex); }
+void destroy_execs(std::vector<cudaGraphExec_t>& exs) {
+  for (auto ex : exs) cudaGraphExecDestroy(ex);
+}
+void drop_all_graphs();  // every cached graph (single-sequence and batched), defined after the batched caches
+// Instantiate captured graph segments (consumed). An instantiation needs device memory, which under the --budget-gib
+// cap can run out: then every cached graph is freed (recaptured on demand) and it retries once; false when that fails
+// too (error state cleared, exs empty): the caller runs the step eagerly, with the same kernels and results.
+bool instantiate(std::vector<cudaGraph_t>& segs, std::vector<cudaGraphExec_t>& exs, const char* what) {
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    cudaError_t e = cudaSuccess;
+    exs.clear();
+    for (cudaGraph_t g : segs) {
+      cudaGraphExec_t ex = nullptr;
+      if ((e = cudaGraphInstantiate(&ex, g, 0)) != cudaSuccess) break;
+      exs.push_back(ex);
+    }
+    if (e == cudaSuccess) break;
+    destroy_execs(exs);
+    exs.clear();
+    cudaGetLastError();
+    fprintf(stderr, "m1: %s graph instantiation failed (%s): %s\n", what, cudaGetErrorString(e),
+            attempt ? "running the step eagerly" : "freeing the cached graphs and retrying");
+    if (!attempt) drop_all_graphs();
+  }
+  for (cudaGraph_t g : segs) cudaGraphDestroy(g);
+  segs.clear();
+  return !exs.empty();
+}
+constexpr int kNoGraph = -(1 << 30);  // warm count of a key whose graph could not be instantiated: eager from then on
 bool graphs_on() {
   static const bool on = [] {
     const char* e = getenv("AGENS_M1_GRAPH");
@@ -2064,11 +2112,17 @@ int decode1(int token, int* next) {
       fprintf(stderr, "m1: decode graph capture failed (%d, %s)\n", e, cudaGetErrorString(ec));
       return e ? e : (int)ec;
     }
-    cudaGraphExec_t ex = nullptr;
-    CK(cudaGraphInstantiate(&ex, gph, 0));
-    cudaGraphDestroy(gph);
-    g_graphs[key] = ex;
-    CK(cudaGraphLaunch(ex, S.s));
+    drop_other_tiles(g_graphs, g_warm, key, 1, destroy_exec);
+    std::vector<cudaGraph_t> segs{gph};
+    std::vector<cudaGraphExec_t> exs;
+    if (instantiate(segs, exs, "decode")) {
+      g_graphs[key] = exs[0];
+      CK(cudaGraphLaunch(exs[0], S.s));
+    } else {
+      g_lin = g_lin_w4 = 0;
+      CK(decode_body());
+      g_warm[key] = kNoGraph;
+    }
   } else {
     g_lin = g_lin_w4 = 0;
     CK(decode_body());
@@ -2245,15 +2299,24 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
       fprintf(stderr, "m1: verify graph capture failed (%d, %s)\n", e, cudaGetErrorString(ec));
       return e ? e : (int)ec;
     }
+    drop_other_tiles(g_vgraphs, g_vwarm, key, 3, destroy_execs);
+    static const bool glog = getenv("AGENS_M1_GRAPH_LOG") != nullptr;
+    size_t f0 = 0, f1 = 0, tot = 0;
+    if (glog) cudaMemGetInfo(&f0, &tot);
     std::vector<cudaGraphExec_t> exs;
-    for (cudaGraph_t g : segs) {
-      cudaGraphExec_t ex = nullptr;
-      CK(cudaGraphInstantiate(&ex, g, 0));
-      cudaGraphDestroy(g);
-      exs.push_back(ex);
+    if (instantiate(segs, exs, "verify")) {
+      g_vgraphs[key] = exs;
+      if (glog) {
+        cudaMemGetInfo(&f1, &tot);
+        fprintf(stderr, "m1: verify graph seq %d regime %d drafted %d tiles %d: %zu segments, %.1f MB, %zu cached, %.0f MB free\n",
+                g_seq, regime, (int)draft, d8t, exs.size(), (f0 - f1) / 1e6, g_vgraphs.size(), f1 / 1e6);
+      }
+      for (auto ex : exs) CK(cudaGraphLaunch(ex, S.s));
+    } else {
+      g_lin = g_lin_w4 = 0;
+      CK(verify_body(T, draft));
+      g_vwarm[key] = kNoGraph;
     }
-    g_vgraphs[key] = exs;
-    for (auto ex : exs) CK(cudaGraphLaunch(ex, S.s));
   } else {
     g_lin = g_lin_w4 = 0;
     CK(verify_body(T, draft));
@@ -2408,31 +2471,30 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
       return e ? e : (int)ec;
     }
     std::vector<cudaGraphExec_t> exs;
-    for (cudaGraph_t g : segs) {
-      cudaGraphExec_t ex = nullptr;
-      CK(cudaGraphInstantiate(&ex, g, 0));
-      cudaGraphDestroy(g);
-      exs.push_back(ex);
-    }
-    g_bvgraphs[key] = exs;
-    if (tiered) {
-      static const size_t keep = getenv("AGENS_M1_BV_TIER_GRAPHS") ? std::max(1, atoi(getenv("AGENS_M1_BV_TIER_GRAPHS"))) : 8;
-      g_bvtier_order.push_back(key);
-      while (g_bvtier_order.size() > keep) {
-        auto old = g_bvgraphs.find(g_bvtier_order.front());
-        if (old != g_bvgraphs.end()) {
-          for (auto ex : old->second) cudaGraphExecDestroy(ex);
-          g_bvgraphs.erase(old);
+    if (instantiate(segs, exs, "batched verify")) {
+      g_bvgraphs[key] = exs;
+      if (tiered) {
+        static const size_t keep = getenv("AGENS_M1_BV_TIER_GRAPHS") ? std::max(1, atoi(getenv("AGENS_M1_BV_TIER_GRAPHS"))) : 8;
+        g_bvtier_order.push_back(key);
+        while (g_bvtier_order.size() > keep) {
+          auto old = g_bvgraphs.find(g_bvtier_order.front());
+          if (old != g_bvgraphs.end()) {
+            for (auto ex : old->second) cudaGraphExecDestroy(ex);
+            g_bvgraphs.erase(old);
+          }
+          g_bvwarm.erase(g_bvtier_order.front());
+          g_bvtier_order.pop_front();
         }
-        g_bvwarm.erase(g_bvtier_order.front());
-        g_bvtier_order.pop_front();
       }
+      if (getenv("AGENS_M1_GRAPH_LOG"))
+        fprintf(stderr, "m1: batched verify graph B %d TV %d regimes %lld captured in %.0f ms (%zu graphs)\n", B, TV, rkey,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count(),
+                g_bvgraphs.size());
+      for (auto ex : exs) CK(cudaGraphLaunch(ex, S.s));
+    } else {
+      e = verify_body_b(B);
+      g_bvwarm[key] = kNoGraph;
     }
-    if (getenv("AGENS_M1_GRAPH_LOG"))
-      fprintf(stderr, "m1: batched verify graph B %d TV %d regimes %lld captured in %.0f ms (%zu graphs)\n", B, TV, rkey,
-              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count(),
-              g_bvgraphs.size());
-    for (auto ex : exs) CK(cudaGraphLaunch(ex, S.s));
   } else {
     e = verify_body_b(B);
     ++g_bvwarm[key];
@@ -2471,6 +2533,13 @@ bool batch_dev() {
 }
 std::map<std::pair<int, int>, cudaGraphExec_t> g_bgraphs;
 std::map<std::pair<int, int>, int> g_bwarm;
+void drop_all_graphs() {  // warm counts are kept: the next step of a key captures again
+  for (auto& g : g_graphs) cudaGraphExecDestroy(g.second);
+  for (auto& g : g_vgraphs) destroy_execs(g.second);
+  for (auto& g : g_bvgraphs) destroy_execs(g.second);
+  for (auto& g : g_bgraphs) cudaGraphExecDestroy(g.second);
+  g_graphs.clear(), g_vgraphs.clear(), g_bvgraphs.clear(), g_bgraphs.clear(), g_bvtier_order.clear();
+}
 int batch_body(int Bp, bool far) {
   CK(cudaMemcpyAsync(S.bstep_d, S.bstep_h, (size_t)Bp * kBRec * sizeof(int), cudaMemcpyHostToDevice, S.s));
   batch_step_prep<<<1, 32, 0, S.s>>>(S.bstep_d, Bp, S.ids, S.pos, S.loc, S.outloc, S.slots_b, S.rng_b, S.r2, S.r3, S.rpos,
@@ -2522,9 +2591,11 @@ int rows_dev(const int* sess, const int* tok, int B, const std::vector<long long
     const cudaError_t ec = cudaStreamEndCapture(S.s, &gph);
     if (!e && ec) e = (int)ec;
     if (!e) {
-      cudaGraphExec_t ex = nullptr;
-      e = (int)cudaGraphInstantiate(&ex, gph, 0);
-      if (!e) g_bgraphs[key] = ex, e = (int)cudaGraphLaunch(ex, S.s);
+      std::vector<cudaGraph_t> segs{gph};
+      std::vector<cudaGraphExec_t> exs;
+      gph = nullptr;  // consumed by instantiate
+      if (instantiate(segs, exs, "batch decode")) g_bgraphs[key] = exs[0], e = (int)cudaGraphLaunch(exs[0], S.s);
+      else e = batch_body(Bp, far), g_bwarm[key] = kNoGraph;
     }
     if (gph) cudaGraphDestroy(gph);
     if (e) fprintf(stderr, "m1: batch graph capture failed (%d)\n", e);
@@ -3261,5 +3332,32 @@ int ak_m1_free_slots() {
   int n = 0;
   for (int k = 1; k <= g_nslots; ++k) n += !g_slot_used[k];
   return n;
+}
+// After a failed engine call (serve fails that request and keeps running; 1.1.1): end a stream capture left open, free
+// every cached CUDA graph (device memory for what comes next; recaptured on demand) and clear the error state. 0: the
+// context is usable; else the sticky error that makes it unusable (the caller exits).
+int ak_m1_recover() {
+  int e = 0;
+  for (int d = 0; d < g_ndev; ++d) {
+    use(d);
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(S.s, &st) == cudaSuccess && st != cudaStreamCaptureStatusNone) {
+      cudaGraph_t g = nullptr;
+      cudaStreamEndCapture(S.s, &g);
+      if (g) cudaGraphDestroy(g);
+    }
+  }
+  g_seg_capture = nullptr;
+  drop_all_graphs();
+  for (int d = 0; d < g_ndev; ++d) {
+    use(d);
+    cudaDeviceSynchronize();
+    cudaGetLastError();  // a non-sticky error is cleared here; a sticky one is returned again
+    const cudaError_t s = cudaDeviceSynchronize();
+    if (s != cudaSuccess && !e) e = (int)s;
+  }
+  use(0);
+  if (e) fprintf(stderr, "m1: recover: the CUDA context is unusable (%s)\n", cudaGetErrorString((cudaError_t)e));
+  return e;
 }
 }

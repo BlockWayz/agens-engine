@@ -34,6 +34,9 @@ pub struct AppState {
     pub vocab_size: usize,
     /// Image sizing when the backend takes images (preprocessor_config.json + the engine's caps), else None.
     pub vision: Option<crate::vision::ImageCfg>,
+    /// New tokens of a request that sets no max_tokens (1.1.1, `agens serve --max-tokens-default`); 0 = up to the
+    /// context. An explicit max_tokens is honoured up to the context.
+    pub max_tokens_default: usize,
 }
 
 impl AppState {
@@ -75,6 +78,7 @@ impl AppState {
             think_end_ids,
             vocab_size,
             vision: None,
+            max_tokens_default: 0,
         }
     }
 }
@@ -181,7 +185,8 @@ fn engine_request(
             st.context_length
         )));
     }
-    let requested = rs.max_new_tokens.map(|m| m.max(0) as usize).unwrap_or(1 << 30);
+    let dflt = if st.max_tokens_default > 0 { st.max_tokens_default } else { 1 << 30 };
+    let requested = rs.max_new_tokens.map(|m| m.max(0) as usize).unwrap_or(dflt);
     let max_new_tokens = requested.min(st.context_length.saturating_sub(n + 1));
     let logit_bias =
         rs.logit_bias.iter().filter_map(|(k, v)| k.trim().parse::<u32>().ok().map(|id| (id, *v))).collect();
@@ -294,7 +299,8 @@ async fn chat_inner(st: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Resul
         let (tx, rx) = mpsc::channel::<String>(64);
         tokio::spawn(async move {
             let mut cs = ChatStream::new(meta, &req, &plan);
-            while let Some(item) = outputs.recv().await {
+            // (1.1.1) the client went away: stop at once (dropping `outputs` cancels the request)
+            while let Some(item) = tokio::select! { biased; _ = tx.closed() => None, i = outputs.recv() => i } {
                 let o = match item {
                     Ok(o) => o,
                     Err(msg) => {
@@ -405,7 +411,8 @@ async fn completions_inner(st: Arc<AppState>, headers: HeaderMap, body: Bytes) -
                 .map(|o| (o.include_usage, o.continuous_usage_stats))
                 .unwrap_or((false, false));
             let mut last = Usage { prompt_tokens: 0, completion_tokens: 0, reasoning_tokens: 0 };
-            while let Some(item) = outputs.recv().await {
+            // (1.1.1) the client went away: stop at once (dropping `outputs` cancels the request)
+            while let Some(item) = tokio::select! { biased; _ = tx.closed() => None, i = outputs.recv() => i } {
                 let o = match item {
                     Ok(o) => o,
                     Err(msg) => {

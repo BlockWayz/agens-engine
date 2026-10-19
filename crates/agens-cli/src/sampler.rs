@@ -70,6 +70,84 @@ impl Budget {
     }
 }
 
+/// Thinking-block repetition guard (1.1.1; a mitigation for the 16 GB build's long-context loops, not a fix): inside
+/// `<|think|>`, an n-gram of generated tokens seen `k` times among the n-grams ending in the last `w` generated tokens
+/// marks the block degenerate; the caller then closes it (the reasoning budget's forced `<|/think|>`) at the next token
+/// it may still replace. Open state as [`Budget`]: from the prompt's last 16 tokens, or a generated `<|think|>`.
+pub struct ThinkGuard {
+    n: usize,
+    k: u32,
+    w: usize,
+    start: u32,
+    end: u32,
+    open: bool,
+    closed: bool,
+    tail: std::collections::VecDeque<u32>,   // last n tokens
+    hashes: std::collections::VecDeque<u64>, // n-gram hash per generated position in the window
+    counts: std::collections::HashMap<u64, u32>,
+    seen: usize, // generated tokens while open
+    pub fired: Option<usize>, // the thinking token at which the repetition reached k
+}
+
+impl ThinkGuard {
+    pub fn new(n: usize, k: u32, w: usize, prompt: &[u32], start: u32, end: u32) -> Self {
+        let tail = &prompt[prompt.len().saturating_sub(16)..];
+        let open = tail.iter().rposition(|&t| t == start).map(|i| !tail[i + 1..].contains(&end)).unwrap_or(false);
+        ThinkGuard { n: n.max(1), k: k.max(2), w: w.max(n), start, end, open, closed: false, tail: Default::default(),
+                     hashes: Default::default(), counts: Default::default(), seen: 0, fired: None }
+    }
+    /// The token to emit for the model's choice `t`: `<|/think|>` when the guard has fired and `t` is still replaceable
+    /// (`pending`: not yet fed to the model); else `t`. Every emitted token goes through here.
+    pub fn filter(&mut self, t: u32, pending: bool) -> u32 {
+        let t = if pending && self.open && self.fired.is_some() { self.end } else { t };
+        self.push(t);
+        t
+    }
+    fn push(&mut self, t: u32) {
+        if t == self.start && !self.open && !self.closed {
+            self.open = true;
+            return;
+        }
+        if !self.open {
+            return;
+        }
+        if t == self.end {
+            self.open = false;
+            self.closed = true;
+            return;
+        }
+        self.seen += 1;
+        self.tail.push_back(t);
+        if self.tail.len() > self.n {
+            self.tail.pop_front();
+        }
+        if self.tail.len() == self.n {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.tail.hash(&mut h);
+            let h = h.finish();
+            self.hashes.push_back(h);
+            let c = self.counts.entry(h).or_insert(0);
+            *c += 1;
+            if *c >= self.k && self.fired.is_none() {
+                self.fired = Some(self.seen);
+            }
+            if self.hashes.len() > self.w {
+                let old = self.hashes.pop_front().unwrap();
+                if let Some(c) = self.counts.get_mut(&old) {
+                    *c -= 1;
+                    if *c == 0 {
+                        self.counts.remove(&old);
+                    }
+                }
+            }
+        }
+    }
+    pub fn params(&self) -> (usize, u32, usize) {
+        (self.n, self.k, self.w)
+    }
+}
+
 fn bf16(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
@@ -252,5 +330,36 @@ mod tests {
         assert!(matches!(b.act(2), BudgetAct::None));
         b.accept(2, S); // a later <|think|> does not reopen (as the image: closed stays closed)
         assert!(matches!(b.act(3), BudgetAct::None));
+    }
+
+    #[test]
+    fn think_guard_closes_a_loop_at_the_next_pending_token() {
+        let mut g = ThinkGuard::new(4, 3, 64, &[1, S], S, E);
+        // no repetition: nothing changes
+        for t in 10..40 {
+            assert_eq!(g.filter(t, true), t);
+        }
+        assert!(g.fired.is_none());
+        // a period-5 loop: the 4-gram (1,2,3,4) is complete for the 3rd time at its 3rd occurrence
+        let mut out = Vec::new();
+        for _ in 0..4 {
+            for (j, &t) in [1u32, 2, 3, 4, 5].iter().enumerate() {
+                out.push(g.filter(t, j == 4)); // only the last token of each "step" is replaceable
+            }
+        }
+        // fired at the 3rd (1, 2, 3, 4) (not replaceable); closed at that step's last token; inactive after
+        assert!(g.fired.is_some());
+        assert_eq!(out[14], E, "{out:?}");
+        assert_eq!(out.iter().filter(|&&t| t == E).count(), 1);
+        assert_eq!(&out[15..], &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn think_guard_inactive_outside_thinking() {
+        let mut g = ThinkGuard::new(2, 2, 64, &[1, 2], S, E); // not open
+        for _ in 0..10 {
+            assert_eq!(g.filter(7, true), 7);
+        }
+        assert!(g.fired.is_none());
     }
 }

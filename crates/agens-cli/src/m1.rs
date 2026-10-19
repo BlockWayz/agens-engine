@@ -351,6 +351,8 @@ fn load_vision(ck: &Checkpoint) -> Result<usize> {
 }
 /// Bytes of the hard-cap ballast (0 = no cap): device use reports subtract it.
 pub(crate) static CAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The context the engine was initialised with: --wctx, or less when the budget's KV pool cannot hold it (1.1.1)
+pub(crate) static WCTX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Device memory in use by this process now (the CUDA context and lazily loaded kernel modules included, the hard-cap
 /// ballast excluded): what a 16 GB card would have to hold.
@@ -426,7 +428,7 @@ fn collapse_scales(sc: &[u8], n: usize, k: usize, cg: usize, group: usize, what:
 }
 
 pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
-    let (gpu_gib, wctx) = (o.gpu_gib, o.wctx);
+    let (gpu_gib, mut wctx) = (o.gpu_gib, o.wctx);
     crate::tp::launch(o.tp)?;
     let (tp, rank) = (crate::tp::size(), crate::tp::rank());
     // AGENS_TP_SAME_GPU=1: every rank on --device (correctness runs on one GPU; the ranks time-share it)
@@ -781,7 +783,19 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         if pool < p.pool_rows {
             eprintln!("m1: KV pool capped at {pool} rows (plan {}; AGENS_M1_POOL_MAX_ROWS)", p.pool_rows);
         }
+        // 1.1.1: one session must fit in the pool at the cap (every other part of the plan is sized for --wctx, so a
+        // smaller context only frees memory). 1.1.0 started at the full --wctx with a WARNING, and a request past the
+        // pool failed inside the engine; now the context is clamped to the pool, with this line.
+        if pool < wctx {
+            let w = (pool.saturating_sub(4) / 4096) * 4096 + 4; // the profiles' form: 4096 k + 4
+            if w < 2 * crate::plan::chunk().max(4096) {
+                bail!("budget {} GiB: the KV pool ({pool} rows) cannot hold a useful context (--wctx {wctx})", o.budget_gib);
+            }
+            eprintln!("m1: --wctx {wctx} clamped to {w}: the KV pool holds {pool} rows at the {} GiB cap", o.budget_gib);
+            wctx = w;
+        }
     }
+    WCTX.store(wctx, std::sync::atomic::Ordering::Relaxed);
     if tp > 1 {
         agens_cuda::m1::tp_config(rank, tp)?;
     }

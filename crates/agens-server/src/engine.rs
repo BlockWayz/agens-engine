@@ -243,7 +243,14 @@ pub fn run(
             return;
         }
         loop {
-            let step = match steps.recv().await {
+            // 1.1.1: a request whose client went away (its receiver dropped: a closed connection, streaming or not)
+            // ends now, not at its next output; dropping `steps` cancels the backend request at its next step
+            let recv = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                r = steps.recv() => r,
+            };
+            let step = match recv {
                 Some(Ok(s)) => s,
                 Some(Err(e)) => {
                     let _ = tx.send(Err(e.0)).await;

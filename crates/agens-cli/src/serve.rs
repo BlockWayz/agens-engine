@@ -32,7 +32,7 @@
 //! chunk of the request passes its rope positions and image-embedding rows. Conversation prefixes are compared on
 //! keys that include each image's hash.
 
-use crate::sampler::{is_greedy, needs_logits, Budget, BudgetAct, Sampler};
+use crate::sampler::{is_greedy, needs_logits, Budget, BudgetAct, Sampler, ThinkGuard};
 use agens_server::backend::{Backend, BackendError, SessionHint, TokenStream};
 use agens_server::sampling::SamplingParams;
 use agens_server::vision::MmInput;
@@ -182,6 +182,7 @@ struct Act {
     lk: Option<crate::lookup::Lookup>, // copy-from-context proposals (hybrid drafting), built at the first verify
     bset: bool,                         // its session's batched-verify sampling is set (server mode)
     vsteps: u64,                        // verify steps of this request (bs = 1 or batched) (AGENS_SERVE_REQ_STATS=1 log)
+    guard: Option<ThinkGuard>,          // thinking-block repetition guard (--think-guard)
 }
 
 /// The request's lookup index (prompt + the bonus token), built on first use.
@@ -212,6 +213,7 @@ struct Engine {
     spec: bool,             // a drafter is loaded (personal mode), or copy-only drafting
     copy: bool,             // copy-only drafting (--spec-copy 1 without a drafter); sampled requests decode on the host without a proposal
     fork: bool,             // conversations generate on a fork of their main session (false: --no-fork)
+    think_guard: Option<(usize, u32, usize)>, // --think-guard n-gram, repeats, window (None: off)
 }
 
 enum Admit {
@@ -298,6 +300,7 @@ impl Engine {
             sampler.budget = Some(Budget::new(n, job.sp.reasoning_budget_soft_bias, &job.prompt, self.think.0, self.think.1));
         }
         let spec = if self.spec { spec_sampling(&job.sp) } else { None };
+        let guard = self.think_guard.map(|(n, k, w)| ThinkGuard::new(n, k, w, &job.prompt, self.think.0, self.think.1));
         let t0 = Instant::now();
         let mk = |phase| Act {
             job: Job { id: job.id, prompt: job.prompt.clone(), key: job.key.clone(), mm: job.mm.clone(), sp: job.sp.clone(),
@@ -311,6 +314,7 @@ impl Engine {
             lk: None,
             bset: false,
             vsteps: 0,
+            guard,
         };
         let Some(k) = conv.clone() else {
             let mm = match Self::mm_feed(job, 0, n) {
@@ -381,6 +385,19 @@ impl Engine {
         })
     }
 
+    /// The thinking-block repetition guard on the model's token `t` (`pending`: not yet fed to the model, so it can be
+    /// replaced): `<|/think|>` once the guard has fired, else `t`.
+    fn pick(act: &mut Act, t: i32, pending: bool) -> i32 {
+        let Some(g) = act.guard.as_mut() else { return t };
+        let u = g.filter(t as u32, pending) as i32;
+        if u != t {
+            let (n, k, w) = g.params();
+            eprintln!("serve: request {} think guard: a {n}-gram repeated {k} times within {w} tokens (thinking token {}): \
+                       closing the thinking block at output token {}", act.job.id, g.fired.unwrap_or(0), act.produced);
+        }
+        u
+    }
+
     /// Emit a token; true when the request is finished.
     fn emit(act: &mut Act, tok: i32) -> bool {
         act.sampler.accept(tok as u32);
@@ -427,11 +444,60 @@ impl Engine {
         Ok(())
     }
 
+    /// The engine loop. A failed engine call (1.1.1: e.g. out of device memory under the --budget-gib cap) ends the
+    /// requests it was for with an error and the loop goes on (1.1.0 exited the server); only an unusable CUDA context
+    /// (a sticky error) or tensor parallelism ends it.
     fn run(&mut self, rx: smpsc::Receiver<Job>) -> Result<()> {
-        use agens_cuda::m1;
-        let mut waiting: VecDeque<Job> = VecDeque::new();
-        let mut acts: Vec<Act> = Vec::new();
+        let (mut waiting, mut acts) = (VecDeque::new(), Vec::new());
+        let (mut done_ids, mut inflight) = (Vec::new(), Vec::new());
         loop {
+            match self.run_loop(&rx, &mut waiting, &mut acts, &mut done_ids, &mut inflight) {
+                Ok(()) => return Ok(()),
+                Err(err) => self.fail_acts(&mut acts, &done_ids, &inflight, err)?,
+            }
+        }
+    }
+
+    /// After a failed engine call for the requests `ids`: recover the CUDA context (Err when it is unusable), retire the
+    /// requests that had finished in that step, end `ids` with an error and free their sessions (a conversation's main
+    /// session too: its state may be partial).
+    fn fail_acts(&mut self, acts: &mut Vec<Act>, done: &[u64], ids: &[u64], err: anyhow::Error) -> Result<()> {
+        eprintln!("serve: engine call failed (requests {ids:?}): {err:#}");
+        if agens_cuda::tp::active() {
+            return Err(err);
+        }
+        if let Err(e) = agens_cuda::m1::recover() {
+            return Err(err.context(format!("{e:#}")));
+        }
+        let msg = format!("engine error: {err:#}");
+        for i in (0..acts.len()).rev() {
+            let id = acts[i].job.id;
+            if ids.contains(&id) {
+                let a = acts.swap_remove(i);
+                let _ = a.job.tx.blocking_send(Err(BackendError(msg.clone())));
+                let sess = match a.phase {
+                    Phase::Decode { sess, .. } | Phase::Prefill { sess, .. } => sess,
+                    Phase::Last { fork } => fork,
+                };
+                if let Some(c) = a.job.conv.as_ref().and_then(|k| self.convs.remove(k)) {
+                    if c.main != sess {
+                        self.free_session(c.main)?;
+                    }
+                }
+                self.free_session(sess)?;
+            } else if done.contains(&id) {
+                let a = acts.swap_remove(i);
+                self.finish(a)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn run_loop(&mut self, rx: &smpsc::Receiver<Job>, waiting: &mut VecDeque<Job>, acts: &mut Vec<Act>,
+                done_ids: &mut Vec<u64>, inflight: &mut Vec<u64>) -> Result<()> {
+        use agens_cuda::m1;
+        loop {
+            inflight.clear();
             if acts.is_empty() && waiting.is_empty() {
                 match rx.recv() {
                     Ok(j) => waiting.push_back(j),
@@ -464,9 +530,10 @@ impl Engine {
                 }
             }
             // one prefill chunk (oldest first)
-            let mut done_ids = Vec::new();
+            done_ids.clear();
             if let Some(i) = acts.iter().position(|a| !matches!(a.phase, Phase::Decode { .. })) {
                 let a = &mut acts[i];
+                *inflight = vec![a.job.id];
                 match &mut a.phase {
                     Phase::Prefill { sess, feed, done, mm } => {
                         let s = *sess;
@@ -493,6 +560,7 @@ impl Engine {
                                 a.phase = Phase::Last { fork };
                             } else {
                                 let t = Self::choose(a, greedy, 0)?;
+                                let t = Self::pick(a, t, true);
                                 a.phase = Phase::Decode { sess: s, last: t };
                                 if Self::emit(a, t) {
                                     done_ids.push(a.job.id);
@@ -510,6 +578,7 @@ impl Engine {
                         let last = *a.job.prompt.last().unwrap() as i32;
                         let greedy = m1::prefill(&[last])?;
                         let t = Self::choose(a, greedy, 0)?;
+                        let t = Self::pick(a, t, true);
                         a.phase = Phase::Decode { sess: f, last: t };
                         if Self::emit(a, t) {
                             done_ids.push(a.job.id);
@@ -532,6 +601,9 @@ impl Engine {
                 Vec::new()
             };
             let batched = spec_rows.len() > 1 || spec_rows.iter().any(|&i| acts[i].spec.map_or(false, |s| s.t > 0.0));
+            if batched {
+                *inflight = spec_rows.iter().map(|&i| acts[i].job.id).collect();
+            }
             for &i in &spec_rows {
                 let a = &mut acts[i];
                 if batched && !a.bset {
@@ -580,7 +652,8 @@ impl Engine {
                     a.vsteps += 1;
                     a.fed.push(last[j] as u32);
                     a.fed.extend(em[j][..em[j].len() - 1].iter().map(|&t| t as u32));
-                    for &t in &em[j] {
+                    for (k, &t) in em[j].iter().enumerate() {
+                        let t = Self::pick(a, t, k + 1 == em[j].len());
                         if let Phase::Decode { last, .. } = &mut a.phase {
                             *last = t;
                         }
@@ -609,6 +682,7 @@ impl Engine {
             if rows.len() == 1 && acts[rows[0]].spec.is_some() {
                 // personal mode, speculative: one verify step emits 1..8 tokens
                 let a = &mut acts[rows[0]];
+                *inflight = vec![a.job.id];
                 let Phase::Decode { sess, last } = a.phase else { unreachable!() };
                 m1::session_use(sess)?;
                 if a.produced == 1 {
@@ -640,7 +714,8 @@ impl Engine {
                 self.stats.1 += em.len() as u64;
                 self.stats.2 += td.elapsed().as_secs_f64();
                 a.vsteps += 1;
-                for &t in &em {
+                for (k, &t) in em.iter().enumerate() {
+                    let t = Self::pick(a, t, k + 1 == em.len());
                     if let Phase::Decode { last, .. } = &mut a.phase {
                         *last = t;
                     }
@@ -659,6 +734,7 @@ impl Engine {
                     );
                 }
             } else if !rows.is_empty() {
+                *inflight = rows.iter().map(|&i| acts[i].job.id).collect();
                 let (sess, toks): (Vec<i32>, Vec<i32>) = rows
                     .iter()
                     .map(|&i| match acts[i].phase {
@@ -682,6 +758,7 @@ impl Engine {
                     let a = &mut acts[i];
                     a.fed.push(toks[j] as u32);
                     let t = Self::choose(a, next[j], j)?;
+                    let t = Self::pick(a, t, true);
                     if let Phase::Decode { last, .. } = &mut a.phase {
                         *last = t;
                     }
@@ -700,6 +777,7 @@ impl Engine {
                 }
             }
             // retire finished and cancelled requests
+            inflight.clear();
             for i in (0..acts.len()).rev() {
                 if done_ids.contains(&acts[i].job.id) || acts[i].job.tx.is_closed() {
                     let a = acts.swap_remove(i);
@@ -718,11 +796,15 @@ impl Engine {
 pub fn run(args: &[String]) -> Result<()> {
     let usage = "agens serve <ckpt_dir> [--model-dir DIR] [--host 0.0.0.0] [--port 30000] [--served-model-name NAME] \
                  [--mode personal|server] [--max-batch 8] [--max-convs 64] [--budget-gib N] [--spec-drafter DIR] [--spec-copy 1] [--no-fork 1] \
+                 [--max-tokens-default 32768] [--think-guard 32,20,8192|off] \
                  [m1 flags: --wctx --pool --sessions --gpu-gib --device]";
     let ckpt = args.first().context(usage)?.clone();
     let (mut model_dir, mut host, mut port, mut name) = (ckpt.clone(), "0.0.0.0".to_string(), 30000u16, None);
     let (mut mode, mut max_batch, mut max_convs, mut drafter) = ("server".to_string(), 8usize, 64usize, None);
     let mut fork = true;
+    // 1.1.1: new tokens of a request without max_tokens (0 = up to the context); thinking repetition guard
+    let mut max_tokens_default = 32768usize;
+    let mut think_guard = Some((32usize, 20u32, 8192usize));
     let mut rest = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -737,6 +819,20 @@ pub fn run(args: &[String]) -> Result<()> {
             "--max-convs" => max_convs = v.parse()?,
             "--spec-drafter" => drafter = Some(v),
             "--no-fork" => fork = v == "0",
+            "--max-tokens-default" => max_tokens_default = v.parse()?,
+            "--think-guard" => {
+                // N,K[,W]: an N-gram K times within the last W thinking tokens closes the block; 0 / off: no guard
+                think_guard = if v == "0" || v == "off" {
+                    None
+                } else {
+                    let f: Vec<usize> = v.split(',').map(|x| x.trim().parse()).collect::<Result<_, _>>()
+                        .with_context(|| format!("--think-guard {v}: N,K[,W] or off"))?;
+                    if f.len() < 2 || f.len() > 3 || f[0] < 1 || f[1] < 2 {
+                        bail!("--think-guard {v}: N,K[,W] (N >= 1, K >= 2) or off");
+                    }
+                    Some((f[0], f[1] as u32, f.get(2).copied().unwrap_or(8192).max(f[0])))
+                };
+            }
             _ => {
                 rest.push(args[i].clone());
                 rest.push(v);
@@ -783,7 +879,6 @@ pub fn run(args: &[String]) -> Result<()> {
     if copy && drafter.is_none() && mode != "personal" {
         bail!("--spec-copy 1 without a drafter: personal mode only");
     }
-    let wctx = o.wctx;
     let think = {  // reasoning-budget markers, as the image (VOLUNDR_THINK_START_ID / _END_ID override)
         let tok = agens_server::tokenizer::Tokenizer::from_model_dir(&model_dir)?;
         let id = |env: &str, s: &str, dflt: u32| {
@@ -801,8 +896,9 @@ pub fn run(args: &[String]) -> Result<()> {
             let buf = agens_cuda::host_alloc(agens_cuda::m1::park_bytes())?; // the anchor's state, never read back
             agens_cuda::m1::session_park(anchor, buf)?;
             crate::tp::start()?; // tensor parallel: followers execute the leader's calls from here (no HTTP)
+            let wctx = crate::m1::WCTX.load(Ordering::Relaxed); // --wctx, or the clamped context (1.1.1)
             Ok(Engine { think, max_batch, max_convs, wctx: wctx - CHUNK, anchor, convs: HashMap::new(), stats: (0, 0, 0.0),
-                        spec: drafter.is_some() || copy, copy: copy && drafter.is_none(), fork, bstats: (0, 0, 0.0, 0), pstats: (0, 0.0, None) })
+                        spec: drafter.is_some() || copy, copy: copy && drafter.is_none(), fork, bstats: (0, 0, 0.0, 0), pstats: (0, 0.0, None), think_guard })
         })();
         match r {
             Ok(mut e) => {
@@ -818,9 +914,11 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     })?;
     rrx.recv().context("engine thread died during load")??;
+    let wctx = crate::m1::WCTX.load(Ordering::Relaxed);
     let backend: Arc<dyn Backend> =
         Arc::new(EngineBackend { tx: Mutex::new(jtx), ctx: wctx - CHUNK, next_id: AtomicU64::new(1) });
-    let state = agens_server::server::AppState::from_model_dir(&model_dir, backend, name)?;
+    let mut state = agens_server::server::AppState::from_model_dir(&model_dir, backend, name)?;
+    state.max_tokens_default = max_tokens_default;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
         let addr = format!("{host}:{port}");

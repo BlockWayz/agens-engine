@@ -44,7 +44,7 @@ The same flags work on the image directly:
 ```bash
 docker run --gpus device=0 --ipc=host -p 30000:30000 \
   -v /path/to/model:/model:ro -v /path/to/drafter:/drafter:ro \
-  ghcr.io/blockwayz/agens-engine:1.1.0 --profile 16gb --model /model --drafter /drafter
+  ghcr.io/blockwayz/agens-engine:1.1.1 --profile 16gb --model /model --drafter /drafter
 ```
 
 ## Profiles
@@ -60,6 +60,19 @@ variables override the profile's tuning defaults.
 
 In 1.0.0 the `24gb` profile did not start with the 4-bit weights and the drafter. 1.1.0 fixes this (see the
 changelog).
+
+### Request limits
+
+- A request that sets no `max_tokens` generates at most 32,768 tokens (1.1.1; before, up to the context).
+  `-- --max-tokens-default N` changes it (`0`: up to the context). An explicit `max_tokens` is honoured up to the
+  context.
+- A request whose client disconnects (streaming or not) stops at the next decode step, so the next request starts at
+  once.
+- Thinking repetition guard (1.1.1, on by default): inside the thinking block, a 32-token sequence repeated 20 times
+  within the last 8,192 tokens closes the block and the model answers, as a reasoning budget would. It is a mitigation
+  for the long-context reasoning loops seen with the 16 GB build, not a fix. `-- --think-guard N,K[,W]` sets the
+  n-gram length, repeat count and window; `-- --think-guard off` turns it off. Each time it fires the server logs
+  `think guard`.
 
 ## Image input
 
@@ -152,6 +165,12 @@ Quality of the 16 GB build against the other v1 builds:
 
 GPQA Diamond: best of 4 runs, 6K-token thinking budget with forced close, temperature 0.6. HumanEval: pass@1,
 greedy, 1 run.
+
+**Known limitation (16 GB build):** with thinking on and a long document in the prompt (32K+ tokens), this build can
+fall into repetition loops or give wrong answers. In our test (a 110K-token document, high thinking effort), 4 of 13
+runs never finished thinking; the v1 4-bit build on the same engine finished 10 of 10 with no loops. For long
+documents, turn thinking off or use the 4-bit build (`24gb` profile). The thinking repetition guard added in 1.1.1
+limits the damage but does not fix this.
 
 **24 GB profile vs SGLang** (`--profile 24gb`, v1 4-bit weights). Both run on the same 48 GB GPU with the same
 4-bit weights, the same v1 drafter, the same prompts and token limits and a single stream; one run per side. The

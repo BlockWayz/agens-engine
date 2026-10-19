@@ -365,6 +365,13 @@ pub mod m1 {
         fn ak_m1_session_unpark(id: c_int, src: *const c_void) -> c_int;
         fn ak_m1_session_parked(id: c_int) -> c_int;
         fn ak_m1_free_slots() -> c_int;
+        fn ak_m1_recover() -> c_int;
+    }
+    /// After a failed engine call (e.g. out of device memory under the --budget-gib cap): end an open stream capture,
+    /// free every cached CUDA graph, clear the error state. Ok: the context is usable and the engine can go on; Err: a
+    /// sticky CUDA error (the process must exit). One device, no tensor parallelism.
+    pub fn recover() -> Result<()> {
+        check(unsafe { ak_m1_recover() }, "m1_recover")
     }
     /// One batched decode step: row r feeds `tokens[r]` to session `sessions[r]` (distinct, not parked); returns the
     /// greedy token of each row. Rows are bit-identical to bs = 1 decodes of the same sessions.

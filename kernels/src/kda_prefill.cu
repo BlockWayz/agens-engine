@@ -280,6 +280,19 @@ extern "C" int ak_kda_prefill(const void* mixed_qkv, const void* a, const void* 
   auto* chunk_indices = (int32_t*)alloc((size_t)nt * 2 * 4);
   auto* chunk_offsets = (long long*)alloc(2 * 8);
   auto* qsl = (int32_t*)alloc(2 * 4);
+  void* const tmps[] = {cq, ck, cv, q48, k48, qn, kn, beta, gcs, Aqk, Akkd, Akk, w, u, kg, h, vnew, chunk_indices,
+                        chunk_offsets, qsl};
+  {  // 1.1.1: out of memory (under a --budget-gib cap): fail before any launch, which on a null temporary would be an
+     // illegal address (sticky: the process could not go on)
+    bool oom = false;
+    for (void* p : tmps) oom |= p == nullptr;
+    if (oom) {
+      for (void* p : tmps)
+        if (p) cudaFreeAsync(p, cs);
+      cudaGetLastError();
+      return (int)cudaErrorMemoryAllocation;
+    }
+  }
   fill_indices<<<(nt + 127) / 128, 128, 0, cs>>>(chunk_indices, chunk_offsets, qsl, nt, T);
   if (fused) {  // torch.zeros for Aqk when fuse_diagonal
     cudaMemsetAsync(Aqk, 0, (size_t)T * HV * BT * 2, cs);
@@ -346,10 +359,7 @@ extern "C" int ak_kda_prefill(const void* mixed_qkv, const void* a, const void* 
   L({{"q", P(qn)}, {"v", P(vnew)}, {"g", P(gcs)}, {"h", P(h)}, {"o", P(o)}, {"A", P(Aqk)}, {"cu_seqlens", P(qsl)},
      {"chunk_indices", P(chunk_indices)}, {"scale", Fl(scale)}, {"T", I(T)}},
     lo ? lo->rep_grid[0] : 1, nt, HV);
-  for (void* p : {(void*)cq, (void*)ck, (void*)cv, (void*)q48, (void*)k48, (void*)qn, (void*)kn, (void*)beta, (void*)gcs,
-                  (void*)Aqk, (void*)Akkd, (void*)Akk, (void*)w, (void*)u, (void*)kg, (void*)h, (void*)vnew,
-                  (void*)chunk_indices, (void*)chunk_offsets, (void*)qsl})
-    cudaFreeAsync(p, cs);
+  for (void* p : tmps) cudaFreeAsync(p, cs);
   if (e) return e;
   return (int)cudaGetLastError();
 }

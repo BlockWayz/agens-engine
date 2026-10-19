@@ -407,10 +407,15 @@ int far_extend(const Ctx& c, void* qi, void* qh, void* o_loc, float* lse, void* 
   if ((size_t)n > d.erows) {  // grow (cudaFree synchronizes the device)
     cudaFree(d.ke), cudaFree(d.ve);
     d.dev_bytes -= d.erows * BF_ROW * 2;
-    d.erows = std::max<size_t>(n, means() ? (size_t)c.wctx / C + 1 : (size_t)c.wctx);  // means: one row per block
-    d.ke = d.ve = nullptr;
-    if (!(d.ke = dzero<__nv_bfloat16>(d.erows * KVH * HD, d)) || !(d.ve = dzero<__nv_bfloat16>(d.erows * KVH * HD, d)))
+    const size_t want = std::max<size_t>(n, means() ? (size_t)c.wctx / C + 1 : (size_t)c.wctx);  // means: one row per block
+    d.ke = d.ve = nullptr, d.erows = 0;  // (1.1.1: the size only once both are allocated; a failure stays retryable)
+    if (!(d.ke = dzero<__nv_bfloat16>(want * KVH * HD, d)) || !(d.ve = dzero<__nv_bfloat16>(want * KVH * HD, d))) {
+      if (d.ke) cudaFree(d.ke), d.dev_bytes -= want * BF_ROW;
+      d.ke = nullptr;
+      cudaGetLastError();
       return (int)cudaErrorMemoryAllocation;
+    }
+    d.erows = want;
   }
   if (n > 0 && means()) {  // block means of blocks 0 .. nb-1 (pool row of each block's last token)
     CK(ak_kv_pick_rows(c.r2t, C - 1, C, n, 2, d.tmp, c.s));
