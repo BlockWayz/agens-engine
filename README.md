@@ -209,6 +209,10 @@ scripts/agens-run.sh --profile 48gb --tp 2 --gpu 0,1 --model /path/to/model --dr
   | 2 x 48 GB | v1 4-bit | 262K, with KV for 821K tokens across conversations |
   | 2 x 48 GB | bf16 | 262K (351K tokens of KV); bf16 does not fit one 48 GB GPU |
 
+  The 16 GB and 24 GB rows are the KV pools the engine planned when loaded on two 48 GB GPUs under 16 GiB and
+  23 GiB per-GPU caps; they have not yet been run on physical 16 GB or 24 GB cards, or end to end at full context.
+  The 48 GB rows were run on two 48 GB GPUs.
+
 - Everything else works as on one GPU: speculative decoding with the drafter (greedy and sampled), image input (the
   vision encoder runs on the first GPU), server mode, conversation reuse and parking, the INT8 dense-layer KV cache.
   `--mtp` does not combine with `--tp` in 1.2.

@@ -27,7 +27,8 @@
 - Under `--tp` the KV cache stays on the GPUs (each GPU holds its share of the attention heads), so a pair of GPUs
   holds more context than one: two 16 GB GPUs run the 4-bit release weights with the drafter and a ~100K-token
   context; two 24 GB GPUs the full 262K context without host tiering; two 48 GB GPUs the bf16 weights with a 262K
-  context, which do not fit one 48 GB GPU at all.
+  context, which do not fit one 48 GB GPU at all. The 16 GB and 24 GB figures are planned under per-GPU caps on
+  48 GB GPUs, not yet run on physical 16/24 GB cards.
 - Prebuilt tensor-parallel prefill kernels for compute capability 8.6, 8.9, 9.0 and 12.0 (8.9 and 9.0 validated).
 
 ### Limits
