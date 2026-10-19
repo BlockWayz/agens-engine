@@ -24,6 +24,12 @@ fn runtime_reserve() -> usize {
     std::env::var("AGENS_M1_RUNTIME_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(850usize) << 20
 }
 
+/// Transient prefill memory (KDA chunk temporaries, stream-ordered; ATen far-branch temporaries, torch's cache): free
+/// between prefill chunks, so an image encode reuses it (m1.rs: the vision workspace reserve is net of it).
+pub fn prefill_temp_bytes() -> usize {
+    (1usize << 30) * chunk() / 4096
+}
+
 fn env_on(n: &str) -> bool {
     std::env::var(n).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
 }
@@ -41,7 +47,7 @@ pub fn scratch_bytes(w4_max_nk: usize, wctx: usize, tier: bool) -> (usize, Vec<(
         (format!("activations (prefill chunk {t})"), acts),
         ("W4 dequant scratch (prefill, tiled)".to_string(), w4_scratch(w4_max_nk)),
         ("flashinfer + cuBLAS workspaces".to_string(), 2 * (136 << 20) + (32 << 20)),
-        ("prefill temporaries (KDA chunk, ATen far branch)".to_string(), (1usize << 30) * t / 4096),
+        ("prefill temporaries (KDA chunk, ATen far branch)".to_string(), prefill_temp_bytes()),
         // m1_kv far_extend: K + V bf16 rows of one layer for every far position (block means: one row per block)
         ("far-extend staging (pool-length rows, tiered)".to_string(),
          if !tier { 0 } else if std::env::var("AGENS_KV_TIER").map(|v| v == "2").unwrap_or(false) { (wctx / 4 + 1) * 4096 }

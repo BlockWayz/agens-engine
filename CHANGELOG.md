@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.0
+
+### New
+
+- **MTP drafting under `--tp`.** `--mtp` now combines with `--tp 2` and `--tp 4`: every GPU runs the same MTP chain in
+  its verify step, and greedy replies stay identical to plain greedy decoding (13 test prompts, single and batched),
+  server mode gives the same replies with and without drafting, and sampled replies keep their distribution. The image
+  entry point no longer drops `--mtp` under `--tp`; the profile asks for its full context and the engine clamps it to
+  the per-GPU KV pool (logged).
+- **MTP drafting with image input on, in every profile.** In 1.2 the `16gb` profile ignored `--mtp` with `--images on`.
+  The vision encoder's working memory now shares the prefill's temporary memory (an image is encoded between prefill
+  steps), so it no longer comes on top of it. On a 48 GB GPU held to 16 GiB, `16gb` with `--images on --mtp` serves a
+  217,092-token context (225,284 with images and no MTP); a 219K-token document, a follow-up turn and two images peaked
+  at 16.75 GB of device memory, inside the cap. The `24gb` profile with images on and `--mtp` now runs the full 262K
+  context (1.2: about 221K). Image prompts: greedy output with MTP is identical to plain greedy decoding (26 test
+  prompts), and sampled output keeps its distribution.
+- **KV cache on the GPU when it fits.** With `--budget-gib`, 1.2 always tiered the KV cache to host memory on one GPU,
+  even with budgets far above the model's needs. The memory plan now keeps all KV on the GPU when the budget holds one
+  full context that way, and tiers it otherwise; the log says which. The shipped `16gb`, `24gb` and `48gb` profiles
+  still tier. `AGENS_KV_AUTO=0` restores the 1.2 behaviour.
+- **Compute capability 8.6 validated.** The prebuilt 8.6 kernels (shipped since 1.1) are now validated on hardware, by a
+  community result on a 24 GB GPU (#1; see the README, Community results).
+
 ## 1.2.0
 
 1.2.0 includes every 1.1.1 fix and limit below.

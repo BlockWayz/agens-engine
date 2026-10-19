@@ -259,6 +259,17 @@ void finish() {
   static const bool keep = getenv("AGENS_VISION_KEEP_CACHE") && getenv("AGENS_VISION_KEEP_CACHE")[0] == '1';
   if (!keep) c10::cuda::CUDACachingAllocator::emptyCache();
 }
+// Before an encode (1.3): hand the prefill's transient memory back first -- torch's cache of the ATen far-branch
+// temporaries and the stream-ordered pool of the KDA prefill temporaries -- so the encode workspace reuses it (the
+// memory plan reserves the workspace minus those temporaries: an encode never runs during a prefill chunk).
+void release_transients() {
+  static const bool keep = getenv("AGENS_VISION_KEEP_CACHE") && getenv("AGENS_VISION_KEEP_CACHE")[0] == '1';
+  if (keep) return;
+  cudaDeviceSynchronize();
+  c10::cuda::CUDACachingAllocator::emptyCache();
+  cudaMemPool_t mp = nullptr;
+  if (cudaDeviceGetDefaultMemPool(&mp, cur_device()) == cudaSuccess && mp) cudaMemPoolTrimTo(mp, 0);
+}
 }  // namespace
 
 extern "C" {
@@ -300,6 +311,7 @@ int ak_vis_encode(const uint8_t* rgb, const uint8_t* jpeg, long long jlen, int h
   try {
     if (rh % (PATCH * MERGE) || rw % (PATCH * MERGE) || rh <= 0 || rw <= 0) return 2;
     c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(static_cast<cudaStream_t>(stream), cur_device()));
+    release_transients();
     at::Tensor e;
     {
       e = tower(preprocess(rgb, h, w, rh, rw, /*bf16=*/true, jpeg, (size_t)jlen), rh / PATCH, rw / PATCH);
@@ -319,6 +331,7 @@ int ak_vis_encode_pixels(const float* pv, int gh, int gw, void* out, void* strea
   try {
     if (gh % MERGE || gw % MERGE) return 2;
     c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(static_cast<cudaStream_t>(stream), cur_device()));
+    release_transients();
     at::Tensor e;
     {
       auto t = at::from_blob(const_cast<float*>(pv), {(int64_t)gh * gw, PDIM}, at::TensorOptions().dtype(at::kFloat))

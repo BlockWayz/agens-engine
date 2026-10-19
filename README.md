@@ -39,7 +39,7 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md).
 # 16 GB GPU: 262K context, one conversation, speculative decoding
 scripts/agens-run.sh --profile 16gb --model /path/to/model --drafter /path/to/drafter
 
-# the same with the MTP head as a second draft source (context up to 241K)
+# the same with the MTP head as a second draft source (context ~237K)
 scripts/agens-run.sh --profile 16gb --model /path/to/model --drafter /path/to/drafter --mtp /path/to/mtp
 
 # then, from another shell
@@ -52,26 +52,26 @@ The same flags work on the image directly:
 ```bash
 docker run --gpus device=0 --ipc=host -p 30000:30000 \
   -v /path/to/model:/model:ro -v /path/to/drafter:/drafter:ro \
-  ghcr.io/blockwayz/agens-engine:1.2.0 --profile 16gb --model /model --drafter /drafter
+  ghcr.io/blockwayz/agens-engine:1.3.0 --profile 16gb --model /model --drafter /drafter
 ```
 
 ## Profiles
 
 | Profile | Budget | Context (up to) | Mode | Drafter | Image input | With `--mtp` |
 |---|---|---|---|---|---|---|
-| `16gb` | 16 GiB | 262K (225K with images on) | one conversation | yes | off (`--images on`) | up to 241K; ignored with images on |
-| `24gb` | 23 GiB | 262K | server, up to 4 concurrent requests | yes | on | up to 221K with images on, 262K with images off |
+| `16gb` | 16 GiB | 262K (225K with images on) | one conversation | yes | off (`--images on`) | up to 241K; 221K with images on |
+| `24gb` | 23 GiB | 262K | server, up to 4 concurrent requests | yes | on | 262K |
 | `48gb` | 46 GiB | 262K | server, up to 16 concurrent requests | yes | on | unchanged |
 
 The context column is the most a profile asks for. At startup the engine plans the KV pool that fits the budget on
 your GPU; if the pool holds fewer tokens than that, the engine clamps the context to what the pool holds and logs
 `--wctx N clamped to M`. The pool depends on the GPU: the driver's own memory per GPU differs between cards. The
 numbers in this README were measured on a 48 GB GPU of compute capability 8.9 held to the profile's budget; there the
-`16gb` profile serves a 258,052-token context per conversation (237,572 with `--mtp`), and the `24gb` profile 217,092
-with images on and `--mtp`.
+`16gb` profile serves a 258,052-token context per conversation (237,572 with `--mtp`; 217,092 with `--mtp` and images
+on), and the `24gb` profile 258,052 with images on and `--mtp`.
 
-`--tp 2|4` runs any profile across 2 or 4 GPUs, with the budget per GPU (see Multi-GPU below). `--mtp` is not
-supported with `--tp` in 1.2: the entry point drops it and says so.
+`--tp 2|4` runs any profile across 2 or 4 GPUs, with the budget per GPU (see Multi-GPU below), with or without
+`--mtp`. Under `--tp` the profile asks for its full context and the engine clamps it to the per-GPU KV pool.
 
 Extra `agens serve` flags go after `--`, for example `-- --served-model-name agens`. The `AGENS_*` environment
 variables override the profile's tuning defaults.
@@ -105,8 +105,10 @@ curl http://localhost:30000/v1/chat/completions -H 'Content-Type: application/js
 
 - Image input is on by default in the `24gb` and `48gb` profiles and off in `16gb`. Turn it on or off with
   `--images on|off` (`scripts/agens-run.sh` and the image entry point).
-- With `--images on` the `16gb` profile's context drops to about 225K tokens (from 262K). The vision encoder's working
-  memory comes out of the KV cache budget.
+- With `--images on` the `16gb` profile's context drops to about 225K tokens (from 262K), and to about 217K with `--mtp`
+  as well. The vision encoder's working memory comes out of the KV cache budget, net of the prefill's temporary memory
+  (an image is encoded between prefill steps, so the two share it). MTP drafting stays on with images in every profile
+  (from 1.3).
 - A message can carry several images, and images can appear in several turns of a conversation. Speculative decoding
   and conversation prefix reuse work on image prompts.
 - An image costs one token per 32 x 32 pixels. Images over 4.19 megapixels (`AGENS_IMAGE_MAX_PIXELS`) are scaled down
@@ -216,7 +218,7 @@ scripts/agens-run.sh --profile 48gb --tp 2 --gpu 0,1 --model /path/to/model --dr
 
 - Everything else works as on one GPU: speculative decoding with the drafter (greedy and sampled), image input (the
   vision encoder runs on the first GPU), server mode, conversation reuse and parking, the INT8 dense-layer KV cache.
-  `--mtp` does not combine with `--tp` in 1.2.
+  `--mtp` works under `--tp` from 1.3 (every GPU runs the same MTP drafts).
 - GPUs with peer access (NVLink-class links, PCIe peer-to-peer) exchange partial sums directly. GPUs without
   peer-to-peer exchange through host shared memory; this needs `--ipc=host` and costs speed (see below).
 
@@ -295,11 +297,42 @@ Quality of the 16 GB build against the other v1 builds:
 GPQA Diamond: best of 4 runs, 6K-token thinking budget with forced close, temperature 0.6. HumanEval: pass@1,
 greedy, 1 run.
 
+More evaluations of the 16 GB build, on Agens Engine 1.1.0, one request at a time; the bf16 v1 model card's values in
+brackets:
+
+| Benchmark (generation limit) | Engine 16 GB [bf16 v1] |
+|---|---|
+| AIME 2025, avg@4 (24,576 tokens) | best run 80.0, mean of the runs 76.7 [best of 2 runs 80.0, mean 79.2] |
+| MATH-500 (16,384 tokens) | 96.4 [96.8] |
+| IFEval, prompt-level strict (8,192 tokens) | 86.5 [87.2] |
+| BFCL v4, parallel | 94.0 [94.0] |
+| BFCL v4, irrelevance | 81.7, provisional [82.1] |
+
+One run each, except AIME 2025 (several runs; best and mean shown). BFCL v4 irrelevance is provisional: the client
+capped generation at 32,768 tokens, and 8 of 240 cases hit the cap.
+
 **Known limitation (16 GB build):** with thinking on and a long document in the prompt (32K+ tokens), this build can
 fall into repetition loops or give wrong answers. In our test (a 110K-token document, high thinking effort), 4 of 13
 runs never finished thinking; the v1 4-bit build on the same engine finished 10 of 10 with no loops. For long
 documents, turn thinking off or use the 4-bit build (`24gb` profile). The thinking repetition guard added in 1.1.1
 limits the damage but does not fix this.
+
+**16 GB profile with `--mtp`** (the model's MTP head as a second draft source with the drafter; same build, budget and
+GPU as above, images off). Decode tok/s (accepted tokens per verify step), one run per cell:
+
+| Prompt class | short, greedy | short, T 0.6 | after 219K, greedy | after 219K, T 0.6 |
+|---|---|---|---|---|
+| chat | 108.0 (2.67) | 93.2 (2.72) | 71.2 (2.46) | 64.4 (2.51) |
+| code | 140.7 (3.47) | 122.4 (3.57) | 103.1 (3.60) | 93.1 (3.66) |
+| reasoning | 122.2 (3.04) | 97.3 (2.85) | 88.4 (3.07) | 81.8 (3.21) |
+| tool calls | 124.1 (3.06) | 135.7 (3.94) | 75.1 (2.56) | 64.5 (2.51) |
+| agent session (8K context) | 155.2 (4.24) | 131.6 (4.18) | 89.2 (3.12) | 94.8 (3.73) |
+
+The same runs without `--mtp`, and the 24 GB profile, are in [MTP drafting](#mtp-drafting). Sampled cells and the
+classes with 2 to 4 prompts carry run-to-run noise. With `--mtp` the `16gb` profile serves 237,572 tokens of context
+(217,092 with `--mtp` and images on). Peaks under the 16 GiB cap: the 219K-token document plus 12 follow-up turns with
+`--mtp`, 16.76 GB (0.42 GB left); the 219K-token document, a follow-up turn and two images with `--mtp` and images on,
+16.75 GB (0.43 GB left).
 
 **24 GB profile vs SGLang** (`--profile 24gb`, v1 4-bit weights). Both run on the same 48 GB GPU with the same
 4-bit weights, the same v1 drafter, the same prompts and token limits and a single stream; one run per side. The
@@ -335,6 +368,20 @@ without the drafter (13 test prompts, 1 to 16 concurrent requests). Above 4
 concurrent requests the `48gb` profile gains little: batched verify over the KV cache tiered to host memory is the
 limit (see the roadmap).
 
+**All KV on the GPU for many short requests (`48gb`).** The `48gb` profile tiers the KV cache to host memory, like the
+smaller profiles. Setting `AGENS_KV_TIER=0` and `AGENS_KV_IDX_HOST=0` keeps all of it on the GPU instead (on the image:
+`docker run -e AGENS_KV_TIER=0 -e AGENS_KV_IDX_HOST=0 ... --profile 48gb ...`). Measured on the same 48 GB GPU (compute
+capability 8.9), 4-bit weights, drafter, greedy:
+
+| | tiered (default) | all KV on the GPU |
+|---|---|---|
+| server mode, 19 short prompts, aggregate tok/s at 1 / 4 / 8 / 16 concurrent requests | 95.4 / 156.7 / 166.3 / 167.7 | 99.6 / 222.2 / 277.7 / 303.9 |
+| context per conversation | 258,052 | 253,956 (the pool holds fewer rows; the engine clamps and logs it) |
+| prefill of a 219K-token prompt | 148 s | 354 s |
+| follow-up turns after it, tok/s (chat / code / reasoning / tool calls / agent) | 63.9 / 91.7 / 91.6 / 73.1 / 85.5 | 61.1 / 94.1 / 98.5 / 78.0 / 91.5 |
+
+Use it for many concurrent short conversations; keep the default for long documents.
+
 ## Community results
 
 Measured by users on their own hardware and reported in this repository. Thank you.
@@ -358,7 +405,7 @@ If you run the engine on another GPU, please open an issue with your numbers.
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for what comes next: 12 GB GPU support (in development, not yet released), MTP drafting
-under `--tp` and on 12 GB, and more measured GPUs.
+on 12 GB, and more measured GPUs.
 
 ## Building from source
 

@@ -145,11 +145,8 @@ pub(crate) fn parse_opts(args: &[String], usage: &str) -> Result<Opts> {
         }
         i += 2;
     }
-    if o.tp > 1 && o.mtp.is_some() {
-        // 1.2: the MTP chain under tensor parallel (each rank's drafts in the verify graphs, batched speculation) is
-        // not gated yet; DFlash2 and copy-from-context drafting work under --tp
-        bail!("--mtp is not supported with --tp {} in 1.2 (use --tp 1 for MTP drafting, or drop --mtp)", o.tp);
-    }
+    // 1.3: --mtp works under --tp (every rank computes the same drafts in its verify graphs: replicated head, output
+    // layer and all-reduced hidden state; gated at --tp 2 and 4 with --mtp)
     Ok(o)
 }
 
@@ -453,6 +450,8 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     if std::env::var("AGENS_FAR_ATTEND").is_err() {
         std::env::set_var("AGENS_FAR_ATTEND", "fused");
     }
+    let kv_auto = o.budget_gib > 0.0 && tp == 1 && std::env::var("AGENS_KV_TIER").is_err()
+        && std::env::var("AGENS_KV_IDX_HOST").is_err() && std::env::var("AGENS_KV_AUTO").map(|v| v != "0").unwrap_or(true);
     if o.budget_gib > 0.0 {
         // budget mode: torch's allocator (ATen far branch) in expandable segments, the far extend in 1.25e7-element steps
         // of >= 8 query rows (A1d: 5e7 -> torch cache 0.28 GB after a 33K prefill instead of 2.9 GB; A1e: 1.25e7 / 8 rows
@@ -463,13 +462,15 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         // + the consumer-GPU product config (release defaults; each passed the relaxed-numerics gates: spec == non-spec,
         // tiered == all-GPU, INT8 head / W3 drafter within the quality rule): KV tiered to host RAM with block means
         // and the indexer keys on the host, INT8 lm_head, prefill chunk 1024, the drafter at W3 g128.
+        // 1.3: KV_TIER / KV_IDX_HOST are decided by the memory plan below (kv_auto): tiered only when the all-GPU plan
+        // cannot hold one full --wctx context (1.2 tiered every budget; AGENS_KV_AUTO=0 restores that)
         for (k, v) in [("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"), ("AGENS_FAR_EXTEND_ELEMS", "1.25e7"),
                        ("AGENS_FAR_EXTEND_MIN_ROWS", "8"), ("AGENS_FAR_EXTEND_ENGINE", "1"), ("AGENS_KV_TIER", "2"),
                        ("AGENS_KV_IDX_HOST", "1"), ("AGENS_M1_LMHEAD_INT8", "1"), ("AGENS_M1_PREFILL_CHUNK", "1024"),
                        ("AGENS_DRAFT_W4", "1"), ("AGENS_DRAFT_BITS", "3")] {
             // tensor parallel: KV stays on the GPUs (m1_kv's tiered / INT8 BCSA pools are tp1 only); each rank holds
             // 1 / tp of the K/V heads, so the pool fits where tp1 needs tiering
-            if tp > 1 && (k == "AGENS_KV_TIER" || k == "AGENS_KV_IDX_HOST") {
+            if (tp > 1 || kv_auto) && (k == "AGENS_KV_TIER" || k == "AGENS_KV_IDX_HOST") {
                 continue;
             }
             if std::env::var(k).is_err() {
@@ -754,13 +755,16 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     };
     let cap_rows = crate::plan::chunk();
     let n_kda = ck.config.layers.iter().filter(|l| l.mixer == agens_core::Mixer::Kda).count();
-    let mut reserve = if draft.is_some() || mtp.is_some() || o.copy {
+    // the speculative reserve (its far-branch union cache depends on the KV mode: rebuilt if kv_auto turns tiering on)
+    let spec_res = || if draft.is_some() || mtp.is_some() || o.copy {
         crate::spec::spec_reserve(cap_rows, n_kda, draft.as_ref().map(|d| d.w4).unwrap_or(false), wctx,
                                   ck.config.layers.iter().filter(|l| l.mixer == agens_core::Mixer::Bcsa).count(),
                                   draft.is_some())
     } else {
         Vec::new()
     };
+    let mut reserve = spec_res();
+    let n_spec_res = reserve.len();
     if mtp.is_some() {
         reserve.push(crate::spec::mtp_reserve(cap_rows, o.sessions));
     }
@@ -772,7 +776,14 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         bail!("--vision 1: {}", if !has_tower { "the checkpoint has no vision tower" } else { "one GPU per process (no --devices)" });
     }
     if vision {
-        reserve.push(("vision tower workspace (one image encode, streamed weights)".to_string(), vision_ws_bytes()));
+        // 1.3: an encode runs between prefill chunks, after the prefill's transient memory is handed back
+        // (vision.cpp release_transients), so only the part of the workspace beyond those temporaries is reserved.
+        // AGENS_VISION_WS_SHARE=0: the 1.2 plan (the whole workspace on top).
+        let share = std::env::var("AGENS_VISION_WS_SHARE").map(|v| v != "0").unwrap_or(true);
+        let ws = vision_ws_bytes();
+        let own = if share { ws.saturating_sub(crate::plan::prefill_temp_bytes()) } else { ws };
+        reserve.push((format!("vision tower workspace (one image encode, streamed weights; {:.2} GB, {:.2} GB shared with \
+                               the prefill temporaries)", ws as f64 / 1e9, (ws - own) as f64 / 1e9), own));
     }
     let t_weights = t0.elapsed().as_secs_f64();
     let mut pool = o.pool;
@@ -780,7 +791,20 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         agens_cuda::synchronize()?;
         let (free, total) = agens_cuda::mem_info()?;
         let budget = ((o.budget_gib * (1u64 << 30) as f64) as usize).min(total);
-        let p = crate::plan::plan(&ck.config, budget, total - free - ballast, o.sessions, wctx, w4_max_nk, &reserve, tp);
+        let mut p = crate::plan::plan(&ck.config, budget, total - free - ballast, o.sessions, wctx, w4_max_nk, &reserve, tp);
+        if kv_auto {
+            if p.pool_rows >= wctx {
+                eprintln!("m1: KV cache all on the GPU: the all-GPU plan holds {} rows >= --wctx {wctx} (AGENS_KV_AUTO=0: tiered, \
+                           as 1.2)", p.pool_rows);
+            } else {
+                let rows0 = p.pool_rows;
+                std::env::set_var("AGENS_KV_TIER", "2");
+                std::env::set_var("AGENS_KV_IDX_HOST", "1");
+                reserve.splice(0..n_spec_res, spec_res());
+                p = crate::plan::plan(&ck.config, budget, total - free - ballast, o.sessions, wctx, w4_max_nk, &reserve, tp);
+                eprintln!("m1: KV cache tiered to host RAM: the all-GPU plan holds {rows0} rows < --wctx {wctx}");
+            }
+        }
         for l in &p.lines {
             eprintln!("{l}");
         }
@@ -790,7 +814,11 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         // at most one full-length context of rows by default (the sessions share the pool): with tiered KV every pool
         // row also pins ~87-91 KB of host RAM (24 GB at 262K), so a budget-sized pool on a big card would pin far more
         // host memory than a full context needs. AGENS_M1_POOL_MAX_ROWS overrides (server mode with many long chats).
-        let cap: usize = std::env::var("AGENS_M1_POOL_MAX_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(wctx);
+        // 1.3: when the plan put all KV on the GPU (kv_auto, tp1: no host pinning), the planned pool is used whole, so more
+        // conversations stay resident; tiered and --tp keep the 1.2 cap (--tp: not re-gated with larger pools yet)
+        let tiered = std::env::var("AGENS_KV_TIER").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+        let cap: usize = std::env::var("AGENS_M1_POOL_MAX_ROWS").ok().and_then(|v| v.parse().ok())
+            .unwrap_or(if kv_auto && !tiered { usize::MAX } else { wctx });
         pool = p.pool_rows.min(cap.max(4096));
         if pool < p.pool_rows {
             eprintln!("m1: KV pool capped at {pool} rows (plan {}; AGENS_M1_POOL_MAX_ROWS)", p.pool_rows);

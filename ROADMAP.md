@@ -9,7 +9,7 @@ same quality and speed gates as the current release, and its numbers are measure
   which needs no extra memory; a lightweight multi-token-prediction (MTP) head, about one decoder layer that shares the
   model's output layer, will then bring model-based drafting to 12 GB.
 - **MTP drafting everywhere.** 1.2 adds the MTP head to the drafting chain on the 16 GB, 24 GB and 48 GB profiles.
-  Next: MTP under `--tp`, on 12 GB, and a per-step choice between the MTP head and the drafter by which one proposes
+  1.3 adds MTP under `--tp`. Next: MTP on 12 GB, and a per-step choice between the MTP head and the drafter by which one proposes
   the most accepted tokens.
 - **Measured results on more GPUs.** Native runs and tuned kernels on 12 GB and 16 GB cards, including laptop GPUs,
   and validation on compute capability 12.0 and 8.6 (prebuilt today, not yet validated on hardware).
@@ -28,6 +28,9 @@ same quality and speed gates as the current release, and its numbers are measure
   memory budgets.
 
 ## Done
+
+- **1.3.0:** MTP drafting under `--tp` and with image input on in every profile; the KV cache stays on the GPU
+  when the budget holds a full context there; compute capability 8.6 validated. See [CHANGELOG.md](CHANGELOG.md).
 
 - **1.2.0:** MTP drafting (`--mtp`) in one-conversation and server mode; multi-GPU tensor parallel
   (`--tp 2`, `--tp 4`) with every 1.1 feature, benchmarked against SGLang on the same GPUs. See
