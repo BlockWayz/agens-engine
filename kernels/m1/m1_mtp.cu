@@ -390,8 +390,47 @@ __global__ void __launch_bounds__(1024) sl_argmax(const float* __restrict__ logi
     if (lane == 0) am[b] = bi == 0x7FFFFFFF ? 0 : bi;
   }
 }
+// bf16 shortlist head (AGENS_DRAFT_VOCAB): argmax over its bf16 logits (ties: the lower token id)
+__global__ void __launch_bounds__(1024) sl_argmax_bf(const bf16* __restrict__ logit, const int* __restrict__ ids, int n,
+                                                     const float* __restrict__ cl, const int* __restrict__ cid, int i,
+                                                     int vocab_valid, int* am) {
+  const int b = blockIdx.x;
+  float bv = -INFINITY;
+  int bi = 0x7FFFFFFF;
+  auto take = [&](float v, int id) {
+    if (id < vocab_valid && (v > bv || (v == bv && id < bi))) bv = v, bi = id;
+  };
+  for (int o = threadIdx.x; o < n; o += blockDim.x) take(__bfloat162float(logit[(size_t)b * n + o]), ids[o]);
+  if (cid && threadIdx.x < m1draft::kCandK)
+    take(cl[b * m1draft::kCandK + threadIdx.x],
+         cid[((size_t)b * (m1draft::kBlock - 1) + i) * m1draft::kCandK + threadIdx.x]);
+  for (int d = 16; d > 0; d >>= 1) {
+    const float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, d);
+    const int oi = __shfl_xor_sync(0xFFFFFFFFu, bi, d);
+    if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+  }
+  __shared__ float sv[32];
+  __shared__ int si[32];
+  const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  if (lane == 0) sv[w] = bv, si[w] = bi;
+  __syncthreads();
+  if (w == 0) {
+    bv = lane < (int)(blockDim.x >> 5) ? sv[lane] : -INFINITY, bi = lane < (int)(blockDim.x >> 5) ? si[lane] : 0x7FFFFFFF;
+    for (int d = 16; d > 0; d >>= 1) {
+      const float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, d);
+      const int oi = __shfl_xor_sync(0xFFFFFFFFu, bi, d);
+      if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+    }
+    if (lane == 0) am[b] = bi == 0x7FFFFFFF ? 0 : bi;
+  }
+}
 // the chain step's argmax over the shortlist (+ the drafter's candidates of slot i), or over the whole head
 int head_argmax(const m1draft::Target& t, int B, int i, cudaStream_t s) {
+  if (t.nsl > 0) {  // bf16 shortlist head (AGENS_DRAFT_VOCAB; the drafter's candidates come from the same rows)
+    MCK(ak_bf16_linear(M.y, t.sl_head, M.logits, B, t.nsl, HID, s));
+    sl_argmax_bf<<<B, 1024, 0, s>>>(M.logits, t.sl_ids, t.nsl, nullptr, nullptr, i, t.vocab_valid, M.am);
+    return (int)cudaGetLastError();
+  }
   if (M.nsl > 0 && t.lm_head_i8 && !t.lm_head && !t.lm_head_w4) {
     const uint4* w = (const uint4*)t.lm_head_i8;
     const dim3 g((M.nsl + 7) / 8);
@@ -452,6 +491,8 @@ int propose_impl(const m1draft::Target& t, int B, Rec R, int steps) {
   cudaStream_t s = t.s;
   if (steps > kMaxSteps) steps = kMaxSteps;
   const size_t kv = (size_t)KVH * HD;
+  // chain-step fusions (AGENS_MTP_FUSE=0: off), every one with the unfused launches' bits
+  static const bool fuse = !(getenv("AGENS_MTP_FUSE") && getenv("AGENS_MTP_FUSE")[0] == '0');
   for (int i = 0; i < steps; ++i) {
     chain_prep<<<1, 32, 0, s>>>(R, B, i, M.tokb, M.cpos, M.ringb);
     if (i == 0) gather_pend<<<B, 256, 0, s>>>(M.pend, M.ringb, M.y);  // step 0's hidden: the pending rows
@@ -461,26 +502,52 @@ int propose_impl(const m1draft::Target& t, int B, Rec R, int steps) {
     MCK(linear(M.cat, M.fc, M.x, B, HID, 2 * HID, s));
     MCK(ak_rmsnorm(M.x, M.in_ln, M.xn, B, HID, HID, HID, EPS, 1, s));
     bf16 *ck = M.ck + (size_t)i * B * kv, *cv = M.cv + (size_t)i * B * kv;
-    MCK(linear(M.xn, M.q, M.qg, B, 2 * QH * HD, HID, s));
-    MCK(linear(M.xn, M.k, ck, B, KVH * HD, HID, s));
-    MCK(linear(M.xn, M.v, cv, B, KVH * HD, HID, s));
-    MCK(ak_rmsnorm(M.qg, M.qn, M.qb, B * QH, HD, 2 * HD, HD, EPS, 1, s));  // q half of each head's [q | gate]
-    split_gate<<<B * QH, HD, 0, s>>>(M.qg, M.gb);
-    MCK(ak_rmsnorm(ck, M.kn, ck, B * KVH, HD, HD, HD, EPS, 1, s));
-    MCK(ak_rope_neox_fly(M.qb, ck, (const int64_t*)M.cpos, B, QH, KVH, HD, ROT, QH * HD, KVH * HD, THETA, s));
+    // q / k / v: one launch for one sequence when all three are W4 of one class (bit-identical to three GEMVs, as the
+    // target's linear_shared at m = 1)
+    const bool qkv1 = fuse && B == 1 && M.q.q && M.k.q && M.v.q && M.q.q->bits == 4 && M.k.q->bits == 4 && M.v.q->bits == 4 &&
+                      M.q.q->group == M.k.q->group && M.q.q->group == M.v.q->group;
+    if (qkv1) {
+      const void* wt[3] = {M.q.q->wt, M.k.q->wt, M.v.q->wt};
+      const void* st[3] = {M.q.q->st, M.k.q->st, M.v.q->st};
+      void* ys[3] = {M.qg, ck, cv};
+      const int ns[3] = {2 * QH * HD, KVH * HD, KVH * HD};
+      MCK(ak_wq_gemv_kt_multi(4, M.xn, 1, 3, wt, st, ys, ns, nullptr, HID, M.q.q->group, 0, s));
+    } else {
+      MCK(linear(M.xn, M.q, M.qg, B, 2 * QH * HD, HID, s));
+      MCK(linear(M.xn, M.k, ck, B, KVH * HD, HID, s));
+      MCK(linear(M.xn, M.v, cv, B, KVH * HD, HID, s));
+    }
+    if (fuse) {  // q / k norms, gate split, RoPE in one launch (ak_qk_prep: one position row, no cache store)
+      QkPrepArgs qa{};
+      qa.qg = M.qg, qa.q = M.qb, qa.gate = M.gb, qa.k = ck, qa.v = cv, qa.kc = nullptr, qa.vc = nullptr, qa.loc = nullptr;
+      qa.wq = M.qn, qa.wk = M.kn, qa.cache = nullptr, qa.pos = (const int64_t*)M.cpos, qa.pstride = 0;
+      qa.T = B, qa.nq = QH, qa.nk = KVH, qa.sec_h = 0, qa.sec_w = 0, qa.eps = EPS, qa.theta = THETA;
+      MCK(ak_qk_prep(&qa, s));
+    } else {
+      MCK(ak_rmsnorm(M.qg, M.qn, M.qb, B * QH, HD, 2 * HD, HD, EPS, 1, s));  // q half of each head's [q | gate]
+      split_gate<<<B * QH, HD, 0, s>>>(M.qg, M.gb);
+      MCK(ak_rmsnorm(ck, M.kn, ck, B * KVH, HD, HD, HD, EPS, 1, s));
+      MCK(ak_rope_neox_fly(M.qb, ck, (const int64_t*)M.cpos, B, QH, KVH, HD, ROT, QH * HD, KVH * HD, THETA, s));
+    }
     if (i == 0) store_step0<<<B, 256, 0, s>>>(ck, cv, R, M.ringb, M.pend_ok, M.ring_k, M.ring_v);
     mtp_attn<<<dim3(QH, kNch, B), 256, 0, s>>>(M.qb, M.ring_k, M.ring_v, M.ck, M.cv, R, M.ringb, B, i, M.window,
                                               M.apart, M.aml);
     mtp_attn_merge<<<dim3(QH, B), HD, 0, s>>>(M.apart, M.aml, M.ao);
     MCK(ak_bf16_binary(M.ao, M.gb, M.ao, (long)B * QH * HD, 2, s));  // * sigmoid(gate)
     MCK(linear(M.ao, M.o, M.t, B, HID, QH * HD, s));
-    MCK(ak_bf16_binary(M.x, M.t, M.x, (long)B * HID, 0, s));
-    MCK(ak_rmsnorm(M.x, M.post_ln, M.xn, B, HID, HID, HID, EPS, 1, s));
+    if (fuse) MCK(ak_add_rmsnorm(M.x, M.t, M.x, M.post_ln, M.xn, B, HID, EPS, 1, s));  // residual add + norm: same bits
+    else {
+      MCK(ak_bf16_binary(M.x, M.t, M.x, (long)B * HID, 0, s));
+      MCK(ak_rmsnorm(M.x, M.post_ln, M.xn, B, HID, HID, HID, EPS, 1, s));
+    }
     MCK(linear(M.xn, M.gu, M.gu_b, B, 2 * INTER, HID, s));
     MCK(ak_silu_mul(M.gu_b, M.act, B, INTER, s));
     MCK(linear(M.act, M.down, M.t, B, HID, INTER, s));
-    MCK(ak_bf16_binary(M.x, M.t, M.x, (long)B * HID, 0, s));
-    MCK(ak_rmsnorm(M.x, M.norm, M.y, B, HID, HID, HID, EPS, 1, s));
+    if (fuse) MCK(ak_add_rmsnorm(M.x, M.t, M.x, M.norm, M.y, B, HID, EPS, 1, s));
+    else {
+      MCK(ak_bf16_binary(M.x, M.t, M.x, (long)B * HID, 0, s));
+      MCK(ak_rmsnorm(M.x, M.norm, M.y, B, HID, HID, HID, EPS, 1, s));
+    }
     MCK(head_argmax(t, B, i, s));
     write_slot<<<1, 32, 0, s>>>(R, B, i, M.am, M.ringb, M.pend_ok);
   }

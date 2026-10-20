@@ -11,7 +11,7 @@ pub struct Plan {
 }
 
 pub fn chunk() -> usize {  // prefill chunk (kernels/m1/m1_model.cu g_chunk, AGENS_M1_PREFILL_CHUNK)
-    std::env::var("AGENS_M1_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096usize).clamp(64, 4096)
+    std::env::var("AGENS_M1_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096usize).clamp(64, 8192)
 }
 const WIN: usize = 4096;
 
@@ -21,7 +21,14 @@ fn w4_scratch(w4_max_nk: usize) -> usize {  // AGENS_M1_W4_TILE_MB (default 64; 
 }
 
 fn runtime_reserve() -> usize {
-    std::env::var("AGENS_M1_RUNTIME_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(850usize) << 20
+    // 1.3.2: server mode at --max-batch 16 (batched decode / verify graphs of 9..16 rows) grew 1.15 GB past
+    // init on a compute capability 9.0 GPU (INT4 + DFlash2, 1 / 4 / 8 / 16 concurrent short chats, uncapped), not counting torch's cache:
+    // +384 MB over 850 there, scaled over max batches 9..16 (<= 8: 850 MB, the 1.3.1 reserve that the 24gb profile,
+    // --max-batch 4, keeps its full context with). Correctness does not depend on it: the prefill temporaries are
+    // reserved at load, and a graph that finds no room runs its step eagerly.
+    let mb: usize = std::env::var("AGENS_SERVE_MAX_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let extra = 384 * mb.saturating_sub(8).min(8) / 8;
+    std::env::var("AGENS_M1_RUNTIME_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(850 + extra) << 20
 }
 
 /// Transient prefill memory (KDA chunk temporaries, stream-ordered; ATen far-branch temporaries, torch's cache): free
@@ -30,13 +37,38 @@ pub fn prefill_temp_bytes() -> usize {
     (1usize << 30) * chunk() / 4096
 }
 
+/// KDA prefill temporaries of one chunk at this rank's heads (kernels/src/kda_prefill.cu ak_kda_prefill_temp_bytes): in
+/// budget mode an arena reserved at load (m1.rs), so CUDA graphs captured later cannot take their room.
+pub fn kda_temp_bytes(tp: usize) -> usize {
+    let t = chunk();
+    let (h, hv) = (16 / tp.max(1), 48 / tp.max(1));
+    let (tq, tv, tk48, nt) = (t * h * 128, t * hv * 128, t * hv * 128, t.div_ceil(64));
+    [tq * 2, tq * 2, tv * 2, tk48 * 2, tk48 * 2, tk48 * 2, tk48 * 2, t * hv * 4, tk48 * 4, t * hv * 64 * 2, t * hv * 16 * 4,
+     t * hv * 64 * 2, tk48 * 2, tv * 2, tk48 * 2, nt * hv * 128 * 128 * 2, tv * 2, nt * 2 * 4, 16, 8]
+        .iter().map(|x| (x + 255) & !255).sum()
+}
+/// The prefill far branch runs on engine kernels (tiered block-mean KV with AGENS_FAR_EXTEND_ENGINE=1), not the ATen
+/// bridge: no torch temporaries.
+pub fn engine_far() -> bool {
+    std::env::var("AGENS_KV_TIER").map(|v| v == "2").unwrap_or(false)
+        && std::env::var("AGENS_FAR_EXTEND_ENGINE").map(|v| v == "1").unwrap_or(false)
+}
+/// The ATen far-branch temporaries (torch's cache, reserved at load in budget mode). Engine far branch: none (that
+/// room is the KDA arena's, as 1.3.1 shared it).
+pub fn torch_temp_bytes(tp: usize) -> usize {
+    // measured on a compute capability 9.0 GPU (tp1, chunk 1024, 1.25e7-element far-extend steps): torch's cache peaked at 408 MB over 4K..30K
+    // prompts; 1.5 x the sm89-era figure + 32 MB covers it
+    let _ = tp;
+    if engine_far() { 0 } else { prefill_temp_bytes() * 3 / 2 + (32 << 20) }
+}
+
 fn env_on(n: &str) -> bool {
     std::env::var(n).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
 }
 
 /// Bytes of the m1 scratch allocated by init for one CHUNK (init_device), plus workspaces and the prefill
 /// temporaries measured on a 48 GB sm89 card (track A1: +0.9 GB peak in an 8K prefill).
-pub fn scratch_bytes(w4_max_nk: usize, wctx: usize, tier: bool) -> (usize, Vec<(String, usize)>) {
+pub fn scratch_bytes(w4_max_nk: usize, wctx: usize, tier: bool, tp: usize) -> (usize, Vec<(String, usize)>) {
     let t = chunk();
     let (hid, ns, inter) = (5120usize, 4usize, 17408usize);
     let acts = 2 * (3 * t * ns * hid + 6 * t * hid + t * (24 + 4 + 16) + 2 * t * 6144 + t * 10240 + t * 2 * inter + t * inter
@@ -47,7 +79,13 @@ pub fn scratch_bytes(w4_max_nk: usize, wctx: usize, tier: bool) -> (usize, Vec<(
         (format!("activations (prefill chunk {t})"), acts),
         ("W4 dequant scratch (prefill, tiled)".to_string(), w4_scratch(w4_max_nk)),
         ("flashinfer + cuBLAS workspaces".to_string(), 2 * (136 << 20) + (32 << 20)),
-        ("prefill temporaries (KDA chunk, ATen far branch)".to_string(), prefill_temp_bytes()),
+        // 1.3.2: reserved at load (1.3.1 left them to the stream-ordered pool / torch's cache at prefill
+        // time, and after short requests' CUDA graphs had taken the room every 4K+ prompt failed with out of memory)
+        (format!("prefill temporaries: KDA arena (chunk {t})"), kda_temp_bytes(tp)),
+        ("prefill temporaries: ATen far branch (torch cache)".to_string(), torch_temp_bytes(tp)),
+        // engine far branch: the measured prefill temporaries were the KDA chunk's: what the arena leaves stays headroom
+        ("prefill headroom (engine far branch)".to_string(),
+         if engine_far() { prefill_temp_bytes().saturating_sub(kda_temp_bytes(tp)) } else { 0 }),
         // m1_kv far_extend: K + V bf16 rows of one layer for every far position (block means: one row per block)
         ("far-extend staging (pool-length rows, tiered)".to_string(),
          if !tier { 0 } else if std::env::var("AGENS_KV_TIER").map(|v| v == "2").unwrap_or(false) { (wctx / 4 + 1) * 4096 }
@@ -94,7 +132,7 @@ pub fn plan(cfg: &VolundrConfig, budget: usize, used_now: usize, slots: usize, w
     let row_gpu = nd * dense_tok + nb * 64 + if idx_host { 0 } else { nb * idx_row } + if tier { 0 } else { nb * bcsa_tok };
     let row_host = if tier { nb * bcsa_tok + if means { nb * kv_tok / 4 } else { 0 } + if idx_host { nb * idx_row } else { 0 } }
                    else { 0 }; // means: one row per page
-    let (scratch, mut parts) = scratch_bytes(w4_max_nk, wctx, tier);
+    let (scratch, mut parts) = scratch_bytes(w4_max_nk, wctx, tier, tp);
     let scratch = scratch + reserve.iter().map(|p| p.1).sum::<usize>();
     parts.extend(reserve.iter().cloned());
     let fixed = used_now + scratch + slots * (kda_slot + ring);

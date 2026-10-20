@@ -19,6 +19,7 @@ set(AGENS_CUDA_FLAGS --expt-relaxed-constexpr -lineinfo -Xptxas=-v)
 set(AGENS_SOURCES
   src/runtime.cu
   src/w4_gemv.cu
+  src/w4h.cu
   src/bf16_linear.cu
   src/kda_decode.cu
   src/mhc.cu
@@ -60,6 +61,11 @@ if(AGENS_BUILD_BENCH)
   target_link_libraries(test_w4 PRIVATE agens_kernels)
   add_executable(tune_w4 bench/tune_w4.cu)
   target_link_libraries(tune_w4 PRIVATE agens_kernels)
+  add_executable(test_w4h bench/test_w4h.cu)
+  target_link_libraries(test_w4h PRIVATE agens_kernels)
+  add_executable(bench_w4h bench/bench_w4h.cu)
+  target_compile_definitions(bench_w4h PRIVATE AGENS_HAVE_W4H)
+  target_link_libraries(bench_w4h PRIVATE agens_kernels)
 endif()
 
 if(AGENS_BUILD_BENCH)

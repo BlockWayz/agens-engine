@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.3.2
+
+### New
+
+- **Faster decoding on data-center GPUs (compute capability 9.0).** Measured on 141 GB compute capability 9.0 GPUs,
+  2-way tensor parallel (`--tp 2`), Volundr INT4, one request at a time, vp_bench decode tokens/s, greedy: with the
+  DFlash2 drafter 143 -> 197 on a short chat prompt and 176 -> 224 at a 22K-token prompt (+27-38%); with `--mtp` alone
+  238 and 256 (+45-67% over 1.3.1 with the drafter). The verify step takes 10.3 ms instead of 15.0. Greedy output is
+  identical to 1.3.1.
+- **`--mtp` recommended on compute capability 9.0.** With the same setup the MTP head alone drafts faster than the
+  DFlash2 drafter (each draft reads a 32K-token shortlist of the output head instead of the whole head); use `--mtp`
+  without `--drafter`.
+- **Speculative decoding with penalties, including under `--tp`.** Requests with presence, frequency or repetition
+  penalties or a logit bias used to decode one token at a time; they now draft and verify like any other sampled
+  request, with the same output distribution. On the compute capability 8.9 profiles (16 GiB and 23 GiB budgets) such
+  requests decode 40-110% faster (vp_bench, presence 1.0).
+- **Prefix cache.** Requests without a session id reuse the prompt prefix of earlier requests (`--prefix-cache-gib`,
+  default 16 GiB per GPU outside budget mode; off in the `16gb` / `24gb` profiles).
+
+### Fixes
+
+- **Long conversations evicted early.** A request reserved KV cache rows for its whole `max_tokens` up front, which
+  could evict other conversations' sessions; rows are now taken as tokens are generated.
+- **HTTP 500 on long prompts in budget mode.** After short requests, a 4K+-token prompt could fail with an out-of-memory
+  error; the prefill's temporary memory is now reserved at load.
+
+### Unchanged
+
+- The `16gb` and `24gb` profiles (compute capability 8.9) decode at 1.3.1's speed (within 2%, vp_bench greedy and
+  sampled); greedy output is identical to 1.3.1. The single-GPU `16gb` / `24gb` profiles (with or without `--mtp`) keep
+  1.3.1's contexts; `24gb --tp 2` serves 245,764 tokens (1.3.1: 249,860) because prefill memory is now reserved at load.
+
 ## 1.3.1
 
 ### Fixes

@@ -38,7 +38,7 @@ __device__ __forceinline__ uint4 ld_nc(const uint4* p) {
 template <int kU>
 __global__ void __launch_bounds__(kWarps * 32)
 bf16_gemv_bi_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ w, const bf16* __restrict__ bias,
-                    bf16* __restrict__ y, int n, int k) {
+                    bf16* __restrict__ y, int n, int k, long ldy) {
   __shared__ float red[kWarps][32][4];
   const int steps = k >> 5;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
@@ -78,8 +78,8 @@ bf16_gemv_bi_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ 
       for (int cc = 0; cc < 2; ++cc) {
         const int col = 2 * t4 + cc;
         if (col < m) {
-          if (ok0) y[(size_t)col * n + r0] = __float2bfloat16_rn(bias ? v[cc] + __bfloat162float(bias[r0]) : v[cc]);
-          if (ok1) y[(size_t)col * n + r1] = __float2bfloat16_rn(bias ? v[2 + cc] + __bfloat162float(bias[r1]) : v[2 + cc]);
+          if (ok0) y[(size_t)col * ldy + r0] = __float2bfloat16_rn(bias ? v[cc] + __bfloat162float(bias[r0]) : v[cc]);
+          if (ok1) y[(size_t)col * ldy + r1] = __float2bfloat16_rn(bias ? v[2 + cc] + __bfloat162float(bias[r1]) : v[2 + cc]);
         }
       }
     }
@@ -93,7 +93,7 @@ bf16_gemv_bi_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ 
 template <int NT>
 __global__ void __launch_bounds__(kWarps * 32)
 bf16_gemv_bi_nt_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ w, const bf16* __restrict__ bias,
-                       bf16* __restrict__ y, int n, int k) {
+                       bf16* __restrict__ y, int n, int k, long ldy) {
   __shared__ float red[kWarps][32][4 * NT];
   const int steps = k >> 5;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
@@ -141,8 +141,8 @@ bf16_gemv_bi_nt_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict
       for (int cc = 0; cc < 2; ++cc) {
         const int col = tt * 8 + 2 * t4 + cc;
         if (col < m) {
-          if (ok0) y[(size_t)col * n + r0] = __float2bfloat16_rn(bias ? v[cc] + __bfloat162float(bias[r0]) : v[cc]);
-          if (ok1) y[(size_t)col * n + r1] = __float2bfloat16_rn(bias ? v[2 + cc] + __bfloat162float(bias[r1]) : v[2 + cc]);
+          if (ok0) y[(size_t)col * ldy + r0] = __float2bfloat16_rn(bias ? v[cc] + __bfloat162float(bias[r0]) : v[cc]);
+          if (ok1) y[(size_t)col * ldy + r1] = __float2bfloat16_rn(bias ? v[2 + cc] + __bfloat162float(bias[r1]) : v[2 + cc]);
         }
       }
     }
@@ -154,7 +154,7 @@ bf16_gemv_bi_nt_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict
 // slot blocks adds them in slot order (from 0) and the bias: bit-identical to the <= 8-token launches.
 __global__ void __launch_bounds__(128)
 bf16_bi_split_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ w, const bf16* __restrict__ bias,
-                     bf16* __restrict__ y, int n, int k, float* __restrict__ part, unsigned* __restrict__ cnt) {
+                     bf16* __restrict__ y, int n, int k, float* __restrict__ part, unsigned* __restrict__ cnt, long ldy) {
   __shared__ int last_s;
   const int steps = k >> 5;
   const int lane = threadIdx.x & 31, tv = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
@@ -198,8 +198,8 @@ bf16_bi_split_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__
   for (int cc = 0; cc < 2; ++cc) {
     const int col = tt * 8 + 2 * t4 + cc;
     if (col < m) {
-      if (ok0) y[(size_t)col * n + r0] = __float2bfloat16_rn(bias ? v[cc] + __bfloat162float(bias[r0]) : v[cc]);
-      if (ok1) y[(size_t)col * n + r1] = __float2bfloat16_rn(bias ? v[2 + cc] + __bfloat162float(bias[r1]) : v[2 + cc]);
+      if (ok0) y[(size_t)col * ldy + r0] = __float2bfloat16_rn(bias ? v[cc] + __bfloat162float(bias[r0]) : v[cc]);
+      if (ok1) y[(size_t)col * ldy + r1] = __float2bfloat16_rn(bias ? v[2 + cc] + __bfloat162float(bias[r1]) : v[2 + cc]);
     }
   }
 }
@@ -214,7 +214,7 @@ __device__ __forceinline__ void cp16(void* dst, const void* src, int bytes) {
 template <int STAGES>
 __global__ void __launch_bounds__(256, 1)
 bf16_bi_gemm_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ w, const bf16* __restrict__ bias,
-                    bf16* __restrict__ y, int n, int k) {
+                    bf16* __restrict__ y, int n, int k, long ldy) {
   constexpr int RB = 4, NTT = 4, TOK = 32, WB = RB * 16 * 512, XB = TOK * 512, STG = WB + XB;
   extern __shared__ __align__(16) unsigned char bsm[];
   const int steps = k >> 5, ntile = (steps + 7) >> 3;
@@ -295,8 +295,8 @@ bf16_bi_gemm_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ 
     for (int cc = 0; cc < 2; ++cc) {
       const int col = tok0 + tt * 8 + 2 * t4 + cc;
       if (col < m) {
-        if (r0 < n) y[(size_t)col * n + r0] = __float2bfloat16_rn(bias ? v[cc] + __bfloat162float(bias[r0]) : v[cc]);
-        if (r1 < n) y[(size_t)col * n + r1] = __float2bfloat16_rn(bias ? v[2 + cc] + __bfloat162float(bias[r1]) : v[2 + cc]);
+        if (r0 < n) y[(size_t)col * ldy + r0] = __float2bfloat16_rn(bias ? v[cc] + __bfloat162float(bias[r0]) : v[cc]);
+        if (r1 < n) y[(size_t)col * ldy + r1] = __float2bfloat16_rn(bias ? v[2 + cc] + __bfloat162float(bias[r1]) : v[2 + cc]);
       }
     }
   }
@@ -327,6 +327,11 @@ int sms() {
 
 extern "C" int ak_bf16_gemv_bi(const void* x, const void* w, const void* bias, void* y, int m, int n, int k,
                                void* stream) {
+  return ak_bf16_gemv_bi_ld(x, w, bias, y, m, n, k, n, stream);
+}
+// the same with output row stride ldy >= n (tensor parallel: a rank's vocab share written into the full logits rows)
+extern "C" int ak_bf16_gemv_bi_ld(const void* x, const void* w, const void* bias, void* y, int m, int n, int k, long ldy,
+                                  void* stream) {
   if (m < 1 || m > 128 || k % 32 != 0) return (int)cudaErrorInvalidValue;
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   static const bool nt = [] { const char* e = getenv("AGENS_W4_NT"); return !(e && e[0] == '0'); }();
@@ -353,7 +358,7 @@ extern "C" int ak_bf16_gemv_bi(const void* x, const void* w, const void* bias, v
     if (z.first) {
       bf16_bi_split_kernel<<<nblk * nb32 * 8, 128, 0, s>>>(static_cast<const bf16*>(x), m, static_cast<const bf16*>(w),
                                                           static_cast<const bf16*>(bias), static_cast<bf16*>(y), n, k,
-                                                          z.first, z.second);
+                                                          z.first, z.second, ldy);
       return (int)cudaGetLastError();
     }
   }
@@ -369,7 +374,7 @@ extern "C" int ak_bf16_gemv_bi(const void* x, const void* w, const void* bias, v
     if (!set[three]) cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), set[three] = true;
     const int items = ((n + 15) / 16 + 3) / 4, ntt = (m + 31) / 32;
     kern<<<items * ntt, 256, smem, s>>>(static_cast<const bf16*>(x), m, static_cast<const bf16*>(w),
-                                         static_cast<const bf16*>(bias), static_cast<bf16*>(y), n, k);
+                                         static_cast<const bf16*>(bias), static_cast<bf16*>(y), n, k, ldy);
     return (int)cudaGetLastError();
   }
   if (m > 8 && nt) {  // batched verify: 8-token tiles per weight pass (64 tokens per launch)
@@ -377,13 +382,13 @@ extern "C" int ak_bf16_gemv_bi(const void* x, const void* w, const void* bias, v
     for (int m0 = 0; m0 < m; m0 += 64) {
       const int mm = m - m0 < 64 ? m - m0 : 64, t = (mm + 7) / 8;
       const bf16* xx = static_cast<const bf16*>(x) + (size_t)m0 * k;
-      bf16* yy = static_cast<bf16*>(y) + (size_t)m0 * n;
+      bf16* yy = static_cast<bf16*>(y) + (size_t)m0 * ldy;
       auto go = [&](auto kern) {
         int per = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, kern, kWarps * 32, 0);
         if (per < 1) per = 1;
         const int blocks = want < sms() * per ? want : sms() * per;
-        kern<<<blocks, kWarps * 32, 0, s>>>(xx, mm, static_cast<const bf16*>(w), static_cast<const bf16*>(bias), yy, n, k);
+        kern<<<blocks, kWarps * 32, 0, s>>>(xx, mm, static_cast<const bf16*>(w), static_cast<const bf16*>(bias), yy, n, k, ldy);
       };
       if (t <= 2) go(bf16_gemv_bi_nt_kernel<2>);
       else if (t <= 4) go(bf16_gemv_bi_nt_kernel<4>);
@@ -406,7 +411,7 @@ extern "C" int ak_bf16_gemv_bi(const void* x, const void* w, const void* bias, v
     kern<<<blocks, kWarps * 32, 0, s>>>(static_cast<const bf16*>(x) + (size_t)m0 * k,
                                                        m - m0 < 8 ? m - m0 : 8, static_cast<const bf16*>(w),
                                                        static_cast<const bf16*>(bias),
-                                                       static_cast<bf16*>(y) + (size_t)m0 * n, n, k);
+                                                       static_cast<bf16*>(y) + (size_t)m0 * ldy, n, k, ldy);
   }
   return (int)cudaGetLastError();
 }

@@ -411,6 +411,10 @@ __global__ void __launch_bounds__(256) topk_merge(const float* __restrict__ pv, 
     topk_insert(lv, li, pv[(size_t)row * kTopkChunks * TOPK + c], pi[(size_t)row * kTopkChunks * TOPK + c]);
   topk_block_merge(lv, li, vals + row * TOPK, ids + row * TOPK);
 }
+__global__ void map_ids(int* cid, int n, const int* ids) {  // shortlist indices -> token ids
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) cid[i] = ids[cid[i]];
+}
 // greedy walk: warp c scores candidate c of slot e; writes the 7 drafts to step[3..9]
 __global__ void __launch_bounds__(TOPK * 32) selector_walk(const float* __restrict__ uval, const int* __restrict__ cid,
                                                           const bf16* __restrict__ hp, const bf16* __restrict__ A,
@@ -489,6 +493,15 @@ int copy_ring(int dst, int src, cudaStream_t s) {  // a forked session's drafter
   const size_t n = (size_t)NL * kRing * KVH * HD;
   DCK(cudaMemcpyAsync(D.ring_k + dst * n, D.ring_k + src * n, n * sizeof(bf16), cudaMemcpyDeviceToDevice, s));
   DCK(cudaMemcpyAsync(D.ring_v + dst * n, D.ring_v + src * n, n * sizeof(bf16), cudaMemcpyDeviceToDevice, s));
+  return 0;
+}
+size_t ring_bytes() { return D.ready ? (size_t)2 * NL * kRing * KVH * HD * sizeof(bf16) : 0; }
+int ring_io(int ring, void* buf, bool to_buf, cudaStream_t s) {  // ring <-> buf (ring_bytes(): K then V)
+  if (!D.ready || ring < 0 || ring >= D.n_rings) return 0;
+  const size_t n = (size_t)NL * kRing * KVH * HD;
+  bf16 *k = D.ring_k + ring * n, *v = D.ring_v + ring * n, *b = static_cast<bf16*>(buf);
+  DCK(cudaMemcpyAsync(to_buf ? b : k, to_buf ? k : b, n * sizeof(bf16), cudaMemcpyDefault, s));
+  DCK(cudaMemcpyAsync(to_buf ? b + n : v, to_buf ? v : b + n, n * sizeof(bf16), cudaMemcpyDefault, s));
   return 0;
 }
 int setup(int max_ctx, int mask_token_id, int max_pos, int n_rings, int max_seqs) {
@@ -644,6 +657,15 @@ int propose_impl(const Target& t, int B, int* step) {
   if (B) {
     gather_sel_rows<<<256, 256, 0, s>>>(D.x, B, D.hsel);
     hpred = D.hsel;
+  }
+  if (t.nsl > 0 && t.sl_drafter) {  // shortlist head: candidates among its rows, then their token ids
+    DCK(ak_bf16_linear(hpred, t.sl_head, D.logits, ns, t.nsl, HID, s));
+    topk_part<<<dim3(ns, kTopkChunks), 256, 0, s>>>(D.logits, t.nsl, t.nsl, D.pval, D.pid);
+    topk_merge<<<ns, 256, 0, s>>>(D.pval, D.pid, D.uval, D.cid);
+    map_ids<<<(ns * TOPK + 255) / 256, 256, 0, s>>>(D.cid, ns * TOPK, t.sl_ids);
+    DCK(linear(hpred, D.sel_proj, D.hp, ns, RANK, HID, s));
+    selector_walk<<<B ? B : 1, TOPK * 32, 0, s>>>(D.uval, D.cid, D.hp, D.sel_A, D.sel_B, step);
+    return (int)cudaGetLastError();
   }
   if (t.lm_head_w4) {
     const int nv = 248320;

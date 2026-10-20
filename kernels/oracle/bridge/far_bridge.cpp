@@ -334,6 +334,18 @@ int ak_bridge_far_extend_staged(void* qi_all, void* qh, void* o_loc, void* lse, 
   }
 }
 }  // extern "C"
+// torch's caching allocator takes `bytes` now and keeps them cached (budget mode: the plan's ATen far-branch
+// temporaries, reserved before CUDA graphs can take the room). 0 or 1 (out of memory).
+extern "C" int ak_bridge_torch_reserve(long long bytes) {
+  try {
+    auto t = at::empty({bytes}, at::TensorOptions().device(at::kCUDA, cur_device()).dtype(at::kByte));
+    (void)t;
+    return 0;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "ak_bridge_torch_reserve: %s\n", e.what());
+    return 1;
+  }
+}
 extern "C" int ak_bridge_set_heads(int qh, int kvh) {
   if (kvh < 1 || qh != G * kvh) return 1;
   H = qh, KV = kvh;

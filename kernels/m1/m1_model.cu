@@ -68,6 +68,10 @@ int ak_vis_pixels(const uint8_t* rgb, const uint8_t* jpeg, long long jlen, int h
 int ak_vis_encode_pixels(const float* pv, int gh, int gw, void* out, void* stream);
 long long ak_vis_peak_bytes();
 int ak_bridge_set_heads(int qh, int kvh);  // far bridge: this rank's q / kv heads (tensor parallel)
+size_t ak_far_extend_engine_ws_bytes(int Wctx);
+int ak_far_extend_engine(int T, int seq0, const void* qi, const void* qh, const void* o_loc, const float* lse,
+                         const int* r2t, int Wctx, const void* kst, const void* vst, const void* idx, void* blk, int rows,
+                         void* ws, void* out, void* stream);
 int ak_bridge_far_extend(void* qi_all, void* qh, void* o_loc, void* lse, int seq_len, int T, int req, void* r2t, int R,
                          int Wctx, void* kc, void* vc, void* idx, void* blk, int rows, void* out, void* stream);
 }
@@ -83,11 +87,12 @@ constexpr int QH_FULL = 24, KVH_FULL = 4, KH_FULL = 16, KHV_FULL = 48, INTER_FUL
 int QH = QH_FULL, KVH = KVH_FULL, KH = KH_FULL, KHV = KHV_FULL, INTER = INTER_FULL;
 int KDIM = 2 * KH_FULL * KK + KHV_FULL * KK;
 int g_tp = 1, g_rank = 0;
-constexpr int IDXH = 4, IDXD = 128, ENG_DIM = 512, ENG_ROWS = 1 << 20, CHUNK = 4096;
-// Prefill chunk (sglv23's chunked_prefill_size 4096 = parity with the reference). AGENS_M1_PREFILL_CHUNK (64..4096)
-// trades prefill speed for the CHUNK-sized scratch (~1.7 GB activations at 4096): the 16 GB plan needs it smaller.
-// Chunk boundaries change prefill numerics (KDA chunking), so the default stays 4096.
-int g_chunk = CHUNK;
+constexpr int IDXH = 4, IDXD = 128, ENG_DIM = 512, ENG_ROWS = 1 << 20, CHUNK = 8192;
+// Prefill chunk (sglv23's chunked_prefill_size 4096 = parity with the reference). AGENS_M1_PREFILL_CHUNK (64..8192;
+// above 4096 only with all-GPU KV, the tiered pools stage 4096-row chunks) trades prefill speed for the chunk-sized
+// scratch (~1.7 GB activations at 4096): the 16 GB plan needs it smaller. Chunk boundaries change prefill numerics
+// (KDA chunking), so the default stays 4096.
+int g_chunk = 4096;
 constexpr float EPS = 1e-6f;
 // layer pattern ('k' KDA, 'b' BCSA, 'd' dense) and Engram layers come from the checkpoint config (ak_m1_init)
 int NL = 72;
@@ -123,6 +128,7 @@ struct W4Lin {
   int n, k;
   int np = 0;
   W4Part p[2];
+  bf16* dq = nullptr;  // prefill: the whole dequantized weight (W4 prefill cache; nullptr: per-tile scratch)
 };
 std::map<std::string, W4Lin> W4M;
 int g_w4_batch_max = 16;  // AGENS_M1_W4_BATCH_MAX (<= 128): largest m on the batched GEMV / GEMM; above: dequant + cuBLAS
@@ -133,8 +139,8 @@ int g_w4_bf16w = 0;       // AGENS_M1_W4_NUMERICS=marlin: decode/verify GEMVs us
 bool g_bi = getenv("AGENS_M1_BI") && getenv("AGENS_M1_BI")[0] == '1';
 constexpr int kSpecT = 8;                                  // verify block (DFlash2 block size)
 // single-sequence verify staging (step_h / step_d): ints; [32..37] the sampled-accept parameter block (samp_pos: T,
-// top-k, top-p, min-p, seed, step), [kStepDelta] = the session's rope delta
-constexpr int kStepInts = 48, kStepDelta = 40;
+// top-k, top-p, min-p, seed, step), [kStepDelta] = the session's rope delta, [44..51] penalties (samp_pos [12..19])
+constexpr int kStepInts = 64, kStepDelta = 40;
 // speculative verify attention in one launch per layer (ak_attn_decode_multi; AGENS_SPEC_MULTI_ATTN=0: per query)
 constexpr int MSLOT_DENSE = 0, MSLOT_WIN = 1, MSLOT_PACKED = 2;
 // dense layer verify as one causal request of the T queries (ak_attn_decode_packed; AGENS_SPEC_DENSE_PACKED=0: the
@@ -533,20 +539,72 @@ __global__ void __launch_bounds__(1024) accept_sampled(const bf16* logits, int l
 // boundary ties cut in index order; then accept / residual / bonus samples from Philox(seed, step, position) as
 // accept_sampled; samp_chain picks the first rejection. Parameters: step[32..35] = temp, top_k (<= 0: all), top_p,
 // min_p (floats as bits); scr[0..7] accept flags, scr[8..15] the token of each position on rejection / as the bonus.
-__device__ __forceinline__ int okey(const bf16 x) {
-  const unsigned short b = __bfloat16_as_ushort(x);
-  return (b & 0x8000) ? (int)(unsigned short)~b : (int)(b | 0x8000);
-}
+//
+// Penalties (1.3.2): a sequence whose parameter block has prm[12] & 1 samples from its penalised logits, as the
+// host sampler computes them per position: x = bf16 logit (+ logit_bias), then for a token generated c > 0 times so far
+// (the session's device counts, which the host keeps equal to its own via ak_m1_session_penalty_add, plus the drafts this
+// block has already accepted before position j) the repetition penalty (x > 0 ? x / r : x * r) and
+// x -= frequency * c + presence; every op in f32 round-to-nearest, no contraction (sampler.rs order). The filtered set is
+// then found on the f32 key (four radix passes) and greedy rows take the first index of the penalised maximum.
+// Parameters prm[12..19]: flags (1 = on, 2 = logit bias), repetition, frequency, presence (float bits), the counts
+// pointer, the bias pointer (NaN = no bias for that id).
+constexpr int kPrmPen = 12;
+// one position's logits: plain bf16 rows (16-bit keys, 2 radix passes) ...
+struct RowBf {
+  static constexpr int NP = 2;
+  const bf16* l;
+  __device__ __forceinline__ float val(int v) const { return __bfloat162float(l[v]); }
+  __device__ __forceinline__ unsigned key_of(float x) const {
+    const unsigned short b = __bfloat16_as_ushort(__float2bfloat16(x));  // exact: x is a bf16 value
+    return (b & 0x8000) ? (unsigned)(unsigned short)~b : (unsigned)(b | 0x8000);
+  }
+  __device__ __forceinline__ float val_of_key(unsigned k) const {
+    const unsigned short kb = (unsigned short)k;
+    const unsigned short bits = (kb & 0x8000) ? (unsigned short)(kb & 0x7fff) : (unsigned short)~kb;
+    return __bfloat162float(__ushort_as_bfloat16(bits));
+  }
+};
+// ... or penalised f32 values (32-bit keys, 4 radix passes)
+struct RowPen {
+  static constexpr int NP = 4;
+  const bf16* l;
+  const int* cnt;
+  const float* bias;  // nullable
+  float rep, fr, pr;
+  int nd, d[kSpecT - 1];  // the block's drafts before this position
+  __device__ __forceinline__ float val(int v) const {
+    float x = __bfloat162float(l[v]);
+    if (bias) {
+      const float b = bias[v];
+      if (!isnan(b)) x = __fadd_rn(x, b);
+    }
+    int c = cnt[v];
+#pragma unroll
+    for (int k = 0; k < kSpecT - 1; ++k) c += k < nd && d[k] == v;
+    if (c > 0) {
+      if (rep != 1.f) x = x > 0.f ? __fdiv_rn(x, rep) : __fmul_rn(x, rep);
+      x = __fsub_rn(x, __fadd_rn(__fmul_rn(fr, (float)c), pr));
+    }
+    return x;
+  }
+  __device__ __forceinline__ unsigned key_of(float x) const {
+    const unsigned u = __float_as_uint(x);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  }
+  __device__ __forceinline__ float val_of_key(unsigned k) const {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
+  }
+};
 struct SampSet {
   float mx, inv_t, minp;
-  int kall, tk, kcut, pall, tp, pcut;
+  int kall, kcut, pall, pcut;
+  unsigned tk, tp;
   __device__ __forceinline__ float mass(float lv) const { return __expf((lv - mx) * inv_t); }
-  __device__ __forceinline__ bool inA(int v, int key) const { return kall || key > tk || (key == tk && v <= kcut); }
-  __device__ __forceinline__ bool in(int v, const bf16 x) const {
-    const int key = okey(x);
+  __device__ __forceinline__ bool inA(int v, unsigned key) const { return kall || key > tk || (key == tk && v <= kcut); }
+  __device__ __forceinline__ bool in(int v, float x, unsigned key) const {
     if (!inA(v, key)) return false;
     if (!pall && !(key > tp || (key == tp && v <= pcut))) return false;
-    return minp <= 0.f || mass(__bfloat162float(x)) >= minp;
+    return minp <= 0.f || mass(x) >= minp;
   }
 };
 // Layout: warp w owns [w * seg, (w + 1) * seg) (seg a multiple of 32) and lane l reads base + 32 r + l in round r:
@@ -589,11 +647,12 @@ __device__ double block_sumd(double v, double* red) {
   return t;
 }
 // the index of the n-th (1-based, index order) element with key == tau (and in A when useA); -1 if fewer exist
-__device__ int samp_tie_cut(const bf16* l, int nv, const SampLay& L, int tau, int n, const SampSet& f, bool useA,
+template <class R>
+__device__ int samp_tie_cut(const R& A, int nv, const SampLay& L, unsigned tau, int n, const SampSet& f, bool useA,
                             int* wcnt, int* sh) {
   auto pred = [&](int v) {
     if (v < 0) return false;
-    const int key = okey(l[v]);
+    const unsigned key = A.key_of(A.val(v));
     return key == tau && (!useA || f.inA(v, key));
   };
   int c = 0;
@@ -630,10 +689,13 @@ __device__ int samp_tie_cut(const bf16* l, int nv, const SampLay& L, int tau, in
   return out;
 }
 // sample from the set without `skip` (total mass z) at uniform u, in index order (block-wide)
-__device__ int samp_draw(const bf16* l, int nv, const SampLay& L, const SampSet& f, int skip, double z, float u,
+template <class R>
+__device__ int samp_draw(const R& A, int nv, const SampLay& L, const SampSet& f, int skip, double z, float u,
                          double* wm, int* sh, double* shd) {
   auto mass_of = [&](int v) -> double {
-    return v >= 0 && v != skip && f.in(v, l[v]) ? (double)f.mass(__bfloat162float(l[v])) : 0.0;
+    if (v < 0 || v == skip) return 0.0;
+    const float x = A.val(v);
+    return f.in(v, x, A.key_of(x)) ? (double)f.mass(x) : 0.0;
   };
   double part = 0.0;
   for (int r = 0; r < L.rounds; ++r) part += mass_of(samp_v(L, r, nv));
@@ -682,28 +744,117 @@ __device__ int samp_draw(const bf16* l, int nv, const SampLay& L, const SampSet&
   __syncthreads();
   return out;
 }
-// grid B x T blocks: sequence b = blockIdx.x / T, position j; its parameters prm + b * prm_stride = {temp, top_k, top_p,
-// min_p, seed, step} (floats as bits); scr + 16 b; temp <= 0: the greedy accept from the target argmax tok
-__global__ void __launch_bounds__(1024) samp_pos(const bf16* logits, int ld, int nv, const int* ids_all, int T,
-                                                 const int* prm_all, int prm_stride, const int* tok, int* scr_all) {
-  const int b = blockIdx.x / T, j = blockIdx.x % T;
-  const int* ids = ids_all + (size_t)b * T;
-  const int* prm = prm_all + (size_t)b * prm_stride;
-  int* scr = scr_all + 16 * b;
-  if (__int_as_float(prm[0]) <= 0.f) {
-    if (threadIdx.x == 0) {
-      const int g = tok[(size_t)b * T + j];
-      scr[j] = j + 1 < T && ids[j + 1] == g, scr[8 + j] = g;
-    }
-    return;
+struct SampShm {
+  float red[32];
+  double redd[32], wm[32], hm[256], shd[2];
+  int hist[256], sh[4], wcnt[32];
+  float amx[32];
+  int aix[32];
+};
+// the first index of the maximum (the host's greedy argmax: strict >, ascending scan)
+template <class R>
+__device__ int samp_argmax(const R& A, int nv, const SampLay& L, SampShm& m) {
+  float bv = -INFINITY;
+  int bi = nv;
+  for (int r = 0; r < L.rounds; ++r) {
+    const int v = samp_v(L, r, nv);
+    if (v < 0) continue;
+    const float x = A.val(v);
+    if (x > bv || (x == bv && v < bi)) bv = x, bi = v;
   }
-  const bf16* l = logits + ((size_t)b * T + j) * ld;
-  __shared__ float red[32];
-  __shared__ double redd[32], wm[32], hm[256], shd[2];
-  __shared__ int hist[256], sh[4], wcnt[32];
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor_sync(kFull, bv, o);
+    const int oi = __shfl_xor_sync(kFull, bi, o);
+    if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+  }
+  if ((threadIdx.x & 31) == 0) m.amx[threadIdx.x >> 5] = bv, m.aix[threadIdx.x >> 5] = bi;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    for (int w = 1; w < (int)(blockDim.x >> 5); ++w)
+      if (m.amx[w] > bv || (m.amx[w] == bv && m.aix[w] < bi)) bv = m.amx[w], bi = m.aix[w];
+    m.sh[0] = bi < nv ? bi : 0;
+  }
+  __syncthreads();
+  const int out = m.sh[0];
+  __syncthreads();
+  return out;
+}
+// radix select over the R::NP 8-bit digits of the key (high first): the bin where the running count / mass from the
+// top reaches the target; returns the key prefix found and the count / mass above it
+template <class R, class Elem>
+__device__ unsigned samp_radix_cnt(const R& A, int nv, const SampLay& L, int target, int* above, SampShm& m, Elem el) {
+  unsigned pre = 0, pmask = 0;
+  int cum = 0;
+  for (int p = 0; p < R::NP; ++p) {
+    const int shift = 8 * (R::NP - 1 - p);
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) m.hist[b] = 0;
+    __syncthreads();
+    for (int r = 0; r < L.rounds; ++r) {
+      const int v = samp_v(L, r, nv);
+      int bin = -1;
+      if (v >= 0) {
+        const unsigned key = A.key_of(A.val(v));
+        if ((key & pmask) == pre && el(v, key)) bin = (key >> shift) & 255;
+      }
+      hist_add(m.hist, bin);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int c = cum, b = 255;
+      for (; b > 0 && c + m.hist[b] < target; --b) c += m.hist[b];
+      m.sh[0] = b, m.sh[1] = c;
+    }
+    __syncthreads();
+    pre |= (unsigned)m.sh[0] << shift, pmask |= 255u << shift, cum = m.sh[1];
+    __syncthreads();
+  }
+  *above = cum;
+  return pre;
+}
+template <class R>
+__device__ unsigned samp_radix_mass(const R& A, int nv, const SampLay& L, double target, double* above, const SampSet& f,
+                                    SampShm& m) {
+  unsigned pre = 0, pmask = 0;
+  double cum = 0.0;
+  for (int p = 0; p < R::NP; ++p) {
+    const int shift = 8 * (R::NP - 1 - p);
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) m.hm[b] = 0.0;
+    __syncthreads();
+    for (int r = 0; r < L.rounds; ++r) {
+      const int v = samp_v(L, r, nv);
+      int bin = -1;
+      double ms = 0.0;
+      if (v >= 0) {
+        const float x = A.val(v);
+        const unsigned key = A.key_of(x);
+        if ((key & pmask) == pre && f.inA(v, key)) bin = (key >> shift) & 255, ms = (double)f.mass(x);
+      }
+      hist_addd(m.hm, bin, ms);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      double c = cum;
+      int b = 255;
+      for (; b > 0 && c + m.hm[b] < target; --b) c += m.hm[b];
+      m.sh[0] = b, m.shd[1] = c;
+    }
+    __syncthreads();
+    pre |= (unsigned)m.sh[0] << shift, pmask |= 255u << shift, cum = m.shd[1];
+    __syncthreads();
+  }
+  *above = cum;
+  return pre;
+}
+template <class R>
+__device__ void samp_body(const R& A, int nv, const int* ids, int T, int j, const int* prm, int* scr, SampShm& m) {
   const float temp = __int_as_float(prm[0]), topp = __int_as_float(prm[2]), minp = __int_as_float(prm[3]);
   const int topk = prm[1];
   const SampLay L = samp_lay(nv);
+  if (temp <= 0.f) {  // greedy over the penalised logits
+    const int g = samp_argmax(A, nv, L, m);
+    if (threadIdx.x == 0) scr[j] = j + 1 < T && ids[j + 1] == g, scr[8 + j] = g;
+    return;
+  }
   SampSet f;
   f.inv_t = 1.0f / temp, f.minp = minp;
   f.kall = !(topk > 0 && topk < nv), f.tk = 0, f.kcut = nv;
@@ -711,121 +862,114 @@ __global__ void __launch_bounds__(1024) samp_pos(const bf16* logits, int ld, int
   float mx = -INFINITY;
   for (int r = 0; r < L.rounds; ++r) {
     const int v = samp_v(L, r, nv);
-    if (v >= 0) mx = fmaxf(mx, __bfloat162float(l[v]));
+    if (v >= 0) mx = fmaxf(mx, A.val(v));
   }
-  f.mx = block_max(mx, red);
-  // top-k: the k-th largest key by two radix passes over counts; its ties kept in index order up to k
+  f.mx = block_max(mx, m.red);
+  // top-k: the k-th largest key by radix passes over counts; its ties kept in index order up to k
   if (!f.kall) {
-    for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
-    __syncthreads();
-    for (int r = 0; r < L.rounds; ++r) {
-      const int v = samp_v(L, r, nv);
-      hist_add(hist, v >= 0 ? okey(l[v]) >> 8 : -1);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      int cum = 0, b = 255;
-      for (; b > 0 && cum + hist[b] < topk; --b) cum += hist[b];
-      sh[0] = b, sh[1] = cum;
-    }
-    __syncthreads();
-    const int b1 = sh[0], above1 = sh[1];
-    __syncthreads();
-    for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
-    __syncthreads();
-    for (int r = 0; r < L.rounds; ++r) {
-      const int v = samp_v(L, r, nv);
-      const int key = v >= 0 ? okey(l[v]) : -1;
-      hist_add(hist, key >= 0 && (key >> 8) == b1 ? (key & 255) : -1);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      int cum = above1, b = 255;
-      for (; b > 0 && cum + hist[b] < topk; --b) cum += hist[b];
-      sh[2] = (b1 << 8) | b, sh[3] = topk - cum;
-    }
-    __syncthreads();
-    f.tk = sh[2];
-    const int need = sh[3];
-    __syncthreads();
-    f.kcut = samp_tie_cut(l, nv, L, f.tk, need, f, false, wcnt, sh);
+    int above = 0;
+    f.tk = samp_radix_cnt(A, nv, L, topk, &above, m, [](int, unsigned) { return true; });
+    f.kcut = samp_tie_cut(A, nv, L, f.tk, topk - above, f, false, m.wcnt, m.sh);
   }
-  // top-p: the smallest prefix of A (key descending, ties by index) with mass >= top_p * Z_A, by two radix passes over
+  // top-p: the smallest prefix of A (key descending, ties by index) with mass >= top_p * Z_A, by radix passes over
   // fp64 masses; the boundary key's ties (equal masses) kept in index order as many as the prefix needs
   if (topp < 1.f) {
     double za = 0.0;
     for (int r = 0; r < L.rounds; ++r) {
       const int v = samp_v(L, r, nv);
-      if (v >= 0 && f.inA(v, okey(l[v]))) za += (double)f.mass(__bfloat162float(l[v]));
+      if (v < 0) continue;
+      const float x = A.val(v);
+      if (f.inA(v, A.key_of(x))) za += (double)f.mass(x);
     }
-    const double target = (double)topp * block_sumd(za, redd);
-    for (int b = threadIdx.x; b < 256; b += blockDim.x) hm[b] = 0.0;
-    __syncthreads();
-    for (int r = 0; r < L.rounds; ++r) {
-      const int v = samp_v(L, r, nv);
-      const int key = v >= 0 ? okey(l[v]) : -1;
-      const bool in = key >= 0 && f.inA(v, key);
-      hist_addd(hm, in ? key >> 8 : -1, in ? (double)f.mass(__bfloat162float(l[v])) : 0.0);
-    }
-    __syncthreads();
+    const double target = (double)topp * block_sumd(za, m.redd);
+    double cum = 0.0;
+    const unsigned tp = samp_radix_mass(A, nv, L, target, &cum, f, m);
     if (threadIdx.x == 0) {
-      double cum = 0.0;
-      int b = 255;
-      for (; b > 0 && cum + hm[b] < target; --b) cum += hm[b];
-      sh[0] = b, shd[1] = cum;
+      const double ms = (double)f.mass(A.val_of_key(tp));
+      const double n = ms > 0.0 ? ceil((target - cum) / ms) : 1.0;
+      m.sh[3] = n < 1.0 ? 1 : (n > 1e9 ? 1000000000 : (int)n);
     }
     __syncthreads();
-    const int b1 = sh[0];
-    for (int b = threadIdx.x; b < 256; b += blockDim.x) hm[b] = 0.0;
+    f.pall = 0, f.tp = tp;
+    const int need = m.sh[3];
     __syncthreads();
-    for (int r = 0; r < L.rounds; ++r) {
-      const int v = samp_v(L, r, nv);
-      const int key = v >= 0 ? okey(l[v]) : -1;
-      const bool in = key >= 0 && (key >> 8) == b1 && f.inA(v, key);
-      hist_addd(hm, in ? key & 255 : -1, in ? (double)f.mass(__bfloat162float(l[v])) : 0.0);
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      double cum = shd[1];
-      int b = 255;
-      for (; b > 0 && cum + hm[b] < target; --b) cum += hm[b];
-      sh[2] = (b1 << 8) | b;
-      const unsigned short kb = (unsigned short)sh[2];
-      const unsigned short bits = (kb & 0x8000) ? (unsigned short)(kb & 0x7fff) : (unsigned short)~kb;
-      const double m = (double)f.mass(__bfloat162float(__ushort_as_bfloat16(bits)));
-      const double n = m > 0.0 ? ceil((target - cum) / m) : 1.0;
-      sh[3] = n < 1.0 ? 1 : (n > 1e9 ? 1000000000 : (int)n);
-    }
-    __syncthreads();
-    f.pall = 0, f.tp = sh[2];
-    const int need = sh[3];
-    __syncthreads();
-    const int cut = samp_tie_cut(l, nv, L, f.tp, need, f, true, wcnt, sh);
+    const int cut = samp_tie_cut(A, nv, L, f.tp, need, f, true, m.wcnt, m.sh);
     f.pcut = cut < 0 ? nv : cut;  // fewer ties than needed (fp64 rounding at the boundary): keep them all
   }
   double zf = 0.0;
   for (int r = 0; r < L.rounds; ++r) {
     const int v = samp_v(L, r, nv);
-    if (v >= 0 && f.in(v, l[v])) zf += (double)f.mass(__bfloat162float(l[v]));
+    if (v < 0) continue;
+    const float x = A.val(v);
+    if (f.in(v, x, A.key_of(x))) zf += (double)f.mass(x);
   }
-  const double z = block_sumd(zf, redd);
+  const double z = block_sumd(zf, m.redd);
   const unsigned long long seed = (unsigned)prm[4], sidx = (unsigned)prm[5];
   curandStatePhilox4_32_10_t rng;
   curand_init(seed, sidx * 64 + j, 0, &rng);
   const float4 u4 = curand_uniform4(&rng);
   if (j + 1 < T) {
     const int x = ids[j + 1];
-    const bool inx = x >= 0 && x < nv && f.in(x, l[x]);
-    const double px = inx ? (double)f.mass(__bfloat162float(l[x])) : 0.0;
+    float xv = 0.f;
+    bool inx = false;
+    if (x >= 0 && x < nv) xv = A.val(x), inx = f.in(x, xv, A.key_of(xv));
+    const double px = inx ? (double)f.mass(xv) : 0.0;
     bool acc = inx && (double)u4.x * z < px;
     if (!acc && z - px <= 0.0) acc = true;  // x is the whole set
     int tok = x;
-    if (!acc) tok = samp_draw(l, nv, L, f, x, z - px, u4.y, wm, sh, shd);
+    if (!acc) tok = samp_draw(A, nv, L, f, x, z - px, u4.y, m.wm, m.sh, m.shd);
     if (threadIdx.x == 0) scr[j] = acc, scr[8 + j] = tok;
   } else {
-    const int tok = samp_draw(l, nv, L, f, -1, z, u4.y, wm, sh, shd);
+    const int tok = samp_draw(A, nv, L, f, -1, z, u4.y, m.wm, m.sh, m.shd);
     if (threadIdx.x == 0) scr[j] = 0, scr[8 + j] = tok;
   }
+}
+__device__ __forceinline__ const void* prm_ptr(const int* q) {
+  return (const void*)(((unsigned long long)(unsigned)q[1] << 32) | (unsigned)q[0]);
+}
+// grid B x T blocks: sequence b = blockIdx.x / T, position j; its parameters prm + b * prm_stride = {temp, top_k, top_p,
+// min_p, seed, step, .., [12..19] penalties} (floats as bits); scr + 16 b; temp <= 0: the greedy accept from the target
+// argmax tok (penalised: the penalised argmax)
+__global__ void __launch_bounds__(1024) samp_pos(const bf16* logits, int ld, int nv, const int* ids_all, int T,
+                                                 const int* prm_all, int prm_stride, const int* tok, int* scr_all) {
+  const int b = blockIdx.x / T, j = blockIdx.x % T;
+  const int* ids = ids_all + (size_t)b * T;
+  const int* prm = prm_all + (size_t)b * prm_stride;
+  int* scr = scr_all + 16 * b;
+  const bool pen = prm[kPrmPen] & 1;
+  if (__int_as_float(prm[0]) <= 0.f && !pen) {
+    if (threadIdx.x == 0) {
+      const int g = tok[(size_t)b * T + j];
+      scr[j] = j + 1 < T && ids[j + 1] == g, scr[8 + j] = g;
+    }
+    return;
+  }
+  __shared__ SampShm m;
+  const bf16* l = logits + ((size_t)b * T + j) * ld;
+  if (pen) {
+    RowPen A;
+    A.l = l, A.cnt = (const int*)prm_ptr(prm + kPrmPen + 4);
+    A.bias = (prm[kPrmPen] & 2) ? (const float*)prm_ptr(prm + kPrmPen + 6) : nullptr;
+    A.rep = __int_as_float(prm[kPrmPen + 1]), A.fr = __int_as_float(prm[kPrmPen + 2]);
+    A.pr = __int_as_float(prm[kPrmPen + 3]);
+    A.nd = j;  // drafts ids[1..j] are accepted before position j
+#pragma unroll
+    for (int k = 0; k < kSpecT - 1; ++k) A.d[k] = k < j ? ids[1 + k] : -1;
+    samp_body(A, nv, ids, T, j, prm, scr, m);
+  } else {
+    RowBf A;
+    A.l = l;
+    samp_body(A, nv, ids, T, j, prm, scr, m);
+  }
+}
+// device penalty state of a session: counts += the tokens ids[0..n) (repeats add up)
+__global__ void pen_count_add(int* cnt, const int* ids, int n, int nv) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && ids[i] >= 0 && ids[i] < nv) atomicAdd(&cnt[ids[i]], 1);
+}
+__global__ void pen_bias_set(float* bias, const int* ids, const float* vals, int n, int nv) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n && ids[i] >= 0 && ids[i] < nv) bias[ids[i]] = vals[i];
 }
 // thread b: sequence b's chain (ids + b T, scr + 16 b) -> res + b * res_stride = {n, emitted[..]}
 __global__ void samp_chain(const int* ids_all, int B, int T, const int* scr_all, int* res_all, int res_stride) {
@@ -956,6 +1100,8 @@ struct State {
   int* dummy_r2t = nullptr;             // padding rows of a batch bucket: all trash row
   int* dummy_prev = nullptr;
   void* far_ws = nullptr;               // engine far branch intermediates (ak_far_decode)
+  void *fx_ws = nullptr;                // prefill far extend on engine kernels (far_extend_engine): workspace,
+  bf16 *fx_kb = nullptr, *fx_vb = nullptr;  // block means of K / V in position order [Wctx / 4][KVH][HD]
   void* far_wsm = nullptr;              // speculative verify: multi-query far branch (ak_far_decode_multi_src)
   // speculative verify (allocated by ak_m1_spec_init): per KDA layer the verify inputs the commit replays
   // [kSpecT][KDIM] pre-conv qkv, [kSpecT][KDIM] conv output, [kSpecT][KHV*KK] gate, [kSpecT][KHV] beta
@@ -997,6 +1143,12 @@ struct Session {
   int *r2t[2] = {}, *prev[2] = {}, *slot[2] = {};
   float samp_t = 0.f, samp_p = 1.f, samp_minp = 0.f;  // batched verify sampling (ak_m1_session_sampling; 0 = greedy)
   int samp_k = 0, samp_seed = 0, samp_step = 0;
+  // penalties of the speculative accept (ak_m1_session_penalty): on, repetition / frequency / presence, and the device
+  // counts of the tokens generated so far / logit bias per id (NaN = none); the buffers are kept for a reused id
+  bool pen = false, pen_bias_on = false;
+  float pen_rep = 1.f, pen_freq = 0.f, pen_pres = 0.f;
+  int* pen_cnt = nullptr;
+  float* pen_bias = nullptr;
   long long cache_epoch = 0;  // owner tag of the far-branch union caches (globally unique, see g_cache_epoch)
   int cache_seq = 0;          // position at the last verify step (a step back = a new epoch)
   int rdelta = 0;             // rope position - token position of the next text token (<= 0 after images; vision.md)
@@ -1081,6 +1233,7 @@ int new_session() {  // -> id, or -1 when every KDA slot is taken
   Session keep = ss;  // a reused id keeps its device buffers
   ss = Session{};
   for (int d = 0; d < 2; ++d) ss.r2t[d] = keep.r2t[d], ss.prev[d] = keep.prev[d], ss.slot[d] = keep.slot[d];
+  ss.pen_cnt = keep.pen_cnt, ss.pen_bias = keep.pen_bias;
   ss.live = true, ss.kslot = k;
   ss.cache_epoch = ++g_cache_epoch;
   g_slot_used[k] = 1;
@@ -1117,6 +1270,10 @@ int plan_decode_attention() {
   return ak_attn_decode_plan(SLOT_DENSE, S.rng + 2, QH, KVH, S.s);
 }
 
+// W4 prefill weight cache (ak_m1_w4_cache_build, decided and sized at load by agens-cli m1.rs, which counts it in
+// the memory plan): every W4 linear's dequantized bf16 weight resident, so a prefill chunk GEMMs the tiles straight
+// from it -- the same bf16 values and GEMM calls as the per-chunk dequantize, so the same bits.
+size_t g_w4_cache_bytes = 0;
 // Tiled W4 prefill: output rows per dequantized tile (AGENS_M1_W4_TILE_MB, default 64 MB of bf16 scratch; 0 = the
 // whole weight at once, the A1 path). Rounded down to 256 rows.
 size_t g_w4_tile_bytes = 64ull << 20;
@@ -1170,19 +1327,24 @@ int linear(const bf16* x, const char* wname, int layer, bf16* y, int m, int n, i
       return 0;
     }
     // prefill: dequantize a tile of output rows at a time into the bounded scratch S.wdq and GEMM that column tile
-    // (tiles by output row whatever the parts: the same bf16 matrix and GEMM shapes as a one-part linear)
+    // (tiles by output row whatever the parts: the same bf16 matrix and GEMM shapes as a one-part linear).
+    // With the prefill weight cache the whole dequantized weight is kept after its first use and the tiles are GEMMed
+    // straight from it: the same bf16 values and GEMM calls, so the same bits, without the per-chunk dequantize.
+    const W4Lin& tw = t;
     const int tn = w4_tile_rows(k, n);
     for (int n0 = 0; n0 < n; n0 += tn) {
       const int nt = std::min(tn, n - n0);
-      for (int j = 0; j < t.np; ++j) {
-        const W4Part& q = t.p[j];
-        const int a0 = std::max(n0, q.r0), a1 = std::min(n0 + nt, q.r0 + q.n);
-        if (a0 < a1)
-          CK(ak_wq_dequant_kt_rows(q.bits, q.wt, q.st, S.wdq + (size_t)(a0 - n0) * k, q.n, k, q.group, a0 - q.r0, a1 - a0,
-                                   S.s));
-      }
-      if (tn >= n) return ak_bf16_linear_f32reduce(x, S.wdq, y, m, n, k, S.s);
-      CK(ak_bf16_linear_f32reduce_ld(x, S.wdq, y + n0, m, nt, k, n, S.s));
+      const bf16* wsrc = tw.dq ? tw.dq + (size_t)n0 * k : S.wdq;
+      if (!tw.dq)
+        for (int j = 0; j < t.np; ++j) {
+          const W4Part& q = t.p[j];
+          const int a0 = std::max(n0, q.r0), a1 = std::min(n0 + nt, q.r0 + q.n);
+          if (a0 < a1)
+            CK(ak_wq_dequant_kt_rows(q.bits, q.wt, q.st, S.wdq + (size_t)(a0 - n0) * k, q.n, k, q.group, a0 - q.r0,
+                                     a1 - a0, S.s));
+        }
+      if (tn >= n) return ak_bf16_linear_f32reduce(x, wsrc, y, m, n, k, S.s);
+      CK(ak_bf16_linear_f32reduce_ld(x, wsrc, y + n0, m, nt, k, n, S.s));
     }
     return 0;
   }
@@ -1195,13 +1357,17 @@ int linear(const bf16* x, const char* wname, int layer, bf16* y, int m, int n, i
 // (ak_w4_gemv_kt_multi, outputs bit-identical to separate GEMVs); otherwise one linear() each.
 int linear_shared(const bf16* x, int nl, const char* const* wnames, int layer, bf16* const* ys, const int* ns, int m,
                   int k) {
-  if (m == 1 && nl <= 4) {
+  // m == 1 (decode); or m <= the batched GEMV bound with every linear in the W4H layout (one W4H launch for the
+  // segments at any m, bit-identical to separate KT GEMVs: test_w4h)
+  if (nl <= 4 && (m == 1 || (m <= g_w4_batch_max || (g_dec && m <= 128)))) {
     const W4Lin* q[4];
-    bool ok = true;
+    bool ok = true, w4h = true;
     for (int j = 0; j < nl && ok; ++j) {
       q[j] = lin_ref(layer, wnames[j]).w4;
       ok = q[j] && q[j]->np == 1 && q[j]->n == ns[j] && q[j]->k == k;
+      w4h = w4h && ok && q[j]->p[0].bits == 4 && ak_w4h_is(q[j]->p[0].wt);
     }
+    ok = ok && (m == 1 || w4h);
     if (ok) {  // one launch per (bits, group) class of the linears (mixed precision: up to 3)
       bool done[4] = {false, false, false, false};
       for (int j = 0; j < nl; ++j) {
@@ -1215,7 +1381,7 @@ int linear_shared(const bf16* x, int nl, const char* const* wnames, int layer, b
           if (done[i] || pi.bits != pj.bits || pi.group != pj.group) continue;
           wt[c] = pi.wt, st[c] = pi.st, y[c] = ys[i], nn[c] = ns[i], ++c, done[i] = true;
         }
-        CK(ak_wq_gemv_kt_multi(pj.bits, x, 1, c, wt, st, y, nn, nullptr, k, pj.group, g_w4_bf16w, S.s));
+        CK(ak_wq_gemv_kt_multi(pj.bits, x, m, c, wt, st, y, nn, nullptr, k, pj.group, g_w4_bf16w, S.s));
       }
       g_lin += nl, g_lin_w4 += nl;
       return 0;
@@ -1225,6 +1391,17 @@ int linear_shared(const bf16* x, int nl, const char* const* wnames, int layer, b
   return 0;
 }
 
+// where kda_mixer writes in_proj_b's output (b) for layer i: the verify stash (single / batched) or S.t2
+bf16* kda_b_out(int i, int T, bool prefill) {
+  const bool verify = !prefill && T > 1 && !g_B;
+  if (verify && g_BV) {
+    const size_t MR = (size_t)S.bv_max * kSpecT;
+    return S.kstb[i] + 2 * MR * KDIM + MR * KHV * KK;
+  }
+  if (verify) return S.kst[i] + 2 * (size_t)kSpecT * KDIM + (size_t)kSpecT * KHV * KK;
+  return S.t2;
+}
+bool g_b_done = false;  // the fused mHC boundary already computed this layer's in_proj_b (into kda_b_out)
 int kda_mixer(int i, const bf16* h, bf16* out, int T, bool prefill) {
   // core [T][48][128] lives in S.o (T*6144); the gated norm writes in place like sglv23 (y = x)
   bf16 *qkv = S.big0, *ag = S.t1, *b = S.t2, *fd = S.t3, *z = S.big1, *core = S.o, *nz = S.o;
@@ -1246,11 +1423,27 @@ int kda_mixer(int i, const bf16* h, bf16* out, int T, bool prefill) {
     const int ns[3] = {KDIM, KHV * KK, 128};
     CK(linear_shared(h, 3, nm, i, ys, ns, T, HID));
   }
-  CK(linear(h, "linear_attn.in_proj_b.weight", i, b, T, KHV, HID));
+  if (!g_b_done) CK(linear(h, "linear_attn.in_proj_b.weight", i, b, T, KHV, HID));
+  else if (b != kda_b_out(i, T, prefill)) return (int)cudaErrorInvalidValue;  // the boundary wrote it elsewhere
+  g_b_done = false;
   CK(linear(fd, "linear_attn.f_up.weight", i, ag, T, KHV * KK, 128));
   float* A_log = (float*)WL(i, "linear_attn.A_log.f32");
   float* dt = (float*)WL(i, "linear_attn.dt_bias.f32");
   if (getenv("AGENS_M1_TRACE")) fprintf(stderr, "kda layer %d dev %d T %d seq %d\n", i, S.dev, T, g_seq);
+  // verify: conv + recurrence + gated norm in one launch per layer (ak_kda_verify_fused; AGENS_KDA_FUSE=1; off by
+  // default: one block of 1024 threads per value head measured slower than the three launches on compute capability 9.0, tp2)
+  static const bool kfuse = getenv("AGENS_KDA_FUSE") && getenv("AGENS_KDA_FUSE")[0] == '1';
+  if (verify && kfuse && KK == 128) {
+    KdaVerifyArgs va{};
+    va.x = qkv, va.y = sc, va.conv = S.conv[i], va.conv_w = S.conv_w[i], va.ag = ag, va.b = b, va.A_log = A_log;
+    va.dt_bias = dt, va.ssm = S.ssm[i], va.slot = g_BV ? S.bv_slot : S.slot, va.g = z;
+    va.w = (const bf16*)WL(i, "linear_attn.norm.weight"), va.out = nz;
+    va.x_stride = KDIM, va.dim = KDIM, va.a_stride = KHV * KK, va.b_stride = KHV, va.H = KH, va.HV = KHV;
+    va.T = g_BV ? g_TV : T, va.scale = 1.0f / sqrtf(128.0f), va.eps = EPS;
+    const int r = ak_kda_verify_fused(&va, g_BV ? g_BV : 1, S.s);
+    if (r == 0) return linear(nz, "linear_attn.out_proj.weight", i, out, T, HID, KHV * KK);
+    if (r != (int)cudaErrorNotSupported) return r;
+  }
   if (prefill) {
     CK(ak_kda_prefill(qkv, ag, b, S.conv_w[i], A_log, dt, S.conv[i], S.ssm[i], S.slot, S.has_init, T, core, S.s));
   } else if (verify && g_BV) {  // each sequence exactly as its own verify (slots S.bv_slot)
@@ -1279,6 +1472,21 @@ int rope(int T) {
                         KVH * HD, 10000000.0f, kMropeH, kMropeW, S.s);
 }
 
+// fused attention q / k prep (ak_qk_prep; AGENS_QK_FUSE=0: the split / norm / rope / store launches)
+bool qk_fuse() {
+  static const bool on = !(getenv("AGENS_QK_FUSE") && getenv("AGENS_QK_FUSE")[0] == '0') && HD == 256 && ROT == 64;
+  return on;
+}
+int g_qk_layer = 0;  // the layer attn_mixer / attn_bv is on (qk_prep's weights and caches)
+int qk_prep(const bf16* qg, int T) {
+  const int i = g_qk_layer;
+  QkPrepArgs qa{};
+  qa.qg = qg, qa.q = S.q, qa.gate = S.gate, qa.k = S.k, qa.v = S.v, qa.kc = S.kc[i], qa.vc = S.vc[i], qa.loc = S.loc;
+  qa.wq = (const bf16*)WL(i, "self_attn.q_norm.weight"), qa.wk = (const bf16*)WL(i, "self_attn.k_norm.weight");
+  qa.cache = (const float*)S.rope, qa.pos = (const int64_t*)S.rpos, qa.pstride = S.rmax;
+  qa.T = T, qa.nq = QH, qa.nk = KVH, qa.sec_h = kMropeH, qa.sec_w = kMropeW, qa.eps = EPS, qa.theta = 10000000.0f;
+  return ak_qk_prep(&qa, S.s);
+}
 // AGENS_KV_INT8_DENSE=fake (quality gate input, no memory saved): the dense layer's new K/V rows quantized to INT8 per
 // (token, head) and dequantized in place with the INT8 KV kernels (ak_kv_quant_store / ak_kv_dequant_rows) before
 // they are stored, so every read sees exactly what an INT8 dense KV would hold
@@ -1296,13 +1504,19 @@ int fake_int8_rows(bf16* x, int T) {
 
 int attn_mixer(int i, const bf16* h, bf16* out, int T, bool prefill, bool bcsa) {
   bf16* qg = S.big0;
+  g_qk_layer = i;
   {
     const char* nm[3] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"};
     bf16* ys[3] = {qg, S.k, S.v};
     const int ns[3] = {QH * 2 * HD, KVH * HD, KVH * HD};
     CK(linear_shared(h, 3, nm, i, ys, ns, T, HID));
   }
-  split_q_gate<<<grid((long)T * QH * HD), 256, 0, S.s>>>(qg, S.q, S.gate, T, QH);
+  // KV tiering / INT8 KV (m1_kv.h): BCSA layers only, AGENS_KV_TIER / AGENS_KV_INT8; off = the code below unchanged
+  const bool kvm = bcsa && m1kv::on();
+  // decode / verify with the plain KV store: q / k prep + store in one launch (ak_qk_prep, bit-identical)
+  const bool qkf = qk_fuse() && !prefill && !kvm && (bcsa || !(m1d8::on() || dense_int8_fake())) && !getenv("AGENS_M1_DBG_DIR");
+  if (qkf) CK(qk_prep(qg, T));
+  else split_q_gate<<<grid((long)T * QH * HD), 256, 0, S.s>>>(qg, S.q, S.gate, T, QH);
   auto dbg_here = [&]() {
     const char* dd = getenv("AGENS_M1_DBG_DIR");
     const char* dl = getenv("AGENS_M1_DBG_LAYER");
@@ -1317,12 +1531,12 @@ int attn_mixer(int i, const bf16* h, bf16* out, int T, bool prefill, bool bcsa) 
     if (f) { fwrite(b.data(), 2, n, f); fclose(f); }
   };
   if (const char* dd = dbg_here()) { dsave(dd, "qg", qg, QH * 2 * HD); dsave(dd, "q_pre", S.q, QH * HD); dsave(dd, "h", h, HID); }
-  CK(ak_rmsnorm(S.q, WL(i, "self_attn.q_norm.weight"), S.q, T * QH, HD, HD, HD, EPS, 1, S.s));
-  if (const char* dd = dbg_here()) dsave(dd, "q_normed", S.q, QH * HD);
-  CK(ak_rmsnorm(S.k, WL(i, "self_attn.k_norm.weight"), S.k, T * KVH, HD, HD, HD, EPS, 1, S.s));
-  CK(rope(T));
-  // KV tiering / INT8 KV (m1_kv.h): BCSA layers only, AGENS_KV_TIER / AGENS_KV_INT8; off = the code below unchanged
-  const bool kvm = bcsa && m1kv::on();
+  if (!qkf) {
+    CK(ak_rmsnorm(S.q, WL(i, "self_attn.q_norm.weight"), S.q, T * QH, HD, HD, HD, EPS, 1, S.s));
+    if (const char* dd = dbg_here()) dsave(dd, "q_normed", S.q, QH * HD);
+    CK(ak_rmsnorm(S.k, WL(i, "self_attn.k_norm.weight"), S.k, T * KVH, HD, HD, HD, EPS, 1, S.s));
+    CK(rope(T));
+  }
   // graph-safe tiered decode: store / window / far branch read positions, rows and ranges from device memory
   const bool kvg = kvm && !prefill && dev_attn() && far_engine() && m1kv::graph_safe();
   const m1kv::Ctx kx{(int)(SP - SD), i, g_sess[g_cur].kslot, g_seq, T, prefill, S.s, S.r2t, S.Wctx, S.rows};
@@ -1333,7 +1547,7 @@ int attn_mixer(int i, const bf16* h, bf16* out, int T, bool prefill, bool bcsa) 
       CK(m1kv::store_dec(kx, S.k + (size_t)t * KVH * HD, S.v + (size_t)t * KVH * HD, S.loc + t, S.pos + t));
   } else if (kvm) CK(m1kv::store(kx, S.k, S.v, S.loc));
   else if (!bcsa && m1d8::on()) CK(m1d8::store(S.k, S.v, S.loc, T, S.s));  // INT8 dense KV
-  else {
+  else if (!qkf) {
     if (!bcsa && dense_int8_fake()) {  // quality probe: the dense layer's K/V as an INT8 KV would serve them
       CK(fake_int8_rows(S.k, T));
       CK(fake_int8_rows(S.v, T));
@@ -1422,7 +1636,9 @@ int attn_mixer(int i, const bf16* h, bf16* out, int T, bool prefill, bool bcsa) 
       save("q", S.q, QH * HD); save("k", S.k, KVH * HD); save("v", S.v, KVH * HD); save("o_loc", S.o, QH * HD);
     }
   }
-  if (bcsa) {
+  // decode / verify with every query in the window (no far branch): the index queries and the scaled lse are unused
+  static const bool near_skip = !(getenv("AGENS_BCSA_NEAR_SKIP") && getenv("AGENS_BCSA_NEAR_SKIP")[0] == '0');
+  if (bcsa && !(near_skip && !prefill && seq_after <= WIN)) {
     scale_f32<<<(T * QH + 255) / 256, 256, 0, S.s>>>(S.lse, T * QH, 0.6931471805599453f);
     if (!kv_far_dec && !far_multi) {
       CK(linear(h, "self_attn.idx_q.weight", i, S.qi, T, IDXH * IDXD, HID));
@@ -1431,6 +1647,16 @@ int attn_mixer(int i, const bf16* h, bf16* out, int T, bool prefill, bool bcsa) 
     if (prefill && kvm) {
       CK(m1kv::far_extend(kx, S.qi, S.q, S.o, S.lse, S.idx[i], S.blk[i], S.t3));
       CK(m1kv::commit_chunk(kx));
+      attn_out = S.t3;
+    } else if (prefill && S.fx_ws) {  // engine kernels: block means of the far blocks, then select + fused attend
+      const long long m = (long long)seq_after - 1 - WIN - 3;
+      const int nb = m >= 0 ? (int)(m / 4 + 1) : 0;
+      if (nb > 0) {
+        CK(ak_kv_block_mean(S.kc[i], S.r2t, nb, KVH * HD, S.fx_kb, nullptr, 0, 0, S.s));
+        CK(ak_kv_block_mean(S.vc[i], S.r2t, nb, KVH * HD, S.fx_vb, nullptr, 0, 0, S.s));
+      }
+      CK(ak_far_extend_engine(T, g_seq, S.qi, S.q, S.o, S.lse, S.r2t, S.Wctx, S.fx_kb, S.fx_vb, S.idx[i], S.blk[i], S.rows,
+                              S.fx_ws, S.t3, S.s));
       attn_out = S.t3;
     } else if (prefill) {
       CK(ak_bridge_far_extend(S.qi, S.q, S.o, S.lse, seq_after, T, 0, S.r2t, 1, S.Wctx, S.kc[i], S.vc[i], S.idx[i],
@@ -1622,17 +1848,22 @@ int attn_bv(int i, const bf16* h, bf16* out, bool bcsa) {
     return e;
   }
   bf16* qg = S.big0;
+  g_qk_layer = i;
   {
     const char* nm[3] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"};
     bf16* ys[3] = {qg, S.k, S.v};
     const int ns[3] = {QH * 2 * HD, KVH * HD, KVH * HD};
     CK(linear_shared(h, 3, nm, i, ys, ns, R, HID));
   }
-  split_q_gate<<<grid((long)R * QH * HD), 256, 0, S.s>>>(qg, S.q, S.gate, R, QH);
-  CK(ak_rmsnorm(S.q, WL(i, "self_attn.q_norm.weight"), S.q, R * QH, HD, HD, HD, EPS, 1, S.s));
-  CK(ak_rmsnorm(S.k, WL(i, "self_attn.k_norm.weight"), S.k, R * KVH, HD, HD, HD, EPS, 1, S.s));
-  CK(rope(R));
-  store_kv<<<grid((long)R * KVH * HD), 256, 0, S.s>>>(S.k, S.v, S.kc[i], S.vc[i], S.loc, R, KVH);
+  if (qk_fuse()) {
+    CK(qk_prep(qg, R));
+  } else {
+    split_q_gate<<<grid((long)R * QH * HD), 256, 0, S.s>>>(qg, S.q, S.gate, R, QH);
+    CK(ak_rmsnorm(S.q, WL(i, "self_attn.q_norm.weight"), S.q, R * QH, HD, HD, HD, EPS, 1, S.s));
+    CK(ak_rmsnorm(S.k, WL(i, "self_attn.k_norm.weight"), S.k, R * KVH, HD, HD, HD, EPS, 1, S.s));
+    CK(rope(R));
+    store_kv<<<grid((long)R * KVH * HD), 256, 0, S.s>>>(S.k, S.v, S.kc[i], S.vc[i], S.loc, R, KVH);
+  }
   const float scale = 1.0f / 16.0f;
   if (bcsa) {
     CK(linear(h, "self_attn.idx_k.weight", i, S.ik, R, IDXD, HID));
@@ -1643,10 +1874,10 @@ int attn_bv(int i, const bf16* h, bf16* out, bool bcsa) {
   CK(ak_attn_decode_multi(bcsa ? MSLOT_BVWIN : MSLOT_BVDENSE, S.q, S.kc[i], S.vc[i], QH, KVH, scale, S.o, S.lse, S.s));
   bf16* attn_out = S.o;
   if (bcsa) {
-    scale_f32<<<(R * QH + 255) / 256, 256, 0, S.s>>>(S.lse, R * QH, 0.6931471805599453f);
     bool any = false;
     for (int b = 0; b < B; ++b) any |= g_bv_reg[b] != 0;
-    if (any) {
+    if (any) {  // (the scaled lse is read by the far branch only)
+      scale_f32<<<(R * QH + 255) / 256, 256, 0, S.s>>>(S.lse, R * QH, 0.6931471805599453f);
       CK(linear(h, "self_attn.idx_q.weight", i, S.qi, R, IDXH * IDXD, HID));
       CK(ak_rmsnorm(S.qi, WL(i, "self_attn.idx_norm.weight"), S.qi, R * IDXH, IDXD, IDXD, IDXD, EPS, 1, S.s));
       for (int b = 0; b < B; ++b) {
@@ -1682,17 +1913,40 @@ bool fuse_on() {
   static const int on = [] { const char* e = getenv("AGENS_M1_FUSE"); return !(e && e[0] == '0'); }();
   return on;
 }
+// AGENS_TP_AR_FUSE=0: the mixer all-reduce and the add + norm after it as separate launches (default: one, tp_ar.cu)
+bool tp_ar_fuse_on() {
+  static const int on = [] { const char* e = getenv("AGENS_TP_AR_FUSE"); return !(e && e[0] == '0'); }();
+  return on;
+}
+// mHC res . H on the MMA kernel (ak_bf16_bmm44, bitwise = cuBLAS's bmm: tools/test_bmm44.py); AGENS_M1_BMM44=0: cuBLAS
+bool bmm44_on() {
+  static const int on = [] { const char* e = getenv("AGENS_M1_BMM44"); return !(e && e[0] == '0'); }();
+  return on;
+}
 const bf16* g_yb = nullptr;  // the layer's mlp output when its last residual add is left to the combine
+bool g_prenormed = false;  // the fused mHC boundary (ak_mhc_fused) already wrote the input norm of this layer into S.t0
+bool g_mlp_ar_fused = false;  // this layer's MLP all-reduce is left to the fused mHC boundary after it (ak_mhc_fused_ar)
 int layer(int i, int T, bool prefill) {
   bf16 *h = S.t0, *a = S.t1;
-  CK(ak_rmsnorm(S.xin, WL(i, "input_layernorm.weight"), h, T, HID, HID, HID, EPS, 1, S.s));
+  if (!g_prenormed) CK(ak_rmsnorm(S.xin, WL(i, "input_layernorm.weight"), h, T, HID, HID, HID, EPS, 1, S.s));
+  g_prenormed = false;
   if (kMixer[i] == 'k') CK(kda_mixer(i, h, a, T, prefill));
   else if (g_BV) CK(attn_bv(i, h, a, kMixer[i] == 'b'));
   else if (g_B && g_bdev) CK(attn_batch(i, h, a, kMixer[i] == 'b'));
   else if (g_B) CK(attn_rows(i, h, a, kMixer[i] == 'b'));
   else CK(attn_mixer(i, h, a, T, prefill, kMixer[i] == 'b'));
-  if (g_tp > 1) CK(ak_tp_allreduce(a, (long)T * HID, S.s));  // the ranks' head shares of the mixer output
-  if (const char* dd = g_B ? nullptr : getenv("AGENS_M1_DUMP_DIR")) {  // debug: attention mixer output (sglv23 dump's att{i})
+  // the ranks' head shares of the mixer output: summed here, or (push path, peer GPUs) by the fused all-reduce + residual
+  // add + post-attention norm below (same bits; AGENS_TP_AR_FUSE=0: separate launches)
+  const char* dump_dir = g_B ? nullptr : getenv("AGENS_M1_DUMP_DIR");
+  bool ar_fused = false;
+  bf16* h2 = S.y;
+  if (g_tp > 1 && fuse_on() && tp_ar_fuse_on() && !dump_dir) {
+    const int r = ak_tp_allreduce_add_rmsnorm(a, S.xin, h2, WL(i, "post_attention_layernorm.weight"), h, T, HID, EPS, 1, S.s);
+    if (r != (int)cudaErrorNotSupported) CK(r);
+    ar_fused = r == 0;
+  }
+  if (g_tp > 1 && !ar_fused) CK(ak_tp_allreduce(a, (long)T * HID, S.s));
+  if (const char* dd = dump_dir) {  // debug: attention mixer output (sglv23 dump's att{i})
     if (kMixer[i] != 'k') {
       std::vector<uint16_t> hbuf((size_t)T * HID);
       cudaMemcpyAsync(hbuf.data(), a, hbuf.size() * 2, cudaMemcpyDeviceToHost, S.s);
@@ -1702,8 +1956,8 @@ int layer(int i, int T, bool prefill) {
       if (f) { fwrite(hbuf.data(), 2, hbuf.size(), f); fclose(f); }
     }
   }
-  bf16* h2 = S.y;
-  if (fuse_on()) {  // x + mixer and the post-attention norm in one launch (same bits)
+  if (ar_fused) {
+  } else if (fuse_on()) {  // x + mixer and the post-attention norm in one launch (same bits)
     CK(ak_add_rmsnorm(S.xin, a, h2, WL(i, "post_attention_layernorm.weight"), h, T, HID, EPS, 1, S.s));
   } else {
     CK(ak_bf16_binary(S.xin, a, h2, (long)T * HID, 0, S.s));                         // x + mixer
@@ -1712,7 +1966,8 @@ int layer(int i, int T, bool prefill) {
   CK(linear(h, "mlp.gate_up_proj.weight", i, S.gu, T, 2 * INTER, HID));
   CK(ak_silu_mul(S.gu, S.act, T, INTER, S.s));
   CK(linear(S.act, "mlp.down_proj.weight", i, a, T, HID, INTER));
-  if (g_tp > 1) CK(ak_tp_allreduce(a, (long)T * HID, S.s));  // the ranks' INTER shares of the MLP output
+  // the ranks' INTER shares of the MLP output (g_mlp_ar_fused: summed by the fused mHC boundary after this layer)
+  if (g_tp > 1 && !g_mlp_ar_fused) CK(ak_tp_allreduce(a, (long)T * HID, S.s));
   g_yb = nullptr;
   if (fuse_on() && i != kEngramLayer[0] && i != kEngramLayer[1]) {
     g_yb = a;  // + mlp: folded into the mHC combine (S.y = x + mixer, a = mlp)
@@ -1788,7 +2043,10 @@ int forward(const int* ids_host, int T, bool prefill, int* next) {
   CK(run_model(T, prefill));
   if (prefill && g_capture && m1draft::ready() && T <= S.cap_rows && g_ndev == 1) {
     m1draft::set_ring(ss.kslot);  // the session's drafter context (one ring per KDA slot with batched speculation)
-    CK(m1draft::materialize(draft_target(), S.cap, T, nullptr, S.pos));
+    // a chunk longer than the drafter's 4096-position ring: only its last 4096 positions are kept (per-token KV, so the
+    // same entries; one launch would race on ring slots p and p + 4096)
+    const int skip = T > 4096 ? T - 4096 : 0;
+    CK(m1draft::materialize(draft_target(), S.cap + (size_t)skip * kCapLayers * HID, T - skip, nullptr, S.pos + skip));
   }
   if (m1mtp::ready() && g_ndev == 1) {  // MTP context entries of the forwarded rows (in passes of max_rows)
     m1mtp::set_ring(ss.kslot);
@@ -1877,7 +2135,30 @@ bool lmh_bf16() {  // a bf16 or W4 (AGENS_M1_LMHEAD_W4) head through linear(); e
   static const bool b = W.count("lm_head.weight") > 0 || W4M.count("lm_head.weight") > 0;
   return b;
 }
+// Tensor parallel, bf16 head on the batch-invariant GEMV (AGENS_TP_VOCAB=0: off): every rank computes its 1 / tp of the
+// vocabulary straight into the full logits rows and zeroes the other ranks' columns; the all-reduce then assembles the
+// rows (x + 0 is exact, and each output column's GEMV is independent of n and of the row offset: the same bits as the
+// replicated head, but half the head's bytes read per rank). The full head stays registered (drafter / MTP use it).
+bool tp_vocab(int m) {
+  static const bool on = !(getenv("AGENS_TP_VOCAB") && getenv("AGENS_TP_VOCAB")[0] == '0');
+  return on && g_tp > 1 && VOCAB % (16 * g_tp) == 0 && g_bi && (m <= 16 || (g_dec && m <= 128)) &&
+         (long)m * VOCAB <= (long)g_chunk * HID;  // the all-reduce slot holds a prefill chunk of hidden rows
+}
 int lm_head(const bf16* x, bf16* y, int m) {
+  if (lmh_bf16() && tp_vocab(m)) {
+    const LinRef& r = lin_ref(-1, "lm_head.weight");
+    if (r.bf16) {
+      const int vs = VOCAB / g_tp;
+      const size_t pitch = (size_t)VOCAB * sizeof(bf16);
+      if (g_rank > 0) CK(cudaMemset2DAsync(y, pitch, 0, (size_t)g_rank * vs * sizeof(bf16), m, S.s));
+      if (g_rank + 1 < g_tp)
+        CK(cudaMemset2DAsync(y + (size_t)(g_rank + 1) * vs, pitch, 0, (size_t)(g_tp - 1 - g_rank) * vs * sizeof(bf16), m, S.s));
+      ++g_lin;
+      CK(ak_bf16_gemv_bi_ld(x, static_cast<const bf16*>(r.bf16) + (size_t)g_rank * vs * HID, nullptr, y + (size_t)g_rank * vs,
+                            m, vs, HID, VOCAB, S.s));
+      return ak_tp_allreduce(y, (long)m * VOCAB, S.s);
+    }
+  }
   if (lmh_bf16()) return linear(x, "lm_head.weight", -1, y, m, VOCAB, HID);
   for (int r = 0; r < m; r += 16)
     CK(ak_i8_gemv(x + (size_t)r * HID, WG("lm_head.weight.i8"), WG("lm_head.weight.scale"), y + (size_t)r * VOCAB,
@@ -1906,6 +2187,11 @@ int run_model(int T, bool prefill, int R) {
   broadcast_streams<<<grid((long)T * NS * HID), 256, 0, S.s>>>(S.t0, S.H, T);
   cudaMemcpyAsync(S.hmean, S.t0, (size_t)T * HID * 2, cudaMemcpyDeviceToDevice, S.s);
   bf16 *H = S.H, *Hn = S.H2, *hm = S.hmean, *hmn = S.hmean2;
+  // fused mHC layer boundaries (AGENS_MHC_FUSE=0: off): the batch-invariant decode / verify rows, one device per process
+  static const bool fuse_env = !(getenv("AGENS_MHC_FUSE") && getenv("AGENS_MHC_FUSE")[0] == '0');
+  const bool fuse_mhc = fuse_env && HID == 5120 && g_ndev == 1 && g_bi && (T <= 16 || (g_dec && T <= 128)) &&
+                        !getenv("AGENS_M1_DUMP_DIR") && ak_mhc_fused_ok();
+  bool pre_done = false, pre_fused = false;
   for (int i = 0; i < NL; ++i) {
     if (i > 0 && dev_of(i) != dev_of(i - 1)) {  // pipeline hand-off: residual streams + their mean to the next device
       State& from = *SP;
@@ -1923,16 +2209,19 @@ int run_model(int T, bool prefill, int R) {
       g_seg_capture->push_back(g);
       CK(cudaStreamBeginCapture(S.s, cudaStreamCaptureModeThreadLocal));
     }
-    if (g_capture && T <= S.cap_rows)
-      for (int c = 0; c < kCapLayers; ++c)
-        if (g_cap_layer[c] == i)  // drafter context feature c: residual stream 0 at this layer's entry
-          CK(cudaMemcpy2DAsync(S.cap + (size_t)c * HID, (size_t)kCapLayers * HID * 2, H, (size_t)NS * HID * 2,
-                               (size_t)HID * 2, T, cudaMemcpyDeviceToDevice, S.s));
-    CK(ak_rmsnorm(hm, WM(i, "norm.weight"), S.nrm, T, HID, HID, HID, EPS, 0, S.s));
-    if (g_bi && (T <= 16 || (g_dec && T <= 128))) CK(ak_bf16_gemv_bi(S.nrm, WM(i, "dyn.weight"), nullptr, S.d, T, 24, HID, S.s));
-    else CK(bf16_lin(S.nrm, WM(i, "dyn.weight"), S.d, T, 24, HID));
-    CK(ak_mhc_mix(S.d, 24, WM(i, "pre_static"), WM(i, "post_static"), WM(i, "res_static"), H, NS * HID, HID, S.xin,
-                  HID, S.post, S.res, T, HID, 10, S.s));
+    if (!pre_done) {
+      if (g_capture && T <= S.cap_rows)
+        for (int c = 0; c < kCapLayers; ++c)
+          if (g_cap_layer[c] == i)  // drafter context feature c: residual stream 0 at this layer's entry
+            CK(cudaMemcpy2DAsync(S.cap + (size_t)c * HID, (size_t)kCapLayers * HID * 2, H, (size_t)NS * HID * 2,
+                                 (size_t)HID * 2, T, cudaMemcpyDeviceToDevice, S.s));
+      CK(ak_rmsnorm(hm, WM(i, "norm.weight"), S.nrm, T, HID, HID, HID, EPS, 0, S.s));
+      if (g_bi && (T <= 16 || (g_dec && T <= 128))) CK(ak_bf16_gemv_bi(S.nrm, WM(i, "dyn.weight"), nullptr, S.d, T, 24, HID, S.s));
+      else CK(bf16_lin(S.nrm, WM(i, "dyn.weight"), S.d, T, 24, HID));
+      CK(ak_mhc_mix(S.d, 24, WM(i, "pre_static"), WM(i, "post_static"), WM(i, "res_static"), H, NS * HID, HID, S.xin,
+                    HID, S.post, S.res, T, HID, 10, S.s));
+    }
+    pre_done = false;
     if (const char* dd = getenv("AGENS_M1_DUMP_DIR")) {  // debug: layer inputs (sglv23 VOLUNDR_DUMP's in{i})
       std::vector<uint16_t> hbuf((size_t)T * HID);
       cudaMemcpyAsync(hbuf.data(), S.xin, hbuf.size() * 2, cudaMemcpyDeviceToHost, S.s);
@@ -1941,8 +2230,46 @@ int run_model(int T, bool prefill, int R) {
       FILE* f = fopen(fn.c_str(), "wb");
       if (f) { fwrite(hbuf.data(), 2, hbuf.size(), f); fclose(f); }
     }
+    g_prenormed = pre_fused;
+    // the MLP all-reduce joins the boundary when it gets fused with the combine's residual add (not the Engram layers,
+    // whose add comes first) and the push path takes T rows
+    g_mlp_ar_fused = fuse_mhc && g_tp > 1 && i + 1 < NL && fuse_on() && i != kEngramLayer[0] && i != kEngramLayer[1] &&
+                     ak_mhc_fused_ar_ok(T);
     CK(layer(i, T, prefill));
+    pre_fused = false;
+    if (fuse_mhc && i + 1 < NL && dev_of(i + 1) == dev_of(i)) {
+      // layer i's bmm + combine and layer i + 1's norm / dyn / mix / input norm in one launch (bit-identical)
+      MhcFusedArgs fa{};
+      fa.dcur = S.d, fa.res_s_cur = (const bf16*)WM(i, "res_static");
+      fa.Hold = H, fa.post = S.post, fa.Y = S.y, fa.Yb = g_yb, fa.Xi = S.xin;
+      fa.Hn = Hn, fa.hmn = hmn, fa.cap = nullptr, fa.cap_ld = (long)kCapLayers * HID;
+      if (g_capture && T <= S.cap_rows)
+        for (int c = 0; c < kCapLayers; ++c)
+          if (g_cap_layer[c] == i + 1) fa.cap = S.cap + (size_t)c * HID;
+      fa.wn = (const bf16*)WM(i + 1, "norm.weight"), fa.wdyn = (const bf16*)WM(i + 1, "dyn.weight");
+      fa.pre_s = (const bf16*)WM(i + 1, "pre_static"), fa.post_s = (const bf16*)WM(i + 1, "post_static");
+      fa.res_s = (const bf16*)WM(i + 1, "res_static"), fa.wln = (const bf16*)WL(i + 1, "input_layernorm.weight");
+      fa.d = S.d, fa.xin = S.xin, fa.post_o = S.post, fa.res_o = S.res, fa.h = S.t0, fa.eps = EPS, fa.iters = 10;
+      fa.write_res = i + 2 >= NL;  // the last layer's bmm is not fused: it reads S.res
+      if (kMixer[i + 1] == 'k' && KHV <= 48 && !(getenv("AGENS_MHC_FUSE_B") && getenv("AGENS_MHC_FUSE_B")[0] == '0')) {
+        const LinRef& rb = lin_ref(i + 1, "linear_attn.in_proj_b.weight");  // bf16 in the INT4 recipe (fake-quantized)
+        if (rb.bf16 && !rb.w4) fa.wb = (const bf16*)rb.bf16, fa.nb_out = KHV, fa.bout = kda_b_out(i + 1, T, prefill);
+      }
+      if (g_mlp_ar_fused) {
+        if (!g_yb) return (int)cudaErrorInvalidValue;  // layer() left the residual add to the combine (fuse_on)
+        CK(ak_mhc_fused_ar(&fa, T, S.s));
+        g_mlp_ar_fused = false;
+      } else {
+        CK(ak_mhc_fused(&fa, T, S.s));
+      }
+      pre_done = pre_fused = true;
+      g_b_done = fa.wb != nullptr;
+      std::swap(H, Hn);
+      std::swap(hm, hmn);
+      continue;
+    }
     if (g_bi && (T <= 16 || (g_dec && T <= 128))) CK(ak_bf16_bmm_bi(S.res, H, S.mixed, T, NS, NS, HID, S.s));
+    else if (bmm44_on()) CK(ak_bf16_bmm44(S.res, H, S.mixed, T, HID, S.s));  // same bits as the cuBLAS bmm
     else CK(ak_bf16_bmm(S.res, H, S.mixed, T, NS, NS, HID, S.s));
     if (g_yb)
       CK(ak_mhc_combine_add(S.mixed, NS * HID, HID, S.post, S.y, g_yb, HID, S.xin, HID, Hn, NS * HID, HID,
@@ -2145,23 +2472,60 @@ int decode1(int token, int* next) {
 // replayed over the n accepted tokens from the stashed verify inputs (the verify itself never writes the state),
 // Engram pair -- all on device, so the step is one graph per (session, regime). The host frees the KV rows of the
 // rejected tokens after reading n. Regimes: 0 near (no query takes the far branch), 1 far (all do), 2 mixed (eager).
+int g_draft_nsl = 0;  // shortlist head rows (ak_m1_draft_vocab; "lm_head.weight.draftsl" / "lm_head.draftsl.ids")
+bool g_draft_sl_drafter = false;  // the DFlash2 drafter's candidates from it too
+void set_draft_sl(m1draft::Target& t) {
+  if (g_draft_nsl > 0 && W.count("lm_head.weight.draftsl") && W.count("lm_head.draftsl.ids"))
+    t.sl_head = W["lm_head.weight.draftsl"], t.sl_ids = (const int*)W["lm_head.draftsl.ids"], t.nsl = g_draft_nsl,
+    t.sl_drafter = g_draft_sl_drafter;
+}
 m1draft::Target draft_target() {
   // the INT8 head when it is registered (AGENS_M1_LMHEAD_INT8=1, or =draft beside the bf16 head in native mode)
   static const bool i8_draft = [] {
     const char* e = getenv("AGENS_M1_LMHEAD_INT8");
     return W.count("lm_head.weight.i8") > 0 && !(e && !strcmp(e, "cmp"));
   }();
-  if (!lmh_bf16() || i8_draft)
-    return m1draft::Target{S.s, WG("model.language_model.embed_tokens.weight"), nullptr, VOCAB_VALID,
-                           WG("lm_head.weight.i8"), (const float*)WG("lm_head.weight.scale")};
+  if (!lmh_bf16() || i8_draft) {
+    m1draft::Target t{S.s, WG("model.language_model.embed_tokens.weight"), nullptr, VOCAB_VALID,
+                      WG("lm_head.weight.i8"), (const float*)WG("lm_head.weight.scale")};
+    set_draft_sl(t);
+    return t;
+  }
   m1draft::Target t{S.s, WG("model.language_model.embed_tokens.weight"), lin_ref(-1, "lm_head.weight").bf16,
                     VOCAB_VALID};
   if (auto it = W4M.find("lm_head.weight.w4draft"); it != W4M.end()) t.lm_head_w4 = it->second.p[0].wt, t.lm_head_w4s = it->second.p[0].st;
+  set_draft_sl(t);
   return t;
+}
+// every KDA layer's commit in one launch (ak_kda_commit_all; AGENS_KDA_COMMIT_ALL=0: per layer). stash(i) -> the layer's
+// stash base and rows: single sequence (S.kst, kSpecT rows) or batched (S.kstb, bv_max * kSpecT rows)
+bool commit_all(bool batched, int B) {
+  static const bool on = !(getenv("AGENS_KDA_COMMIT_ALL") && getenv("AGENS_KDA_COMMIT_ALL")[0] == '0');
+  if (!on || KK != 128) return false;
+  static KdaCommitArgs ca;  // ~4.7 KB: kept off the stack
+  ca = KdaCommitArgs{};
+  const size_t MR = batched ? (size_t)S.bv_max * kSpecT : (size_t)kSpecT;
+  int n = 0;
+  for (int i = 0; i < NL; ++i) {
+    if (kMixer[i] != 'k') continue;
+    if (n == kKdaCommitMaxLayers) return false;
+    bf16* st = batched ? S.kstb[i] : S.kst[i];
+    KdaCommitLayer& L = ca.L[n++];
+    L.sq = st, L.sc = st + MR * KDIM, L.sa = L.sc + MR * KDIM, L.sb = L.sa + MR * KHV * KK;
+    L.conv = S.conv[i], L.conv_w = S.conv_w[i], L.ssm = S.ssm[i];
+    L.A_log = (const float*)WL(i, "linear_attn.A_log.f32"), L.dt_bias = (const float*)WL(i, "linear_attn.dt_bias.f32");
+  }
+  ca.nl = n, ca.conv_dim = KDIM, ca.a_stride = KHV * KK, ca.b_stride = KHV, ca.H = KH, ca.HV = KHV;
+  ca.scale = 1.0f / sqrtf(128.0f);
+  ca.T = batched ? g_TV : kSpecT;
+  ca.slot = batched ? S.bv_slot : S.slot;
+  ca.n_dev = batched ? S.bv_res : S.vres, ca.n_stride = batched ? kBVRes : 0;
+  return ak_kda_commit_all(&ca, batched ? B : 1, S.s) == 0;
 }
 int spec_commit() {
   const float scale = 1.0f / sqrtf(128.0f);
-  for (int i = 0; i < NL; ++i) {
+  const bool all = commit_all(false, 1);
+  for (int i = 0; i < NL && !all; ++i) {
     if (kMixer[i] != 'k') continue;
     bf16* st = S.kst[i];
     bf16 *sq = st, *sc = st + (size_t)kSpecT * KDIM, *sa = sc + (size_t)kSpecT * KDIM, *sb = sa + (size_t)kSpecT * KHV * KK;
@@ -2212,6 +2576,28 @@ int mtp_steps() {
   const int n = e ? atoi(e) : (m1draft::ready() ? 4 : kSpecT - 1);
   return n < 1 ? 1 : (n > kSpecT - 1 ? kSpecT - 1 : n);
 }
+// segmented verify graphs: close the capture's current segment here and continue in a new one (same stream order).
+// AGENS_M1_GRAPH_SPLIT_DRAFT=1: a segment ends after the drafting, so the GPU starts on a small first graph launch
+// instead of waiting for the host to submit the drafter + the first quarter of the layers.
+void seg_split_draft() {
+  static const bool on = [] { const char* e = getenv("AGENS_M1_GRAPH_SPLIT_DRAFT"); return e && e[0] == '1'; }();
+  if (!on || !g_seg_capture) return;
+  cudaGraph_t g = nullptr;
+  if (cudaStreamEndCapture(S.s, &g) != cudaSuccess) return;
+  g_seg_capture->push_back(g);
+  cudaStreamBeginCapture(S.s, cudaStreamCaptureModeThreadLocal);
+}
+bool g_vpen = false;  // this verify's session has penalties (verify1; baked into its graphs: part of their key)
+// a sequence's penalty block (samp_pos prm[12..19]) from its session
+void put_pen(int* q, const Session& ss) {
+  memset(q, 0, 8 * sizeof(int));
+  if (!ss.pen) return;
+  q[0] = 1 | (ss.pen_bias_on ? 2 : 0);
+  memcpy(q + 1, &ss.pen_rep, 4), memcpy(q + 2, &ss.pen_freq, 4), memcpy(q + 3, &ss.pen_pres, 4);
+  const unsigned long long c = (unsigned long long)ss.pen_cnt, b = (unsigned long long)ss.pen_bias;
+  q[4] = (int)(unsigned)(c & 0xffffffffu), q[5] = (int)(unsigned)(c >> 32);
+  q[6] = (int)(unsigned)(b & 0xffffffffu), q[7] = (int)(unsigned)(b >> 32);
+}
 int verify_body(int T, bool draft) {
   CK(cudaMemcpyAsync(S.step_d, S.step_h, kStepInts * sizeof(int), cudaMemcpyHostToDevice, S.s));
   if (draft) {
@@ -2219,12 +2605,14 @@ int verify_body(int T, bool draft) {
     apply_hint<<<1, 32, 0, S.s>>>(S.step_d);
     // MTP chain (hybrid drafting: host proposal, then MTP through it, then the DFlash2 drafts in the slots beyond)
     if (m1mtp::ready()) CK(m1mtp::propose(draft_target(), S.step_d, mtp_steps()));
+    seg_split_draft();
   }
   verify_step_prep<<<1, kSpecT, 0, S.s>>>(S.step_d, S.ids, S.pos, S.loc, S.outloc, S.r2t, S.rng, S.rpos, S.rmax);
   engram_rows_extend<<<1, 128, 0, S.s>>>(S.ids, S.pos, T, S.prev, S.r2, S.r3);
   CK(plan_verify(T));
   CK(run_model(T, false));
-  if (g_temp > 0.f) {  // sampled accept over the request's filtered distribution (temperature, top-k / top-p / min-p)
+  if (g_temp > 0.f || g_vpen) {  // sampled accept over the request's filtered distribution (temperature, top-k / top-p /
+                                  // min-p), or any accept with penalties (the penalised argmax / distribution)
     samp_pos<<<T, 1024, 0, S.s>>>(S.big0, VOCAB, VOCAB_VALID, S.ids, T, S.step_d + 32, 0, S.tok, S.samp_scr);
     samp_chain<<<1, 32, 0, S.s>>>(S.ids, 1, T, S.samp_scr, S.vres, 0);
   } else
@@ -2267,6 +2655,8 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
   S.step_h[0] = T, S.step_h[1] = g_seq, S.step_h[18] = g_spec_step++, S.step_h[19] = g_seed;
   memcpy(&S.step_h[32], &g_temp, 4), S.step_h[33] = g_topk, memcpy(&S.step_h[34], &g_topp, 4), memcpy(&S.step_h[35], &g_minp, 4);
   S.step_h[36] = S.step_h[19], S.step_h[37] = S.step_h[18];  // samp_pos parameter block: seed, step
+  put_pen(S.step_h + 32 + 12, ss);
+  g_vpen = ss.pen;
   S.step_h[kStepDelta] = ss.rdelta;
   S.step_h[20] = draft ? g_hint_n : 0;
   for (int t = 0; t < kSpecT - 1; ++t) S.step_h[21 + t] = t < g_hint_n ? g_hint[t] : 0;
@@ -2283,7 +2673,7 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
     S.step_h[2 + t] = draft ? (t == 0 ? *n_out : 0) : (t < T ? tokens[t] : 0), S.step_h[10 + t] = t < T ? rows[t] : 0;
   const int regime = g_seq + T <= WIN ? 0 : (g_seq + 1 > WIN ? 1 : 2);
   const int d8t = m1d8::on() ? (g_seq + T + m1d8::TILE - 1) / m1d8::TILE : 0;  // INT8 dense KV: tiles in the graph
-  const auto key = std::make_pair(g_cur, regime + (draft ? 4 : 0) + 8 * d8t);
+  const auto key = std::make_pair(g_cur, regime + (draft ? 4 : 0) + 8 * d8t + (g_vpen ? 1 << 28 : 0));
   auto it = g_vgraphs.find(key);
   if (it != g_vgraphs.end() && T == kSpecT) {
     for (auto ex : it->second) CK(cudaGraphLaunch(ex, S.s));
@@ -2355,7 +2745,8 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
 int spec_commit_b(int B) {
   const float scale = 1.0f / sqrtf(128.0f);
   const size_t MR = (size_t)S.bv_max * kSpecT;  // stash capacity (rows b * g_TV + t)
-  for (int i = 0; i < NL; ++i) {
+  const bool all = commit_all(true, B);
+  for (int i = 0; i < NL && !all; ++i) {
     if (kMixer[i] != 'k') continue;
     bf16* st = S.kstb[i];
     bf16 *sq = st, *sc = st + MR * KDIM, *sa = sc + MR * KDIM, *sb = sa + MR * KHV * KK;
@@ -2380,6 +2771,7 @@ int verify_body_b(int B) {
   static const int mtp_bmax = getenv("AGENS_MTP_BATCH_MAX") ? atoi(getenv("AGENS_MTP_BATCH_MAX")) : 8;
   if (m1mtp::ready() && B <= mtp_bmax)
     CK(m1mtp::propose_b(draft_target(), B, S.bv_d, std::min(mtp_steps(), g_TV - 1)));
+  seg_split_draft();
   bv_prep<<<B, 32, 0, S.s>>>(S.bv_d, S.Wctx, S.ids, S.pos, S.loc, S.outloc, S.bv_rng, S.bv_slot, g_TV, S.rpos, S.rmax);
   bv_engram<<<B, 32, 0, S.s>>>(S.bv_d, S.ids, S.pos, S.r2, S.r3, g_TV);
   bv_r2t_stage<<<grid((long)B * S.Wctx), 256, 0, S.s>>>(S.bv_d, B, S.Wctx, S.r2t_b);
@@ -2444,6 +2836,7 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
     r[18] = ss.kslot, r[19] = ss.kslot < m1draft::rings() ? ss.kslot : 0;
     memcpy(r + 34, &ss.samp_t, 4), r[35] = ss.samp_k, memcpy(r + 36, &ss.samp_p, 4), memcpy(r + 37, &ss.samp_minp, 4);
     r[38] = ss.samp_seed, r[39] = ss.samp_step++;
+    put_pen(r + 34 + 12, ss);
     r[kRecDelta] = ss.rdelta;
     put_ptr(r + 20, ss.r2t[0]), put_ptr(r + 22, ss.prev[0]);
     if (ss.seq < ss.cache_seq) ss.cache_epoch = ++g_cache_epoch;
@@ -2692,6 +3085,7 @@ int ak_m1_init(int Wctx, const char* mixers, int engram_a, int engram_b, void* e
   if (const char* e = getenv("AGENS_M1_BATCH_INVARIANT")) g_binv = e[0] && e[0] != '0';
   if (const char* e = getenv("AGENS_M1_BI")) g_bi = e[0] == '1';  // also when set after load (agens serve server mode)
   if (const char* e = getenv("AGENS_M1_PREFILL_CHUNK")) g_chunk = std::max(64, std::min(CHUNK, atoi(e)));
+  if (m1kv::on() && g_chunk > 4096) g_chunk = 4096;  // m1_kv stages chunks of up to 4096 rows
   if (const char* e = getenv("AGENS_M1_W4_TILE_MB")) g_w4_tile_bytes = (size_t)std::max(0, atoi(e)) << 20;
   const int rows = (pool_rows > 0 ? pool_rows : Wctx) & ~3;  // whole pages
   kMixer = mixers;
@@ -2814,6 +3208,13 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
   S.samp_scr = dalloc<int>(16 * kMaxBV);
   for (int i = 0; i < NL; ++i)
     if (kMixer[i] == 'b' && dev_of(i) == my && !S.far_ws) S.far_ws = dalloc<char>(ak_far_decode_ws_bytes(Wctx));
+  // AGENS_FAR_EXTEND_GPU=1 (all-GPU KV): the prefill far branch on engine kernels (m1_kv's tiered path has its own,
+  // AGENS_FAR_EXTEND_ENGINE). Product numerics, opt-in: KL 8.7e-5 vs the ATen bridge at tp2 (1.3.2).
+  if (!m1kv::on() && S.far_ws && getenv("AGENS_FAR_EXTEND_GPU") && getenv("AGENS_FAR_EXTEND_GPU")[0] == '1') {
+    S.fx_ws = dalloc<char>(ak_far_extend_engine_ws_bytes(Wctx));
+    S.fx_kb = dalloc<bf16>((size_t)(Wctx / 4 + 512) * KVH * HD), S.fx_vb = dalloc<bf16>((size_t)(Wctx / 4 + 512) * KVH * HD);
+    if (!S.fx_ws || !S.fx_kb || !S.fx_vb) return (int)cudaErrorMemoryAllocation;
+  }
   CK(cudaMallocHost(&S.step_h, kStepInts * sizeof(int)));
   memset(S.step_h, 0, kStepInts * sizeof(int));
   CK(cudaMallocHost(&S.tok_h, kMaxBatch * sizeof(int)));
@@ -2865,9 +3266,15 @@ int ak_m1_vis_register(const char* name, void* host, const long long* shape, int
   return ak_vis_register(name, host, shape, ndim);
 }
 int ak_m1_vis_ready() { return ak_vis_ready(); }
+int prefill_res_drop();
+int prefill_res_take();
 int ak_m1_vis_encode(const uint8_t* rgb, const uint8_t* jpeg, long long jlen, int h, int w, int rh, int rw, void* out) {
   use(0);
-  return ak_vis_encode(rgb, jpeg, jlen, h, w, rh, rw, out, S.s);
+  // the encode workspace shares the prefill temporaries' room (m1.rs): the reserved arena / torch cache step aside for it
+  CK(prefill_res_drop());
+  const int e = ak_vis_encode(rgb, jpeg, jlen, h, w, rh, rw, out, S.s);
+  const int r = prefill_res_take();
+  return e ? e : r;
 }
 int ak_m1_vis_pixels(const uint8_t* rgb, const uint8_t* jpeg, long long jlen, int h, int w, int rh, int rw, float* out) {
   use(0);
@@ -2938,6 +3345,12 @@ int ak_m1_mtp_register_wq(const char* name, void* wt, void* st, int n, int k, in
   return m1mtp::register_w4(name, wt, st, n, k, group, bits);
 }
 int ak_m1_mtp_shortlist(const int* ids, int n) { return m1mtp::set_shortlist(ids, n); }
+// the draft shortlist head's row count (its rows / ids registered as "lm_head.weight.draftsl" / "lm_head.draftsl.ids")
+int ak_m1_draft_vocab(int n, int drafter) {
+  g_draft_nsl = n > 0 ? n : 0, g_draft_sl_drafter = drafter != 0;
+  g_vgraphs.clear(), g_vwarm.clear();
+  return 0;
+}
 long long ak_m1_mtp_setup(int max_rows, int window) {
   use(0);
   if (S.kst.empty() || g_ndev != 1) return -1;  // after ak_m1_spec_init; one device per process
@@ -3026,6 +3439,54 @@ int ak_m1_session_sampling(int sess, float temperature, int top_k, float top_p, 
   ss.samp_p = top_p > 0.f && top_p < 1.f ? top_p : 1.f, ss.samp_minp = min_p > 0.f ? min_p : 0.f;
   ss.samp_seed = seed, ss.samp_step = 0;
   return 0;
+}
+// Penalties of a session's speculative accept (single-sequence and batched verify), as the host sampler applies them:
+// repetition / frequency / presence over the tokens generated so far (counts reset to 0 here) and nb logit-bias pairs
+// (distinct ids). All neutral = off. One device only (the logits and the counts on device 0).
+int ak_m1_session_penalty(int sess, float rep, float freq, float pres, const int* bias_ids, const float* bias_vals,
+                          int nb) {
+  if (sess < 0 || sess >= (int)g_sess.size() || !g_sess[sess].live || nb < 0) return (int)cudaErrorInvalidValue;
+  Session& ss = g_sess[sess];
+  ss.pen = rep != 1.f || freq != 0.f || pres != 0.f || nb > 0;
+  ss.pen_rep = rep, ss.pen_freq = freq, ss.pen_pres = pres, ss.pen_bias_on = nb > 0;
+  if (!ss.pen) return 0;
+  if (g_ndev != 1) return (int)cudaErrorNotSupported;
+  use(0);
+  if (!ss.pen_cnt && !(ss.pen_cnt = dalloc<int>(VOCAB_VALID))) return (int)cudaErrorMemoryAllocation;
+  CK(cudaMemsetAsync(ss.pen_cnt, 0, (size_t)VOCAB_VALID * 4, S.s));
+  if (nb > 0) {
+    if (!ss.pen_bias && !(ss.pen_bias = dalloc<float>(VOCAB_VALID))) return (int)cudaErrorMemoryAllocation;
+    CK(cudaMemsetAsync(ss.pen_bias, 0xFF, (size_t)VOCAB_VALID * 4, S.s));  // NaN: no bias
+    int* di = dalloc<int>(nb);
+    float* dv = dalloc<float>(nb);
+    if (!di || !dv) return (int)cudaErrorMemoryAllocation;
+    CK(cudaMemcpyAsync(di, bias_ids, (size_t)nb * 4, cudaMemcpyHostToDevice, S.s));
+    CK(cudaMemcpyAsync(dv, bias_vals, (size_t)nb * 4, cudaMemcpyHostToDevice, S.s));
+    pen_bias_set<<<(nb + 255) / 256, 256, 0, S.s>>>(ss.pen_bias, di, dv, nb, VOCAB_VALID);
+    CK(cudaStreamSynchronize(S.s));
+    cudaFree(di), cudaFree(dv);
+  }
+  return (int)cudaGetLastError();
+}
+// counts += ids[0..n): the tokens the request emitted since the last call (the host sampler's counts, kept equal)
+int ak_m1_session_penalty_add(int sess, const int* ids, int n) {
+  if (sess < 0 || sess >= (int)g_sess.size() || !g_sess[sess].live || n < 0) return (int)cudaErrorInvalidValue;
+  Session& ss = g_sess[sess];
+  if (!ss.pen || n == 0) return 0;
+  use(0);
+  static int* d_ids = nullptr;
+  static int cap = 0;
+  if (n > cap) {
+    if (d_ids) {
+      CK(cudaStreamSynchronize(S.s));
+      cudaFree(d_ids);
+    }
+    cap = std::max(n, 1024);
+    if (!(d_ids = dalloc<int>(cap))) return (int)cudaErrorMemoryAllocation;
+  }
+  CK(cudaMemcpyAsync(d_ids, ids, (size_t)n * 4, cudaMemcpyHostToDevice, S.s));  // pageable: staged on return
+  pen_count_add<<<(n + 255) / 256, 256, 0, S.s>>>(ss.pen_cnt, d_ids, n, VOCAB_VALID);
+  return (int)cudaGetLastError();
 }
 // One batched step: sequence b = session sess[b] with anchor bonus[b]; emitted[b * 8 ..] = its n[b] tokens.
 int ak_m1_spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n) {
@@ -3267,6 +3728,76 @@ int ak_m1_logits(void* host_dst) {
 // INT8 lm_head logits of row r of the last head input (comparison runs: both heads registered) -> VOCAB_VALID
 // Bytes torch's caching allocator holds (ATen far branch temporaries), after returning unused blocks when release.
 long long ak_m1_torch_reserved(int release) { return ak_bridge_torch_reserved(release); }
+// Test entry (tools/test_samp_accept.py): `trials` sampled verifies of one T-token chain on fixed device logits
+// [T][ld] and drafts ids [T] (ids[0] = the anchor), parameters {temp, top_k, top_p, min_p, seed} with the step =
+// trial index; out[trial] = the emitted chain (n, tokens[..]) in res_stride ints. Same kernels as the verify.
+int ak_m1_test_samp(const void* logits, int ld, int nv, const int* ids, int T, float temp, int top_k, float top_p,
+                    float min_p, int seed, int trials, int* out, int res_stride, void* stream) {
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  int *prm = nullptr, *scr = nullptr, *tok = nullptr;
+  cudaMalloc(&prm, 6 * 4 * trials);
+  cudaMalloc(&scr, 16 * 4);
+  cudaMalloc(&tok, 8 * 4);
+  std::vector<int> h(6 * (size_t)trials);
+  for (int i = 0; i < trials; ++i) {
+    int* p = &h[6 * (size_t)i];
+    memcpy(&p[0], &temp, 4), p[1] = top_k, memcpy(&p[2], &top_p, 4), memcpy(&p[3], &min_p, 4), p[4] = seed, p[5] = i;
+  }
+  cudaMemcpy(prm, h.data(), h.size() * 4, cudaMemcpyHostToDevice);
+  for (int i = 0; i < trials; ++i) {
+    samp_pos<<<T, 1024, 0, s>>>(static_cast<const bf16*>(logits), ld, nv, ids, T, prm + 6 * i, 0, tok, scr);
+    samp_chain<<<1, 32, 0, s>>>(ids, 1, T, scr, out + (size_t)i * res_stride, res_stride);
+  }
+  const int e = (int)cudaStreamSynchronize(s);
+  cudaFree(prm), cudaFree(scr), cudaFree(tok);
+  return e;
+}
+// Bytes the default stream-ordered pool (KDA prefill temporaries) holds on device 0 (reserved, in use).
+long long ak_m1_kda_pool_bytes(int used) {
+  cudaMemPool_t pool;
+  if (cudaDeviceGetDefaultMemPool(&pool, SD[0].dev) != cudaSuccess) return -1;
+  uint64_t v = 0;
+  cudaMemPoolGetAttribute(pool, used ? cudaMemPoolAttrUsedMemCurrent : cudaMemPoolAttrReservedMemCurrent, &v);
+  return (long long)v;
+}
+// Budget mode: take the planned prefill temporaries now, so nothing allocated later (CUDA graphs, lazily loaded
+// modules) can take the room the plan gave them (1.3.1: the stream-ordered pool gave its retained memory back under
+// pressure, the decode / verify graphs of short requests took it, and every later 4K+ prompt failed in ak_kda_prefill
+// with out of memory): kda_bytes > 0 -> the KDA chunk temporaries' arena (ak_kda_prefill_set_arena), torch_bytes into
+// torch's caching allocator (ATen far branch).
+// A later graph instantiation that finds no room fails and its step runs eagerly (instantiate()), same results.
+int ak_bridge_torch_reserve(long long bytes);
+long long g_res_kda = 0, g_res_torch = 0;  // what ak_m1_prefill_reserve took (re-taken after an image encode)
+int prefill_res_drop() {
+  if (!g_res_kda && !g_res_torch) return 0;
+  for (int d = 0; d < g_ndev; ++d) {
+    use(d);
+    CK(cudaStreamSynchronize(S.s));
+    if (g_res_kda) CK(ak_kda_prefill_set_arena(0));
+  }
+  use(0);
+  return 0;  // torch's cache: the encode empties it itself (vision.cpp release_transients)
+}
+int ak_m1_prefill_reserve(long long kda_bytes, long long torch_bytes);
+int prefill_res_take() {
+  if (!g_res_kda && !g_res_torch) return 0;
+  for (int d = 0; d < g_ndev; ++d) {
+    use(d);
+    CK(cudaStreamSynchronize(S.s));
+  }
+  ak_bridge_torch_reserved(1);  // the encode's temporaries back, then the reservations again
+  return ak_m1_prefill_reserve(g_res_kda, g_res_torch);
+}
+int ak_m1_prefill_reserve(long long kda_bytes, long long torch_bytes) {
+  g_res_kda = kda_bytes, g_res_torch = torch_bytes;
+  for (int d = 0; d < g_ndev; ++d) {
+    use(d);
+    if (kda_bytes > 0) CK(ak_kda_prefill_set_arena(g_chunk));  // the arena for this process's heads at g_chunk
+    if (torch_bytes > 0 && dev_of(NL - 1) == d) CK(ak_bridge_torch_reserve(torch_bytes));
+  }
+  use(0);
+  return 0;
+}
 int ak_m1_logits_i8_row(int r, void* host_dst) {
   if (r < 0 || r >= kMaxBatch || !W.count("lm_head.weight.i8")) return -(int)cudaErrorInvalidValue;
   use(dev_of(NL - 1));
@@ -3347,7 +3878,145 @@ int ak_m1_session_unpark(int id, const void* src) {
   CK(park_copy(ss, (char*)const_cast<void*>(src), false));
   return 0;
 }
+// W4 prefill weight cache: bytes it takes on this device, and build it (all or nothing; error: nothing kept)
+size_t ak_m1_w4_cache_bytes() {
+  size_t b = 0;
+  for (auto& kv : W4M) b += (size_t)kv.second.n * kv.second.k * 2;
+  return b;
+}
+int ak_m1_w4_cache_build() {
+  if (g_ndev != 1) return (int)cudaErrorNotSupported;  // layer split: linears live on two devices
+  use(0);
+  int e = 0;
+  for (auto& kv : W4M) {
+    W4Lin& t = kv.second;
+    if (t.dq) continue;
+    void* p = nullptr;
+    if ((e = (int)cudaMalloc(&p, (size_t)t.n * t.k * 2))) break;
+    t.dq = (bf16*)p;
+    for (int j = 0; j < t.np && !e; ++j) {
+      const W4Part& q = t.p[j];
+      e = ak_wq_dequant_kt_rows(q.bits, q.wt, q.st, t.dq + (size_t)q.r0 * t.k, q.n, t.k, q.group, 0, q.n, S.s);
+    }
+    if (e) break;
+    g_w4_cache_bytes += (size_t)t.n * t.k * 2;
+  }
+  if (!e) e = (int)cudaStreamSynchronize(S.s);
+  if (e) {
+    cudaGetLastError();
+    for (auto& kv : W4M)
+      if (kv.second.dq) cudaFree(kv.second.dq), kv.second.dq = nullptr;
+    g_w4_cache_bytes = 0;
+  }
+  return e;
+}
 int ak_m1_session_parked(int id) { return id >= 0 && id < (int)g_sess.size() && g_sess[id].live && g_sess[id].kslot == 0; }
+
+// ---------------------------------------------------------------- prefix cache (agens serve)
+// A prefix snapshot is a parked session that never decodes: the KV pages of its positions are shared with the session
+// it was taken from (refcount, like a fork), its KDA conv + recurrent state (+ window rings) and the drafter context
+// ring of the source slot are copied to a buffer (pinned host). It holds no KDA slot. A new session restored from it
+// shares those pages again and gets the state copied into a slot of its own: exact (copies), so a prefill continued
+// from the snapshot computes what the source session would have computed from that point.
+size_t ak_m1_snap_bytes() { return ak_m1_park_bytes() + m1draft::ring_bytes(); }
+namespace {
+int share_prefix(Session& b, const Session& a) {  // b takes a's positions (pages shared), r2t prefix, Engram pair
+  b.seq = a.seq, b.rows = a.rows, b.rdelta = a.rdelta;
+  for (int k = 0; k < (int)b.rows.size(); k += 4) ++g_ref[b.rows[k] >> 2];
+  for (int d = 0; d < g_ndev; ++d) {
+    use(d);
+    if (a.seq) CK(cudaMemcpyAsync(b.r2t[d], a.r2t[d], (size_t)a.seq * 4, cudaMemcpyDeviceToDevice, S.s));
+    CK(cudaMemcpyAsync(b.prev[d], a.prev[d], 8, cudaMemcpyDeviceToDevice, S.s));
+    CK(cudaStreamSynchronize(S.s));
+  }
+  return 0;
+}
+// b's partial last page (shared with the session it was taken from, which appends to it) copied to a page of b's own
+int own_partial_page(Session& b) {
+  const int part = b.seq % 4;
+  if (!part) return 0;
+  const int k0 = b.seq - part, from = b.rows[k0];
+  --g_ref[from >> 2];
+  const int to = 4 * g_free.back();
+  g_free.pop_back();
+  g_ref[to >> 2] = 1;
+  for (int j = 0; j < part; ++j) b.rows[k0 + j] = to + j;
+  for (int d = 0; d < g_ndev; ++d) {
+    use(d);
+    CK(cudaMemcpyAsync(b.r2t[d] + k0, b.rows.data() + k0, (size_t)part * 4, cudaMemcpyHostToDevice, S.s));
+    for (int i = 0; i < NL; ++i) {
+      if (kMixer[i] == 'k' || dev_of(i) != d) continue;
+      if (kMixer[i] == 'b' && m1kv::on()) {
+        CK(m1kv::copy_rows(d, i, from, to, part, S.s));
+      } else {
+        const size_t kv = (size_t)KVH * HD;
+        CK(cudaMemcpyAsync(S.kc[i] + to * kv, S.kc[i] + from * kv, part * kv * 2, cudaMemcpyDefault, S.s));
+        CK(cudaMemcpyAsync(S.vc[i] + to * kv, S.vc[i] + from * kv, part * kv * 2, cudaMemcpyDefault, S.s));
+      }
+      if (kMixer[i] == 'b')
+        CK(cudaMemcpyAsync(S.idx[i] + (size_t)to * IDXD, S.idx[i] + (size_t)from * IDXD, (size_t)part * IDXD * 2,
+                           cudaMemcpyDefault, S.s));
+    }
+    CK(cudaStreamSynchronize(S.s));
+  }
+  return 0;
+}
+}  // namespace
+// Snapshot of session src (live, holding a slot) into dst (ak_m1_snap_bytes()). -> id or -1. A partial last page
+// (seq not a multiple of 4: a prompt-end snapshot) moves to a page of the snapshot's own, as a fork's does.
+int ak_m1_session_snap(int src, void* dst) {
+  if (m1d8::on() || src < 0 || src >= (int)g_sess.size() || !g_sess[src].live || g_sess[src].kslot <= 0) return -1;
+  if (g_sess[src].seq % 4 && g_free.empty()) return -1;
+  int id = 0;
+  while (id < (int)g_sess.size() && g_sess[id].live) ++id;
+  if (id == (int)g_sess.size()) g_sess.emplace_back();
+  Session& ss = g_sess[id];
+  Session keep = ss;
+  ss = Session{};
+  for (int d = 0; d < 2; ++d) ss.r2t[d] = keep.r2t[d], ss.prev[d] = keep.prev[d], ss.slot[d] = keep.slot[d];
+  ss.live = true, ss.kslot = 0;
+  ss.cache_epoch = ++g_cache_epoch;
+  drop_graphs(id);
+  for (int d = 0; d < g_ndev; ++d) {
+    use(d);
+    if (!ss.r2t[d]) ss.r2t[d] = dalloc<int>(S.Wctx), ss.prev[d] = dalloc<int>(2), ss.slot[d] = dalloc<int>(1);
+    std::vector<int> trash(S.Wctx, S.rows);
+    if (cudaMemcpy(ss.r2t[d], trash.data(), (size_t)S.Wctx * 4, cudaMemcpyHostToDevice)) return -1;
+  }
+  Session& a = g_sess[src];
+  if (share_prefix(ss, a) || own_partial_page(ss) || park_copy(a, (char*)dst, true)) {
+    release_rows(ss);
+    ss.live = false;
+    use(0);
+    return -1;
+  }
+  use(0);
+  if (m1draft::ring_bytes()) {
+    if (m1draft::ring_io(a.kslot, (char*)dst + ak_m1_park_bytes(), true, S.s) || cudaStreamSynchronize(S.s)) return -1;
+  }
+  return id;
+}
+// A new live session (a free KDA slot; not activated) restored from snapshot `snap` with its buffer src. -> id or -1.
+int ak_m1_session_from_snap(int snap, const void* src) {
+  if (snap < 0 || snap >= (int)g_sess.size() || !g_sess[snap].live || g_sess[snap].kslot > 0) return -1;
+  if (g_sess[snap].seq % 4 && g_free.empty()) return -1;
+  const int cur = g_cur, id = new_session();
+  g_cur = cur;
+  if (id < 0) return -1;
+  Session &a = g_sess[snap], &b = g_sess[id];
+  if (share_prefix(b, a) || own_partial_page(b) || park_copy(b, (char*)const_cast<void*>(src), false)) {
+    use(0);
+    ak_m1_session_free(id);
+    return -1;
+  }
+  use(0);
+  if (m1draft::ring_bytes()) {
+    if (m1draft::ring_io(b.kslot, (char*)const_cast<void*>(src) + ak_m1_park_bytes(), false, S.s) ||
+        cudaStreamSynchronize(S.s))
+      return -1;
+  }
+  return id;
+}
 int ak_m1_free_slots() {
   int n = 0;
   for (int k = 1; k <= g_nslots; ++k) n += !g_slot_used[k];

@@ -12,8 +12,9 @@ constexpr int kFeat = 5;     // target context features (layers 8, 21, 35, 53, 6
 //   [10..17] pool rows of the 8 verify positions  [18] KDA slot  [19] drafter ring  [20..21] r2t ptr  [22..23] Engram
 //   prev ptr  [24..25] far-cache tag  [26] host proposal length nh  [27..33] host proposal (hybrid drafting: replaces
 //   the first nh drafts after propose_b)  [34..39] sampling (T, top-k, top-p, min-p, seed, step)  [40] rope delta
-//   (image input)
-constexpr int kRecInts = 44;
+//   (image input)  [46..53] penalties (samp_pos parameter block [12..19]: flags, repetition, frequency, presence,
+//   counts ptr, bias ptr)
+constexpr int kRecInts = 56;
 
 int register_weight(const char* name, void* ptr);  // bf16 device pointers, checkpoint names (gate_up merged)
 // a linear as W4 instead (k-tiled layout of ak_w4_repack_kt), under the name of its bf16 weight
@@ -25,6 +26,9 @@ void set_ring(int ring);
 int rings();
 // copy ring src to ring dst (session fork; no-op without per-slot rings)
 int copy_ring(int dst, int src, cudaStream_t s);
+// prefix cache snapshots: bytes of one ring (0 before setup) and ring <-> host / device buffer
+size_t ring_bytes();
+int ring_io(int ring, void* buf, bool to_buf, cudaStream_t s);
 bool ready();
 size_t bytes();  // device memory owned by the drafter besides its weights (ring, buffers)
 
@@ -37,6 +41,12 @@ struct Target {      // what the drafter borrows from the target
   const float* lm_head_scale = nullptr;  // [vocab]
   const void* lm_head_w4 = nullptr;      // W4 g128 KT copy of the head (AGENS_M1_LMHEAD_W4=draft): weights / scales
   const void* lm_head_w4s = nullptr;
+  // shortlist head (AGENS_DRAFT_VOCAB, 1.3.2): the bf16 lm_head rows of the nsl most frequent output ids
+  // (mtp_vocab.bin order) and those ids; the drafter's candidates and the MTP chain's argmax come from it (nsl = 0: off)
+  const void* sl_head = nullptr;  // [nsl][5120] bf16
+  const int* sl_ids = nullptr;    // [nsl]
+  int nsl = 0;
+  bool sl_drafter = false;  // the drafter's candidates from it too (else only the MTP chain uses it)
 };
 // Context KV of n target tokens at positions pos[0..n-1] (int64, device) from their features cap [n][5][5120]
 // (n_dev, nullable: n read on device, capped at n_max).

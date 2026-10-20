@@ -118,10 +118,11 @@ pub(crate) struct Opts {
     pub(crate) mtp: Option<String>,     // MTP head dir (docs/mtp.md): a draft source of speculative decoding
     pub(crate) copy: bool,              // copy-only speculative decoding (no drafter model): verify buffers only
     pub(crate) vision: Option<bool>,    // --vision 0|1: load the vision tower (default: when the checkpoint has one)
+    pub(crate) w4_cache: Option<String>, // --w4-prefill-cache auto|0|1 (AGENS_M1_W4_PREFILL_CACHE; default auto)
 }
 
 pub(crate) fn parse_opts(args: &[String], usage: &str) -> Result<Opts> {
-    let mut o = Opts { gpu_gib: 0.0, device: 0, devices: vec![], new_tokens: 64, wctx: 36868, cuts: 50, tier: "host".into(), seed: 1, pool: 0, sessions: 1, budget_gib: 0.0, drafter: None, tp: 1, mtp: None, copy: false, vision: None };
+    let mut o = Opts { gpu_gib: 0.0, device: 0, devices: vec![], new_tokens: 64, wctx: 36868, cuts: 50, tier: "host".into(), seed: 1, pool: 0, sessions: 1, budget_gib: 0.0, drafter: None, tp: 1, mtp: None, copy: false, vision: None, w4_cache: None };
     let mut i = 0;
     while i < args.len() {
         let v = args.get(i + 1).context(usage.to_string())?;
@@ -141,6 +142,7 @@ pub(crate) fn parse_opts(args: &[String], usage: &str) -> Result<Opts> {
             "--mtp" => o.mtp = Some(v.clone()),
             "--spec-copy" => o.copy = v == "1",
             "--vision" => o.vision = Some(v != "0"),
+            "--w4-prefill-cache" => o.w4_cache = Some(v.clone()),
             f => bail!("unknown flag {f}\n{usage}"),
         }
         i += 2;
@@ -546,6 +548,16 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         cur: 0,
     };
     let mut engram = [std::ptr::null_mut(); 4];
+    // the embedding and Engram tables (row lookups: ~8 us per lookup over PCIe when host-mapped) on the GPU in native
+    // mode (--gpu-gib, no --budget-gib), as far as the weight budget allows; host-mapped in budget mode (consumer
+    // cards: 2.5 + 4.3 GB). AGENS_M1_LOOKUP_GPU=0|1 overrides.
+    let lookups_gpu = std::env::var("AGENS_M1_LOOKUP_GPU").map(|v| v == "1").unwrap_or(gpu_gib > 0.0 && o.budget_gib <= 0.0);
+    // native mode: the W4H layout (kernels/src/w4h.cu) in its "auto" shape classes (MLP gate_up, attention k / v, KDA
+    // f_down: faster than KT at m = 1 / 8 on compute capability 9.0; bit-identical); devices without the 200 KB shared-memory opt-in
+    // keep KT by themselves. AGENS_W4H set: as given (0 = off).
+    if gpu_gib > 0.0 && o.budget_gib <= 0.0 && std::env::var_os("AGENS_W4H").is_none() {
+        std::env::set_var("AGENS_W4H", "2");
+    }
     // =draft: the INT8 head (1.27 GB more) for the drafter's candidate logits while the target decodes with the bf16
     // head (drafter numerics move acceptance only). Not the default: ak_i8_gemv at 7 rows took 1.16 ms on sm90 vs
     // 0.62 for the bf16 head.
@@ -679,7 +691,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
             continue;
         }
         if name.contains(".engram.tables.") {
-            let p = pl.place(b, true)?;
+            let p = pl.place(b, !lookups_gpu)?;
             let first = ck.config.engram.layers.first().map(|l| name.contains(&format!(".layers.{l}."))).unwrap_or(false);
             let order = if name.contains(".tables.0.") { 0 } else { 1 };
             engram[if first { 0 } else { 2 } + order] = p;
@@ -693,6 +705,25 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
             let reg = format!("{name}.f32");
             agens_cuda::m1::register(&reg, pl.place(&f, false)?)?;
             continue;
+        }
+        if name == "lm_head.weight" {
+            // (every rank holds the whole head under --tp: each computes the same drafts)
+            let (ids, drafter_too) = crate::spec::draft_vocab_ids(o.mtp.is_some() && lmh_int8 == "0");
+            if !ids.is_empty() {
+                // the draft shortlist head: bf16 rows of the N most frequent output ids, and the ids
+                let k = ck.info(name).unwrap().shape[1];
+                let mut rows = Vec::with_capacity(ids.len() * k * 2);
+                for &t in &ids {
+                    rows.extend_from_slice(&b[t as usize * k * 2..(t as usize + 1) * k * 2]);
+                }
+                let idb: Vec<u8> = ids.iter().flat_map(|t| (*t as i32).to_le_bytes()).collect();
+                agens_cuda::m1::register("lm_head.weight.draftsl", pl.place(&rows, false)?)?;
+                agens_cuda::m1::register("lm_head.draftsl.ids", pl.place(&idb, false)?)?;
+                *gpu_kinds.entry("lm_head draft shortlist (bf16)").or_insert(0) += rows.len() + idb.len();
+                agens_cuda::m1::draft_vocab(ids.len(), drafter_too)?;
+                eprintln!("m1: draft shortlist head: {} ids, {:.2} GB bf16 (MTP chain{})", ids.len(), rows.len() as f64 / 1e9,
+                          if drafter_too { " + DFlash2 candidates" } else { "" });
+            }
         }
         if name == "lm_head.weight" && std::env::var("AGENS_M1_LMHEAD_W4").map(|v| v == "draft").unwrap_or(false) {
             // AGENS_M1_LMHEAD_W4=draft: a W4 g128 copy of the head for the drafter's candidate logits only (the target
@@ -729,7 +760,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
                 continue;
             }
         }
-        let host = *name == format!("{lm}.embed_tokens.weight");
+        let host = *name == format!("{lm}.embed_tokens.weight") && !lookups_gpu;
         if !host {
             let kind = if name == "lm_head.weight" {
                 "lm_head (bf16)"
@@ -803,6 +834,12 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
                                the prefill temporaries)", ws as f64 / 1e9, (ws - own) as f64 / 1e9), own));
     }
     let t_weights = t0.elapsed().as_secs_f64();
+    // the W4 prefill weight cache in budget mode only when forced on (--w4-prefill-cache 1): the plan counts it
+    let budget_cache = o.budget_gib > 0.0 && w4_cache_mode(o) == "1" && devs.len() == 1;
+    if budget_cache {
+        let b = agens_cuda::m1::w4_cache_bytes();
+        reserve.push((format!("W4 prefill weight cache (dequantized bf16 W4 linears, {:.2} GB)", b as f64 / 1e9), b));
+    }
     let mut pool = o.pool;
     if o.budget_gib > 0.0 {  // size the KV pool from the budget left after weights + context (one device)
         agens_cuda::synchronize()?;
@@ -863,7 +900,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     }
     agens_cuda::m1::init(wctx, &mixers, eng_layers, engram, &devs, split, pool, o.sessions)?;
     // the largest all-reduce: a prefill chunk of hidden rows
-    let chunk = std::env::var("AGENS_M1_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4096).min(4096);
+    let chunk = std::env::var("AGENS_M1_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4096).min(8192);
     crate::tp::setup_allreduce(chunk * 5120)?;
     if let Some(d) = &draft {
         crate::spec::finish_drafter(d, cap_rows)?;
@@ -912,6 +949,13 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         eprintln!("m1: W4 k-tiled {:.2} GB + W3 k-tiled {:.2} GB on GPU, small-k W4 as bf16 {:.3} GB; weights placed in \
                    {t_weights:.0} s", w4_gpu as f64 / 1e9, w3_gpu as f64 / 1e9, w4_dense as f64 / 1e9);
     }
+    w4_prefill_cache(o, budget_cache)?;
+    if o.budget_gib > 0.0 && std::env::var("AGENS_M1_PREFILL_RESERVE").map(|v| v != "0").unwrap_or(true) {
+        // the plan's prefill temporaries taken now, before any CUDA graph (AGENS_M1_PREFILL_RESERVE=0: 1.3.1's lazy way)
+        let (kb, tb) = (crate::plan::kda_temp_bytes(tp), crate::plan::torch_temp_bytes(tp));
+        agens_cuda::m1::prefill_reserve(kb, tb)?;
+        eprintln!("m1: prefill temporaries reserved: KDA arena {:.2} GB, torch cache {:.2} GB", kb as f64 / 1e9, tb as f64 / 1e9);
+    }
     for (k, &d) in devs.iter().enumerate() {
         pl.on(k)?;
         let (free, total) = agens_cuda::mem_info()?;
@@ -921,6 +965,51 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
                   if b > 0 { format!(", {:.2} GB free under the cap", free as f64 / 1e9) } else { String::new() });
     }
     pl.on(0)?;
+    Ok(())
+}
+
+fn w4_cache_mode(o: &Opts) -> String {
+    o.w4_cache.clone().or_else(|| std::env::var("AGENS_M1_W4_PREFILL_CACHE").ok()).unwrap_or_else(|| "auto".into())
+}
+/// W4 prefill weight cache (1.3.2, a stopgap until a large-M W4 tensor-core GEMM): every W4 linear's
+/// dequantized bf16 weight kept on the GPU, so prefill chunks skip the per-chunk dequantize (bitwise the same output).
+/// auto: on outside budget mode on a GPU of >= 80 GB when, after everything else is loaded, the cache still leaves
+/// AGENS_M1_W4_PREFILL_CACHE_RESERVE_GIB (default 24: prefill temporaries, graphs, the serve prefix cache) free; 0 off;
+/// 1 on (in budget mode the memory plan counts it). Built at load, all or nothing: no allocation later.
+fn w4_prefill_cache(o: &Opts, planned: bool) -> Result<()> {
+    let mode = w4_cache_mode(o);
+    let bytes = agens_cuda::m1::w4_cache_bytes();
+    if bytes == 0 || mode == "0" || mode == "off" {
+        if bytes > 0 {
+            eprintln!("m1: W4 prefill weight cache off ({:.2} GB; --w4-prefill-cache 0)", bytes as f64 / 1e9);
+        }
+        return Ok(());
+    }
+    agens_cuda::synchronize()?;
+    let (free, total) = agens_cuda::mem_info()?;
+    let reserve = (std::env::var("AGENS_M1_W4_PREFILL_CACHE_RESERVE_GIB").ok().and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(24.0) * (1u64 << 30) as f64) as usize;
+    let why = if mode == "1" {
+        if o.budget_gib > 0.0 && !planned { Some("not planned (one device only)") } else { None }
+    } else if o.budget_gib > 0.0 {
+        Some("budget mode")
+    } else if total < 80_000_000_000 {
+        Some("GPU under 80 GB")
+    } else if free < bytes + reserve {
+        Some("not enough free memory")
+    } else {
+        None
+    };
+    if let Some(w) = why {
+        eprintln!("m1: W4 prefill weight cache off: {w} ({:.2} GB needed, {:.2} GB free, {:.0} GB reserve)",
+                  bytes as f64 / 1e9, free as f64 / 1e9, reserve as f64 / (1u64 << 30) as f64);
+        return Ok(());
+    }
+    match agens_cuda::m1::w4_cache_build() {
+        Ok(()) => eprintln!("m1: W4 prefill weight cache: {:.2} GB of dequantized bf16 W4 weights on the GPU ({:.2} GB free \
+                             before; --w4-prefill-cache 0 turns it off)", bytes as f64 / 1e9, free as f64 / 1e9),
+        Err(e) => eprintln!("m1: W4 prefill weight cache off: build failed ({e:#}); prefill dequantizes per chunk"),
+    }
     Ok(())
 }
 

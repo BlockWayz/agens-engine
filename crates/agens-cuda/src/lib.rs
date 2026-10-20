@@ -343,12 +343,16 @@ pub mod m1 {
                                  bits: c_int) -> c_int;
         fn ak_m1_mtp_setup(max_rows: c_int, window: c_int) -> i64;
         fn ak_m1_mtp_shortlist(ids: *const c_int, n: c_int) -> c_int;
+        fn ak_m1_draft_vocab(n: c_int, drafter: c_int) -> c_int;
         fn ak_m1_spec_step(bonus: c_int, emitted: *mut c_int, n: *mut c_int, drafts: *mut c_int) -> c_int;
         fn ak_m1_spec_step_hint(bonus: c_int, hint: *const c_int, nh: c_int, emitted: *mut c_int, n: *mut c_int,
                                 drafts: *mut c_int) -> c_int;
         fn ak_m1_spec_batch_init(max_b: c_int) -> c_int;
         fn ak_m1_spec_batch_max() -> c_int;
         fn ak_m1_session_sampling(sess: c_int, temperature: f32, top_k: c_int, top_p: f32, min_p: f32, seed: c_int) -> c_int;
+        fn ak_m1_session_penalty(sess: c_int, rep: f32, freq: f32, pres: f32, bias_ids: *const c_int, bias_vals: *const f32,
+                                 nb: c_int) -> c_int;
+        fn ak_m1_session_penalty_add(sess: c_int, ids: *const c_int, n: c_int) -> c_int;
         fn ak_m1_spec_batch_hint(sess: *const c_int, b: c_int, bonus: *const c_int, hint: *const c_int, nh: *const c_int,
                                  emitted: *mut c_int, n: *mut c_int) -> c_int;
         fn ak_m1_spec_batch(sess: *const c_int, b: c_int, bonus: *const c_int, emitted: *mut c_int, n: *mut c_int) -> c_int;
@@ -363,6 +367,8 @@ pub mod m1 {
         fn ak_tp_region_bytes(slot_elems: i64) -> usize;
         fn ak_tp_selftest(iters: c_int, n: i64) -> i64;
         fn ak_tp_bench(iters: c_int, n: i64) -> f64;
+        fn ak_tp_push_selftest(iters: c_int) -> i64;
+        fn ak_tp_bench2(iters: c_int, rows: i64, which: c_int, graph: c_int) -> f64;
         fn ak_m1_init(wctx: c_int, mixers: *const c_char, engram_a: c_int, engram_b: c_int, e2a: *mut c_void,
                       e2b: *mut c_void, e22a: *mut c_void, e22b: *mut c_void, ndev: c_int, devs: *const c_int,
                       split: c_int, pool_rows: c_int, nslots: c_int) -> c_int;
@@ -395,11 +401,18 @@ pub mod m1 {
         fn ak_m1_logits_row(r: c_int, dst: *mut c_void) -> c_int;
         fn ak_m1_logits_i8_row(r: c_int, dst: *mut c_void) -> c_int;
         fn ak_m1_torch_reserved(release: c_int) -> i64;
+        fn ak_m1_kda_pool_bytes(used: c_int) -> i64;
+        fn ak_m1_prefill_reserve(kda: i64, torch: i64) -> c_int;
         fn ak_m1_decode_batch(sess: *const c_int, tok: *const c_int, b: c_int, next: *mut c_int) -> c_int;
         fn ak_m1_park_bytes() -> usize;
         fn ak_m1_session_park(id: c_int, dst: *mut c_void) -> c_int;
         fn ak_m1_session_unpark(id: c_int, src: *const c_void) -> c_int;
         fn ak_m1_session_parked(id: c_int) -> c_int;
+        fn ak_m1_snap_bytes() -> usize;
+        fn ak_m1_w4_cache_bytes() -> usize;
+        fn ak_m1_w4_cache_build() -> c_int;
+        fn ak_m1_session_snap(src: c_int, dst: *mut c_void) -> c_int;
+        fn ak_m1_session_from_snap(snap: c_int, src: *const c_void) -> c_int;
         fn ak_m1_free_slots() -> c_int;
         fn ak_m1_recover() -> c_int;
     }
@@ -421,6 +434,15 @@ pub mod m1 {
     }
     /// Logits (bf16 bits) of row r of the last step (row 0 = the last token of a prefill / bs = 1 step).
     /// Bytes torch's caching allocator holds on the device (ATen far branch), after releasing unused ones if asked.
+    /// Bytes the default stream-ordered pool (KDA prefill temporaries) holds (reserved, or in use).
+    pub fn kda_pool_bytes(used: bool) -> i64 {
+        unsafe { ak_m1_kda_pool_bytes(used as c_int) }
+    }
+    /// Take the planned prefill temporaries into their pools now (budget mode, before any CUDA graph). Every rank
+    /// runs it during its own load (no forwarding).
+    pub fn prefill_reserve(kda: usize, torch: usize) -> Result<()> {
+        check(unsafe { ak_m1_prefill_reserve(kda as i64, torch as i64) }, "m1_prefill_reserve")
+    }
     pub fn torch_reserved(release: bool) -> i64 {
         unsafe { ak_m1_torch_reserved(release as c_int) }
     }
@@ -451,6 +473,42 @@ pub mod m1 {
     pub fn session_unpark(id: i32, src: *const c_void) -> Result<()> {
         crate::tp::fwd(&format!("session_unpark {id}"));
         check(unsafe { ak_m1_session_unpark(id, src) }, "m1_session_unpark")
+    }
+    /// Bytes of the W4 prefill weight cache (every W4 linear dequantized to bf16) on this device.
+    pub fn w4_cache_bytes() -> usize {
+        unsafe { ak_m1_w4_cache_bytes() }
+    }
+    /// Build the W4 prefill weight cache (all or nothing). Every rank builds its own at load (no forwarding).
+    pub fn w4_cache_build() -> Result<()> {
+        check(unsafe { ak_m1_w4_cache_build() }, "m1_w4_cache_build")
+    }
+    /// Bytes of a prefix snapshot's buffer (KDA state + rings as when parked, plus the drafter's context ring).
+    pub fn snap_bytes() -> usize {
+        unsafe { ak_m1_snap_bytes() }
+    }
+    /// Prefix cache: a snapshot of session `src` (holding a slot, length a multiple of 4) as a new parked session that
+    /// shares its KV pages; the state goes to `dst` (pinned host, snap_bytes()). `key` names the followers' buffers
+    /// (tensor parallel: each rank snapshots its own share). -> the snapshot's session id.
+    pub fn session_snap(src: i32, dst: *mut c_void, key: u64) -> Result<i32> {
+        crate::tp::fwd(&format!("session_snap {src} {key}"));
+        let id = unsafe { ak_m1_session_snap(src, dst) };
+        if id < 0 { anyhow::bail!("m1_session_snap({src}) failed") }
+        Ok(id)
+    }
+    /// A new session (a free KDA slot, not activated) restored from snapshot session `snap` and its buffer.
+    pub fn session_from_snap(snap: i32, src: *const c_void, key: u64) -> Result<i32> {
+        crate::tp::fwd(&format!("session_from_snap {snap} {key}"));
+        let id = unsafe { ak_m1_session_from_snap(snap, src) };
+        if id < 0 { anyhow::bail!("m1_session_from_snap({snap}) failed") }
+        Ok(id)
+    }
+    /// The followers return their buffer of snapshot `key` to their pool (the leader keeps its own pool).
+    pub fn snap_drop(key: u64) {
+        crate::tp::fwd(&format!("snap_drop {key}"));
+    }
+    /// The followers allocate their pool of `n` snapshot buffers (device memory or pinned host), as the leader does.
+    pub fn snap_pool(n: usize, dev: bool) {
+        crate::tp::fwd(&format!("snap_pool {n} {}", if dev { "d" } else { "h" }));
     }
     pub fn session_parked(id: i32) -> bool {
         unsafe { ak_m1_session_parked(id) != 0 }
@@ -511,6 +569,11 @@ pub mod m1 {
     }
     pub fn seq() -> usize {
         unsafe { ak_m1_seq() as usize }
+    }
+    /// Rows of the draft shortlist head (registered as "lm_head.weight.draftsl" + "lm_head.draftsl.ids"); 0 = off. The
+    /// MTP chain uses it; the DFlash2 drafter's candidates too when `drafter`.
+    pub fn draft_vocab(n: usize, drafter: bool) -> Result<()> {
+        check(unsafe { ak_m1_draft_vocab(n as c_int, drafter as c_int) }, "m1_draft_vocab")
     }
     pub fn register(name: &str, ptr: *mut c_void) -> Result<()> {
         let c = CString::new(name)?;
@@ -638,6 +701,14 @@ pub mod m1 {
     pub fn tp_bench(iters: usize, n: usize) -> f64 {
         unsafe { ak_tp_bench(iters as c_int, n as i64) }
     }
+    /// Push all-reduce vs the pull kernel and fused AR + add + RMSNorm vs the two calls: differing elements (-1: no push path).
+    pub fn tp_push_selftest(iters: usize) -> i64 {
+        unsafe { ak_tp_push_selftest(iters as c_int) }
+    }
+    /// Mean us per call of `which` (0 pull AR, 1 push AR, 2 pull AR + add_rmsnorm, 3 fused) on `rows` rows, graphs or not.
+    pub fn tp_bench2(iters: usize, rows: usize, which: i32, graph: bool) -> f64 {
+        unsafe { ak_tp_bench2(iters as c_int, rows as i64, which as c_int, graph as c_int) }
+    }
     pub fn tp_selftest(iters: usize, n: usize) -> i64 {
         unsafe { ak_tp_selftest(iters as c_int, n as i64) }
     }
@@ -676,8 +747,44 @@ pub mod m1 {
         crate::tp::fwd(&format!("session_sampling {sess} {temperature} {top_k} {top_p} {min_p} {seed}"));
         check(unsafe { ak_m1_session_sampling(sess, temperature, top_k, top_p, min_p, seed) }, "m1_session_sampling")
     }
+    /// Penalties of a session's speculative accept (single-sequence and batched verify), applied on the device exactly
+    /// as the host sampler does: repetition / frequency / presence over the tokens generated so far (the counts start
+    /// at 0 here; `session_penalty_add` adds every emitted token) and logit bias (distinct ids). All neutral = off.
+    /// One device per process (Err otherwise); under --tp every rank keeps the same state (forwarded; the logits are
+    /// replicated, so each rank's accept draws the same tokens).
+    pub fn session_penalty(sess: i32, rep: f32, freq: f32, pres: f32, bias: &[(u32, f32)]) -> Result<()> {
+        let ids: Vec<c_int> = bias.iter().map(|b| b.0 as c_int).collect();
+        let vals: Vec<f32> = bias.iter().map(|b| b.1).collect();
+        // f32 Display is the shortest round-trip form: the followers parse the same bits
+        crate::tp::fwd(&format!("session_penalty {sess} {rep} {freq} {pres} {} {}", crate::tp::join(&ids),
+                                if vals.is_empty() { "-".into() } else { vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",") }));
+        check(unsafe { ak_m1_session_penalty(sess, rep, freq, pres, ids.as_ptr(), vals.as_ptr(), ids.len() as c_int) },
+              "m1_session_penalty")
+    }
+    /// The penalty counts of a session += these emitted tokens.
+    pub fn session_penalty_add(sess: i32, ids: &[u32]) -> Result<()> {
+        if crate::tp::active() {
+            let v: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
+            crate::tp::fwd(&format!("session_penalty_add {sess} {}", crate::tp::join(&v)));
+        }
+        check(unsafe { ak_m1_session_penalty_add(sess, ids.as_ptr() as *const c_int, ids.len() as c_int) },
+              "m1_session_penalty_add")
+    }
     /// One batched step: sequence b = session `sessions[b]` drafts after `bonus[b]`, verifies, commits; -> the emitted
     /// tokens of each (each exactly its own spec_step).
+    /// AGENS_TP_SPEC_LOG=1: every batched verify's emitted tokens per session, numbered, on stderr (each tensor-parallel
+    /// rank computes them; the ranks' logs must agree line for line)
+    fn spec_log(kind: &str, sessions: &[i32], em: &[i32], n: &[i32]) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static K: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if !*ON.get_or_init(|| std::env::var("AGENS_TP_SPEC_LOG").map_or(false, |v| v == "1")) {
+            return;
+        }
+        let k = K.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rows: Vec<String> = sessions.iter().enumerate()
+            .map(|(i, s)| format!("{s}:{:?}", &em[8 * i..8 * i + n[i] as usize])).collect();
+        eprintln!("tp-spec {k} {kind} {}", rows.join(" "));
+    }
     pub fn spec_batch(sessions: &[i32], bonus: &[i32]) -> Result<Vec<Vec<i32>>> {
         crate::tp::fwd(&format!("spec_batch {} {}", crate::tp::join(sessions), crate::tp::join(bonus)));
         assert_eq!(sessions.len(), bonus.len());
@@ -685,6 +792,7 @@ pub mod m1 {
         let (mut em, mut n) = (vec![0i32; 8 * b], vec![0i32; b]);
         check(unsafe { ak_m1_spec_batch(sessions.as_ptr(), b as c_int, bonus.as_ptr(), em.as_mut_ptr(), n.as_mut_ptr()) },
               "m1_spec_batch")?;
+        spec_log("b", sessions, &em, &n);
         Ok((0..b).map(|i| em[8 * i..8 * i + n[i] as usize].to_vec()).collect())
     }
     /// The same with host proposals (hybrid drafting): hints[i] (<= 7 tokens, may be empty) replaces sequence i's
@@ -705,6 +813,7 @@ pub mod m1 {
         }
         check(unsafe { ak_m1_spec_batch_hint(sessions.as_ptr(), b as c_int, bonus.as_ptr(), hv.as_ptr(), nh.as_ptr(),
                                              em.as_mut_ptr(), n.as_mut_ptr()) }, "m1_spec_batch_hint")?;
+        spec_log("h", sessions, &em, &n);
         Ok((0..b).map(|i| em[8 * i..8 * i + n[i] as usize].to_vec()).collect())
     }
     /// Start/stop the CUDA profiler capture range (nsys --capture-range=cudaProfilerApi).

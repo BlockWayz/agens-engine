@@ -42,6 +42,10 @@ int agens_kf_repack(const int32_t* packed, const void* scales, void* wt, void* s
 bool agens_kf_is(const void* wt);
 void agens_kf_forget(const void* wt);
 int agens_kf_dequant_rows(const void* wt, const void* st, void* w, int n, int k, int r0, int nr, cudaStream_t s);
+// W4H layout (w4h.cu, sm90 / sm100; AGENS_W4H=1): repack (1 = not handled), membership, forget
+int agens_w4h_repack(const int32_t* packed, const void* scales, void* wt, void* st, int n, int k, cudaStream_t s);
+bool agens_w4h_is(const void* wt);
+void agens_w4h_forget(const void* wt);
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -541,9 +545,14 @@ extern "C" int ak_w4_repack_kt(const int32_t* packed, const void* scales, void* 
                                void* stream) {
   if (!group_ok(k, group) || k % 32 != 0) return (int)cudaErrorInvalidValue;
   if (group == 128) {
-    const int e = agens_kf_repack(packed, scales, wt, st, n, k, static_cast<cudaStream_t>(stream));
+    // W4H only carries the tensor-core numerics: not with the exact fp32 path (AGENS_W4_EXACT=1)
+    int e = mma_on(128, 0) ? agens_w4h_repack(packed, scales, wt, st, n, k, static_cast<cudaStream_t>(stream)) : 1;
+    if (e != 1) return e;
+    agens_w4h_forget(wt);  // a KT / KF weight at an address a freed W4H weight had
+    e = agens_kf_repack(packed, scales, wt, st, n, k, static_cast<cudaStream_t>(stream));
     if (e != 1) return e;
   }
+  agens_w4h_forget(wt);
   agens_kf_forget(wt);  // a KT weight at an address a freed KF weight had
   auto kern = group == 64 ? repack_kt_kernel<64> : repack_kt_kernel<128>;
   kern<<<1024, 256, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -642,9 +651,30 @@ int batched(const void* x, const void* wt, const void* st, void* y, int m, int n
 
 }  // namespace
 
+namespace {
+// W4H weights among the segments: all W4H -> one W4H launch (bit-identical to the tensor-core KT path); a mix -> per
+// segment; none -> -1 (not handled here). W4H has only the tensor-core numerics (group 128, bf16w = 0).
+int w4h_route(const void* x, int m, int nseg, const void* const* wt, const void* const* st, void* const* y,
+              const int* n, const int* ldy, int k, int group, int bf16w, void* stream) {
+  int nh = 0;
+  for (int i = 0; i < nseg; ++i) nh += agens_w4h_is(wt[i]);
+  if (!nh) return -1;
+  if (group != 128 || bf16w) return (int)cudaErrorInvalidValue;
+  if (nh == nseg) return ak_w4h_gemm(x, m, nseg, wt, st, y, n, ldy, k, stream);
+  for (int i = 0; i < nseg; ++i) {
+    const int e = agens_w4h_is(wt[i]) ? ak_w4h_gemm(x, m, 1, wt + i, st + i, y + i, n + i, ldy ? ldy + i : nullptr, k, stream)
+                                      : ak_wq_gemv_kt_multi(4, x, m, 1, wt + i, st + i, y + i, n + i, ldy ? ldy + i : nullptr,
+                                                            k, group, bf16w, stream);
+    if (e) return e;
+  }
+  return 0;
+}
+}  // namespace
+
 extern "C" int ak_w4_gemv_kt(const void* x, const void* wt, const void* st, void* y, int n, int k, int group,
                              int bf16w, void* stream) {
   if (!group_ok(k, group)) return (int)cudaErrorInvalidValue;
+  if (const int e = w4h_route(x, 1, 1, &wt, &st, &y, &n, nullptr, k, group, bf16w, stream); e >= 0) return e;
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (mma_on(group, bf16w)) return mma_segs(x, 1, make_segs(1, &wt, &st, &y, &n, 16), k, s, group, 4);
   const KtSegs g = make_segs(1, &wt, &st, &y, &n, 4);
@@ -654,6 +684,7 @@ extern "C" int ak_w4_gemv_kt(const void* x, const void* wt, const void* st, void
 extern "C" int ak_w4_gemv_kt_multi(const void* x, int nseg, const void* const* wt, const void* const* st,
                                    void* const* y, const int* n, int k, int group, int bf16w, void* stream) {
   if (!group_ok(k, group) || nseg < 1 || nseg > kMaxSegs) return (int)cudaErrorInvalidValue;
+  if (const int e = w4h_route(x, 1, nseg, wt, st, y, n, nullptr, k, group, bf16w, stream); e >= 0) return e;
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (mma_on(group, bf16w)) return mma_segs(x, 1, make_segs(nseg, wt, st, y, n, 16), k, s, group, 4);
   const KtSegs g = make_segs(nseg, wt, st, y, n, 4);
@@ -663,6 +694,7 @@ extern "C" int ak_w4_gemv_kt_multi(const void* x, int nseg, const void* const* w
 extern "C" int ak_w4_gemv_kt_batched(const void* x, const void* wt, const void* st, void* y, int m, int n, int k,
                                      int group, int bf16w, void* stream) {
   if (!group_ok(k, group) || m < 1 || m > 128) return (int)cudaErrorInvalidValue;
+  if (const int e = w4h_route(x, m, 1, &wt, &st, &y, &n, nullptr, k, group, bf16w, stream); e >= 0) return e;
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (mma_on(group, bf16w)) return mma_segs(x, m, make_segs(1, &wt, &st, &y, &n, 16), k, s, group, 4);
   if (m > 16) return (int)cudaErrorInvalidValue;  // exact path: <= 16 rows (ak_wq_gemv_kt_multi chunks larger m)
@@ -672,6 +704,7 @@ extern "C" int ak_w4_gemv_kt_batched(const void* x, const void* wt, const void* 
 
 extern "C" int ak_w4_dequant_kt(const void* wt, const void* st, void* w, int n, int k, int group, void* stream) {
   if (!group_ok(k, group) || k % 32 != 0) return (int)cudaErrorInvalidValue;
+  if (agens_w4h_is(wt)) return ak_w4h_dequant_rows(wt, st, w, n, k, 0, n, stream);
   if (agens_kf_is(wt)) return agens_kf_dequant_rows(wt, st, w, n, k, 0, n, static_cast<cudaStream_t>(stream));
   auto kern = group == 64 ? dequant_kt_kernel<64> : dequant_kt_kernel<128>;
   kern<<<num_sms() * 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -682,6 +715,7 @@ extern "C" int ak_w4_dequant_kt(const void* wt, const void* st, void* w, int n, 
 extern "C" int ak_w4_dequant_kt_rows(const void* wt, const void* st, void* w, int n, int k, int group, int r0, int nr,
                                      void* stream) {
   if (!group_ok(k, group) || k % 32 != 0 || r0 < 0 || nr < 1 || r0 + nr > n) return (int)cudaErrorInvalidValue;
+  if (agens_w4h_is(wt)) return ak_w4h_dequant_rows(wt, st, w, n, k, r0, nr, stream);
   if (agens_kf_is(wt)) return agens_kf_dequant_rows(wt, st, w, n, k, r0, nr, static_cast<cudaStream_t>(stream));
   auto kern = group == 64 ? dequant_kt_kernel<64> : dequant_kt_kernel<128>;
   kern<<<num_sms() * 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -791,6 +825,8 @@ extern "C" int ak_wq_gemv_kt_multi(int bits, const void* x, int m, int nseg, con
                                    const void* const* st, void* const* y, const int* n, const int* ldy, int k,
                                    int group, int bf16w, void* stream) {
   if (!group_ok(k, group) || nseg < 1 || nseg > kMaxSegs || m < 1 || m > 128) return (int)cudaErrorInvalidValue;
+  if (bits == 4)
+    if (const int e = w4h_route(x, m, nseg, wt, st, y, n, ldy, k, group, bf16w, stream); e >= 0) return e;
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   if (m > 16 && !mma_on(group, bf16w)) {  // exact path: 16-row chunks (rows bit-identical for any m)
     for (int m0 = 0; m0 < m; m0 += 16) {
@@ -813,6 +849,7 @@ extern "C" int ak_wq_gemv_kt_multi(int bits, const void* x, int m, int nseg, con
 extern "C" int ak_wq_dequant_kt_rows(int bits, const void* wt, const void* st, void* w, int n, int k, int group, int r0,
                                      int nr, void* stream) {
   if (!group_ok(k, group) || k % 32 != 0 || r0 < 0 || nr < 1 || r0 + nr > n) return (int)cudaErrorInvalidValue;
+  if (bits == 4 && agens_w4h_is(wt)) return ak_w4h_dequant_rows(wt, st, w, n, k, r0, nr, stream);
   if (bits == 4 && agens_kf_is(wt)) return agens_kf_dequant_rows(wt, st, w, n, k, r0, nr, static_cast<cudaStream_t>(stream));
   decltype(&dequant_kt_kernel<64, 4>) kern;
   switch (bits * 1000 + group) {
@@ -3165,6 +3202,7 @@ int mma_segs(const void* x, int m, const KtSegs& g, int k, cudaStream_t s, int g
 extern "C" int ak_w4_mma_gemv(const void* x, const void* wt, const void* st, void* y, int m, int n, int k, int group,
                               void* stream) {
   if (!group_ok(k, group) || m < 1 || m > 128) return (int)cudaErrorInvalidValue;
+  if (const int e = w4h_route(x, m, 1, &wt, &st, &y, &n, nullptr, k, group, 0, stream); e >= 0) return e;
   return mma_segs(x, m, make_segs(1, &wt, &st, &y, &n, 16), k, static_cast<cudaStream_t>(stream), group, 4);
 }
 extern "C" int ak_w4_set_lean(int rb) {  // lean register path: -1 auto (env / arch), 0 off, 1 / 2 / 4 row blocks

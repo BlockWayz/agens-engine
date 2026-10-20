@@ -6,6 +6,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <float.h>
+#include <algorithm>
 #include <stdint.h>
 
 namespace {
@@ -116,6 +117,58 @@ extern "C" int ak_argmax(const void* logits, int rows, int vocab, int vocab_vali
 extern "C" int ak_embed(const int32_t* ids, const void* table, void* out, int tokens, int d, void* stream) {
   embed_kernel<<<tokens, 128, 0, static_cast<cudaStream_t>(stream)>>>(ids, static_cast<const uint4*>(table),
                                                                       static_cast<uint4*>(out), d * 2 / 16);
+  return (int)cudaGetLastError();
+}
+namespace {
+// ak_bf16_bmm for the mHC res . H shape (m = k = 4): the tensor-core product cuBLAS computes (one bf16 MMA over the
+// four k terms in k slots 0..3, the other slots zero, fp32 accumulator from 0, one rounding), without its 32x32 WMMA
+// tile kernel (sm80 kernel, ~1.4 ms per 4096-token call on sm90; this one is memory bound). Warp = 16 output columns of
+// one token per mma.m16n8k16: A rows = columns c (A[c][k] = B_in[t][k][c]), B cols = output rows r (B[k][r] = A_in[t][r][k]).
+__device__ __forceinline__ uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
+  return (uint32_t)__bfloat16_as_ushort(lo) | ((uint32_t)__bfloat16_as_ushort(hi) << 16);
+}
+__global__ void bmm44_kernel(const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+                             __nv_bfloat16* __restrict__ C, int T, int n) {
+  const int lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+  const int groups = n / 16, per_tok = groups;
+  const long warps = (long)gridDim.x * (blockDim.x / 32);
+  const __nv_bfloat16 z = __ushort_as_bfloat16(0);
+  for (long w = blockIdx.x * (long)(blockDim.x / 32) + threadIdx.x / 32; w < (long)T * per_tok; w += warps) {
+    const int t = (int)(w / per_tok), c0 = (int)(w % per_tok) * 16;
+    const __nv_bfloat16* b = B + (size_t)t * 4 * n;
+    const __nv_bfloat16* a = A + (size_t)t * 16;
+    uint32_t a0 = 0, a1 = 0, b0 = 0;
+    if (t4 < 2) {
+      const int k = 2 * t4;
+      a0 = pack2(b[(size_t)k * n + c0 + g], b[(size_t)(k + 1) * n + c0 + g]);
+      a1 = pack2(b[(size_t)k * n + c0 + g + 8], b[(size_t)(k + 1) * n + c0 + g + 8]);
+      if (g < 4) b0 = pack2(a[g * 4 + k], a[g * 4 + k + 1]);
+    }
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a0), "r"(a1), "r"(0u), "r"(0u), "r"(b0), "r"(0u));
+    if (t4 < 2) {
+      __nv_bfloat16* c = C + (size_t)t * 4 * n;
+      const int r = 2 * t4;
+      c[(size_t)r * n + c0 + g] = __float2bfloat16_rn(d[0]);
+      c[(size_t)(r + 1) * n + c0 + g] = __float2bfloat16_rn(d[1]);
+      c[(size_t)r * n + c0 + g + 8] = __float2bfloat16_rn(d[2]);
+      c[(size_t)(r + 1) * n + c0 + g + 8] = __float2bfloat16_rn(d[3]);
+    }
+    (void)z;
+  }
+}
+}  // namespace
+// C [T][4][n] = A [T][4][4] . B [T][4][n] (n % 16 == 0), bit-identical to ak_bf16_bmm (tools/test_bmm44.py)
+extern "C" int ak_bf16_bmm44(const void* A, const void* B, void* C, int T, int n, void* stream) {
+  if (n % 16) return (int)cudaErrorInvalidValue;
+  const long warps = (long)T * (n / 16);
+  const int blocks = (int)std::min<long>((warps + 7) / 8, 132 * 16);
+  bmm44_kernel<<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(static_cast<const __nv_bfloat16*>(A),
+                                                                      static_cast<const __nv_bfloat16*>(B),
+                                                                      static_cast<__nv_bfloat16*>(C), T, n);
   return (int)cudaGetLastError();
 }
 // torch.bmm(A [T][m][k], B [T][k][n]) -> C [T][m][n], all bf16 row-major contiguous, issued like at::cuda::blas::bgemm

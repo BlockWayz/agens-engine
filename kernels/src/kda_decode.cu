@@ -223,11 +223,12 @@ __global__ void gated_rmsnorm_kernel(const __nv_bfloat16* __restrict__ x, const 
 // state untouched (verify); a commit then replays the accepted prefix with write_state = 1. n_dev (optional) caps T
 // with a count read on device (the commit length, graph-safe).
 // blockIdx.y = sequence z of a batched verify (rows z*T .. z*T+T-1, slot idx[z], count n_dev[z * n_stride])
-__global__ void conv_multi_kernel(const __nv_bfloat16* __restrict__ x, int x_stride, __nv_bfloat16* __restrict__ state,
-                                  const float* __restrict__ w, const int32_t* __restrict__ idx,
-                                  __nv_bfloat16* __restrict__ y, int dim, int T, const int* __restrict__ n_dev,
-                                  int write_state, int n_stride) {
-  const int c = blockIdx.x * blockDim.x + threadIdx.x, z = blockIdx.y;
+__device__ __forceinline__ void conv_multi_body(const __nv_bfloat16* __restrict__ x, int x_stride,
+                                                __nv_bfloat16* __restrict__ state, const float* __restrict__ w,
+                                                const int32_t* __restrict__ idx, __nv_bfloat16* __restrict__ y, int dim,
+                                                int T, const int* __restrict__ n_dev, int write_state, int n_stride,
+                                                int bx, int z) {
+  const int c = bx * 256 + threadIdx.x;  // blockDim 256
   if (c >= dim) return;
   const int slot = idx[z];
   if (slot < 0) return;
@@ -248,6 +249,13 @@ __global__ void conv_multi_kernel(const __nv_bfloat16* __restrict__ x, int x_str
     if (y) y[(size_t)t * dim + c] = __float2bfloat16_rn(out);
   }
   if (write_state) s[c] = s0, s[dim + c] = s1, s[2 * dim + c] = s2;
+}
+__global__ void __launch_bounds__(256) conv_multi_kernel(const __nv_bfloat16* __restrict__ x, int x_stride,
+                                                         __nv_bfloat16* __restrict__ state, const float* __restrict__ w,
+                                                         const int32_t* __restrict__ idx, __nv_bfloat16* __restrict__ y,
+                                                         int dim, int T, const int* __restrict__ n_dev, int write_state,
+                                                         int n_stride) {
+  conv_multi_body(x, x_stride, state, w, idx, y, dim, T, n_dev, write_state, n_stride, blockIdx.x, blockIdx.y);
 }
 
 template <int K, int V>
@@ -412,16 +420,15 @@ kda_multi_pre_kernel(const __nv_bfloat16* __restrict__ qkv, int qkv_stride, cons
 // operations of kda_multi_pre_kernel (rows are independent; the prologue is per token), so outputs and state are
 // bit-identical, with NW times the warps in flight (the single-warp kernel runs 1.5 warps per sm90 SM: 192 blocks).
 template <int K, int V, int NW>
-__global__ void __launch_bounds__(32 * NW)
-kda_multi_pre_w_kernel(const __nv_bfloat16* __restrict__ qkv, int qkv_stride, const __nv_bfloat16* __restrict__ a,
-                       int a_stride, const __nv_bfloat16* __restrict__ b, int b_stride, const float* __restrict__ A_log,
-                       const float* __restrict__ dt_bias, float* __restrict__ state, const int32_t* __restrict__ idx,
-                       __nv_bfloat16* __restrict__ out, float scale, int H, int HV, int T, const int* __restrict__ n_dev,
-                       int write_state, int n_stride) {
+__device__ __forceinline__ void
+kda_multi_pre_w_body(const __nv_bfloat16* __restrict__ qkv, int qkv_stride, const __nv_bfloat16* __restrict__ a,
+                     int a_stride, const __nv_bfloat16* __restrict__ b, int b_stride, const float* __restrict__ A_log,
+                     const float* __restrict__ dt_bias, float* __restrict__ state, const int32_t* __restrict__ idx,
+                     __nv_bfloat16* __restrict__ out, float scale, int H, int HV, int T, const int* __restrict__ n_dev,
+                     int write_state, int n_stride, int i_v, int i_hv, int z) {
   constexpr int TM = 8, RW = 32 / NW;
   __shared__ float sq[TM][32][4], sk[TM][32][4], sd[TM][32][4], sv[TM][32], sb[TM];
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int i_v = blockIdx.x, i_hv = blockIdx.y, z = blockIdx.z;  // z: sequence of a batched verify
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;  // z: sequence of a batched verify
   const int i_h = i_hv / (HV / H);
   const int slot = idx[z];
   const int n = n_dev ? min(n_dev[z * n_stride], T) : T;
@@ -499,7 +506,192 @@ kda_multi_pre_w_kernel(const __nv_bfloat16* __restrict__ qkv, int qkv_stride, co
     for (int r = 0; r < RW; ++r)
       *reinterpret_cast<float4*>(h + (rb + r) * K + 4 * lane) = make_float4(hs[r][0], hs[r][1], hs[r][2], hs[r][3]);
 }
+template <int K, int V, int NW>
+__global__ void __launch_bounds__(32 * NW)
+kda_multi_pre_w_kernel(const __nv_bfloat16* __restrict__ qkv, int qkv_stride, const __nv_bfloat16* __restrict__ a,
+                       int a_stride, const __nv_bfloat16* __restrict__ b, int b_stride, const float* __restrict__ A_log,
+                       const float* __restrict__ dt_bias, float* __restrict__ state, const int32_t* __restrict__ idx,
+                       __nv_bfloat16* __restrict__ out, float scale, int H, int HV, int T, const int* __restrict__ n_dev,
+                       int write_state, int n_stride) {
+  kda_multi_pre_w_body<K, V, NW>(qkv, qkv_stride, a, a_stride, b, b_stride, A_log, dt_bias, state, idx, out, scale, H, HV, T,
+                                 n_dev, write_state, n_stride, blockIdx.x, blockIdx.y, blockIdx.z);
+}
+// Speculative commit of every KDA layer in one launch: blockIdx.y = layer, blockIdx.z = sequence; blockIdx.x < nconv:
+// that layer's conv-state replay block (conv_multi_body), else its recurrent-state replay block (kda_multi_pre_w_body,
+// 8 warps). The layers' updates are independent, and each block runs exactly the per-layer kernels' code: the same bits.
+__global__ void __launch_bounds__(256) kda_commit_all_kernel(const __grid_constant__ KdaCommitArgs a) {
+  const KdaCommitLayer& L = a.L[blockIdx.y];
+  const int nconv = (a.conv_dim + 255) / 256, z = blockIdx.z;
+  if ((int)blockIdx.x < nconv) {
+    conv_multi_body(L.sq, a.conv_dim, static_cast<__nv_bfloat16*>(L.conv), L.conv_w, a.slot, nullptr, a.conv_dim, a.T,
+                    a.n_dev, 1, a.n_stride, blockIdx.x, z);
+    return;
+  }
+  const int bd = blockIdx.x - nconv;
+  kda_multi_pre_w_body<128, 128, 8>(L.sc, a.conv_dim, L.sa, a.a_stride, L.sb, a.b_stride, L.A_log, L.dt_bias, L.ssm, a.slot,
+                                    nullptr, a.scale, a.H, a.HV, a.T, a.n_dev, 1, a.n_stride, bd % 4, bd / 4, z);
+}
+// Speculative verify of one KDA layer in one launch (T <= 8 tokens per sequence, K = V = 128): for value head hv (blockIdx.x)
+// of sequence z (blockIdx.y), bit-identical to
+//   conv_multi_kernel (write_state 0; its y = the stash sc)  ->  kda_multi_pre_w_kernel<128, 128, 8> (write_state 0)
+//   ->  gated_rmsnorm_kernel
+// 1024 threads = the 4 blocks (i_v = 32-column tiles) of the recurrent kernel: warp w is warp w % 8 of tile w / 8. The
+// conv runs here for the head's 384 channels (q / k of head h = hv / (HV / H), v of hv; q / k stash writes repeat across
+// the HV / H heads that share them, with the same values); the token prologue (q / k norms, decays, beta), identical
+// in the 4 tiles, runs once (token t on warp t); the 4 tiles' outputs meet in shared memory for the 128-column norm.
+__global__ void __launch_bounds__(1024) kda_verify_fused_kernel(const __grid_constant__ KdaVerifyArgs a) {
+  constexpr int K = 128, V = 128, TM = 8;
+  __shared__ __nv_bfloat16 sx[TM][3 * 128];  // conv outputs: q (128), k (128), v (128) channels of the head
+  __shared__ float sq[TM][32][4], sk[TM][32][4], sd[TM][32][4], sv[TM][128], sb[TM];
+  __shared__ __nv_bfloat16 so[TM][128];      // recurrent outputs (bf16, as the kernel stores them)
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int i_hv = blockIdx.x, z = blockIdx.y, H = a.H, HV = a.HV, T = a.T, i_h = i_hv / (HV / H);
+  const int slot = a.slot[z];
+  const size_t row0 = (size_t)z * T;  // this sequence's first token row
+  // 1. conv (conv_multi_body's per-channel code; slot < 0: no output, as there)
+  if (tid < 384 && slot >= 0) {
+    const int part = tid >> 7, cc = tid & 127;
+    const int c = part == 0 ? i_h * K + cc : part == 1 ? H * K + i_h * K + cc : 2 * H * K + i_hv * V + cc;
+    const __nv_bfloat16* s = a.conv + (size_t)slot * 3 * a.dim;
+    __nv_bfloat16 s0 = s[c], s1 = s[a.dim + c], s2 = s[2 * a.dim + c];
+    const float4 w4 = *reinterpret_cast<const float4*>(a.conv_w + (size_t)c * 4);
+    const float wc[4] = {w4.x, w4.y, w4.z, w4.w};
+    __nv_bfloat16 xs[TM];  // the T tokens' inputs loaded together (one memory latency, not T)
+#pragma unroll
+    for (int t = 0; t < TM; ++t) xs[t] = t < T ? a.x[(row0 + t) * a.x_stride + c] : __nv_bfloat16{};
+#pragma unroll
+    for (int t = 0; t < TM; ++t) {
+      if (t >= T) break;
+      const __nv_bfloat16 xin = xs[t];
+      float acc = __fmaf_rn(__bfloat162float(s0), wc[0], 0.0f);
+      acc = __fmaf_rn(__bfloat162float(s1), wc[1], acc);
+      acc = __fmaf_rn(__bfloat162float(s2), wc[2], acc);
+      acc = __fmaf_rn(wc[3], __bfloat162float(xin), acc);
+      const float out = div_full(acc, __fadd_rn(tri_exp(__fsub_rn(0.0f, acc)), 1.0f));
+      s0 = s1, s1 = s2, s2 = xin;
+      const __nv_bfloat16 ob = __float2bfloat16_rn(out);
+      a.y[(row0 + t) * a.dim + c] = ob;
+      sx[t][tid] = ob;
+    }
+  }
+  __syncthreads();
+  // 2. token prologue (kda_multi_pre_w_body, token t on warp t; the v row: all 128 columns)
+  if (slot >= 0 && warp < TM && warp < T) {
+    const int t = warp;
+    float q[4], k[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) q[j] = __bfloat162float(sx[t][4 * lane + j]), k[j] = __bfloat162float(sx[t][128 + 4 * lane + j]);
+    const float qn = sqrt_approx_ftz(__fadd_rn(bfly_sum(dot4(q, q)), F(0x358637BDu)));
+    const float kn = sqrt_approx_ftz(__fadd_rn(bfly_sum(dot4(k, k)), F(0x358637BDu)));
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      sq[t][lane][j] = __fmul_rn(div_full(q[j], qn), a.scale);
+      sk[t][lane][j] = div_full(k[j], kn);
+    }
+    const float negA = __fsub_rn(0.0f, tri_exp(a.A_log[i_hv]));
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int kk = i_hv * K + 4 * lane + j;
+      const float xg = __fadd_rn(__bfloat162float(a.ag[(row0 + t) * a.a_stride + kk]), a.dt_bias[kk]);
+      const float sp = xg <= 20.0f ? tri_log(__fadd_rn(tri_exp(xg), 1.0f)) : xg;
+      sd[t][lane][j] = tri_exp(__fmul_rn(sp, negA));
+    }
+    if (lane == 0) {
+      const float bv = __bfloat162float(a.b[(row0 + t) * a.b_stride + i_hv]);
+      sb[t] = div_full(1.0f, __fadd_rn(tri_exp(__fsub_rn(0.0f, bv)), 1.0f));
+    }
+#pragma unroll
+    for (int q4 = 0; q4 < 4; ++q4) sv[t][q4 * 32 + lane] = __bfloat162float(sx[t][256 + q4 * 32 + lane]);
+  }
+  __syncthreads();
+  // 3. recurrence: tile i_v = warp / 8, rows (warp % 8) * 4 .. + 3 of its 32 (RW = 4)
+  {
+    const int i_v = warp >> 3, rb = (warp & 7) * 4;
+    if (slot < 0) {
+      if ((warp & 7) == 0)
+        for (int t = 0; t < T; ++t) so[t][i_v * 32 + lane] = __float2bfloat16_rn(0.f);
+    } else {
+      const float* h = a.ssm + (size_t)slot * HV * V * K + (size_t)i_hv * V * K + (size_t)i_v * 32 * K;
+      float hs[4][4];
+#pragma unroll
+      for (int r = 0; r < 4; ++r) {
+        const float4 v4 = *reinterpret_cast<const float4*>(h + (rb + r) * K + 4 * lane);
+        hs[r][0] = v4.x, hs[r][1] = v4.y, hs[r][2] = v4.z, hs[r][3] = v4.w;
+      }
+      for (int t = 0; t < T; ++t) {
+        float q[4], k[4], dec[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) q[j] = sq[t][lane][j], k[j] = sk[t][lane][j], dec[j] = sd[t][lane][j];
+        const float beta = sb[t];
+        float res[4];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          float hr[4] = {__fmul_rn(hs[r][0], dec[0]), __fmul_rn(hs[r][1], dec[1]), __fmul_rn(hs[r][2], dec[2]),
+                         __fmul_rn(hs[r][3], dec[3])};
+          const float kv = bfly_sum(dot4(k, hr));
+          const float vnew = __fmul_rn(__fsub_rn(sv[t][i_v * 32 + rb + r], kv), beta);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) hs[r][j] = __fmaf_rn(vnew, k[j], hr[j]);
+          res[r] = bfly_sum(dot4(q, hs[r]));
+        }
+        if (lane < 4) {
+          float v = res[0];
+#pragma unroll
+          for (int r = 1; r < 4; ++r) v = lane == r ? res[r] : v;
+          so[t][i_v * 32 + rb + lane] = __float2bfloat16_rn(v);
+        }
+      }
+    }
+  }
+  __syncthreads();
+  // 4. gated RMSNorm of the T rows (t, hv): row t on half-warp t (16 lanes x 8 columns), gated_rmsnorm_kernel's code
+  if (warp < (T + 1) / 2) {  // whole warps (the shuffles); a half-warp past row T - 1 computes and writes nothing
+    const int t = tid >> 4, l = tid & 15;
+    float xv[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) xv[j] = t < T ? __bfloat162float(so[t][8 * l + j]) : 0.f;
+    float s = dot8_sq(xv);
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, o));
+    if (t >= T) return;
+    const float var = div_full(s, 128.0f);
+    const float rstd = div_full(1.0f, sqrt_approx_ftz(__fadd_rn(var, a.eps)));
+    const size_t rowi = ((row0 + t) * HV + i_hv) * 128;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const size_t i = rowi + 8 * l + j;
+      const float gv = __bfloat162float(a.g[i]);
+      const float sig = div_full(1.0f, __fadd_rn(tri_exp(__fsub_rn(0.0f, gv)), 1.0f));
+      float v = __fmul_rn(__fmul_rn(xv[j], rstd), __bfloat162float(a.w[8 * l + j]));
+      v = __fmul_rn(__fmul_rn(v, gv), sig);
+      a.out[i] = __float2bfloat16_rn(v);
+    }
+  }
+}
 }  // namespace
+
+// one KDA layer's speculative verify (conv + recurrence + gated norm) in one launch; nb sequences of T <= 8 tokens
+// (cudaErrorNotSupported when the per-layer kernels would not be the 8-warp preload ones, or T > 8)
+extern "C" int ak_kda_verify_fused(const KdaVerifyArgs* args, int nb, void* stream) {
+  static const int pre = [] { const char* e = getenv("AGENS_KDA_MULTI_PRELOAD"); return !(e && e[0] == '0'); }();
+  static const int nw = [] { const char* e = getenv("AGENS_KDA_MULTI_WARPS"); return e ? atoi(e) : 8; }();
+  if (!pre || nw < 8 || args->T < 1 || args->T > 8 || args->HV % args->H) return (int)cudaErrorNotSupported;
+  kda_verify_fused_kernel<<<dim3(args->HV, nb), 1024, 0, static_cast<cudaStream_t>(stream)>>>(*args);
+  return (int)cudaGetLastError();
+}
+
+// every KDA layer's speculative commit in one launch (nb sequences; nb = 1: the single-sequence commit): the same bits as
+// ak_kda_conv_multi(_b) + ak_kda_decode_multi(_b) per layer. cudaErrorNotSupported when the per-layer kernels would not be
+// the 8-warp preload kernel (AGENS_KDA_MULTI_PRELOAD=0 / AGENS_KDA_MULTI_WARPS != 8) or the shape is not K = V = 128.
+extern "C" int ak_kda_commit_all(const KdaCommitArgs* args, int nb, void* stream) {
+  static const int pre = [] { const char* e = getenv("AGENS_KDA_MULTI_PRELOAD"); return !(e && e[0] == '0'); }();
+  static const int nw = [] { const char* e = getenv("AGENS_KDA_MULTI_WARPS"); return e ? atoi(e) : 8; }();
+  if (!pre || nw < 8 || args->T > 8 || args->nl < 1 || args->nl > kKdaCommitMaxLayers || args->HV % args->H)
+    return (int)cudaErrorNotSupported;
+  const int nconv = (args->conv_dim + 255) / 256;
+  kda_commit_all_kernel<<<dim3(nconv + 4 * args->HV, args->nl, nb), 256, 0, static_cast<cudaStream_t>(stream)>>>(*args);
+  return (int)cudaGetLastError();
+}
 
 extern "C" int ak_kda_gated_rmsnorm(const void* x, const void* g, const void* w, void* y, int rows, int d, float eps,
                                     void* stream) {

@@ -32,7 +32,10 @@ pub fn launch(tp: usize) -> Result<()> {
     }
     std::env::set_var("AGENS_TP_SIZE", tp.to_string());
     std::env::set_var("AGENS_TP_RANK", "0");
-    std::env::set_var("AGENS_TP_ID", std::process::id().to_string());
+    // the pid alone repeats across containers (PID namespaces, --ipc=host shares /dev/shm): a stale handle file of an
+    // earlier run with the same pid was read as this run's peer handle (tp_region_open: invalid argument)
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    std::env::set_var("AGENS_TP_ID", format!("{}x{nanos:x}", std::process::id()));
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut ins = Vec::new();
@@ -121,9 +124,16 @@ pub fn setup_allreduce(slot_elems: usize) -> Result<()> {
         }
     }
     agens_cuda::m1::tp_setup(r, &regions, slot_elems)?;
+    // every rank holds every region (and has initialised its own): the handle files and shm names can go
+    std::fs::write(f(r, "ok"), "ok\n")?;
+    for q in 0..n {
+        wait_file(&f(q, "ok"), "peer setup")?;
+    }
     if let Some(it) = std::env::var("AGENS_TP_AR_SELFTEST").ok().and_then(|v| v.parse::<usize>().ok()) {
         let bad = agens_cuda::m1::tp_selftest(it, slot_elems.min(1 << 22));
         eprintln!("tp: rank {r} all-reduce self-test: {it} rounds, {bad} wrong elements");
+        let pb = agens_cuda::m1::tp_push_selftest(it);
+        eprintln!("tp: rank {r} push all-reduce + fused add/RMSNorm vs pull (bitwise): {it} rounds, {pb} differing elements");
     }
     if std::env::var("AGENS_TP_AR_BENCH").map(|v| v == "1").unwrap_or(false) {
         for n in [5120usize, 8 * 5120, 64 * 5120, 1024 * 5120] {
@@ -132,11 +142,15 @@ pub fn setup_allreduce(slot_elems: usize) -> Result<()> {
                 eprintln!("tp: rank {r} all-reduce of {n} elements ({} rows): {us:.1} us", n / 5120);
             }
         }
-    }
-    // every rank holds every region: the handle files and shm names can go
-    std::fs::write(f(r, "ok"), "ok\n")?;
-    for q in 0..n {
-        wait_file(&f(q, "ok"), "peer setup")?;
+        for rows in [1usize, 8, 16, 64, 128, 256] {
+            if rows * 5120 > slot_elems {
+                continue;
+            }
+            let v: Vec<String> = [(4, "empty kernel"), (0, "pull"), (1, "push"), (2, "pull+norm"), (3, "fused")].iter().flat_map(|&(w, nm)| {
+                [false, true].map(|g| format!("{nm}{} {:.2}", if g { "/graph" } else { "" }, agens_cuda::m1::tp_bench2(50, rows, w, g)))
+            }).collect();
+            eprintln!("tp: rank {r} {rows} rows, us per call: {}", v.join(", "));
+        }
     }
     let _ = std::fs::remove_file(f(r, "h"));
     for w in ["pool"] {
@@ -147,6 +161,11 @@ pub fn setup_allreduce(slot_elems: usize) -> Result<()> {
     }
     std::thread::sleep(Duration::from_millis(200));
     let _ = std::fs::remove_file(f(r, "ok"));
+    if std::env::var("AGENS_TP_AR_ONLY").map(|v| v == "1").unwrap_or(false) {
+        // microbench runs: stop after the self-test / timing (every rank exits on its own)
+        eprintln!("tp: rank {r} AGENS_TP_AR_ONLY: exit");
+        std::process::exit(0);
+    }
     eprintln!("tp: rank {r}/{n} all-reduce over {} ({:.0} MB per rank)", if peer { "CUDA IPC (peer GPUs)" } else { "host shared memory" },
               bytes as f64 / 1e6);
     Ok(())
@@ -171,6 +190,8 @@ fn follow() -> Result<()> {
     let stdin = std::io::stdin();
     let mut parked: std::collections::HashMap<i32, *mut std::ffi::c_void> = Default::default();
     let mut snap: (*mut std::ffi::c_void, usize) = (std::ptr::null_mut(), 0); // this rank's Session State snapshot
+    let mut snaps: std::collections::HashMap<u64, *mut std::ffi::c_void> = Default::default(); // prefix cache buffers
+    let mut snap_free: Vec<*mut std::ffi::c_void> = Vec::new();
     for line in stdin.lock().lines() {
         let line = line?;
         let a: Vec<&str> = line.split(' ').collect();
@@ -190,6 +211,16 @@ fn follow() -> Result<()> {
                 }
                 "spec_sampling" => m1::spec_sampling_filtered(a[1].parse()?, int(3)?, a[4].parse()?, a[5].parse()?, int(2)?)?,
                 "session_sampling" => m1::session_sampling(int(1)?, a[2].parse()?, int(3)?, a[4].parse()?, a[5].parse()?, int(6)?)?,
+                "session_penalty" => {
+                    let ids = split(a[5]);
+                    let vals: Vec<f32> = if a[6] == "-" { Vec::new() } else { a[6].split(',').map(|x| x.parse()).collect::<Result<_, _>>()? };
+                    let bias: Vec<(u32, f32)> = ids.iter().zip(&vals).map(|(&t, &v)| (t as u32, v)).collect();
+                    m1::session_penalty(int(1)?, a[2].parse()?, a[3].parse()?, a[4].parse()?, &bias)?
+                }
+                "session_penalty_add" => {
+                    let ids: Vec<u32> = split(a[2]).iter().map(|&t| t as u32).collect();
+                    m1::session_penalty_add(int(1)?, &ids)?
+                }
                 "session_new" => drop(m1::session_new()?),
                 "session_use" => m1::session_use(int(1)?)?,
                 "session_fork" => drop(m1::session_fork(int(1)?)?),
@@ -203,6 +234,29 @@ fn follow() -> Result<()> {
                     let id = int(1)?;
                     let buf = *parked.get(&id).context("tp: unpark of a session this rank never parked")?;
                     m1::session_unpark(id, buf)?
+                }
+                "snap_pool" => {
+                    for _ in 0..a[1].parse::<usize>()? {
+                        snap_free.push(if a[2] == "d" {
+                            agens_cuda::leak(agens_cuda::device_alloc(m1::snap_bytes())?)
+                        } else {
+                            agens_cuda::host_alloc(m1::snap_bytes())?
+                        });
+                    }
+                }
+                "session_snap" => {
+                    let buf = snap_free.pop().context("tp: snapshot pool used up")?;
+                    snaps.insert(a[2].parse()?, buf);
+                    drop(m1::session_snap(int(1)?, buf, 0)?)
+                }
+                "session_from_snap" => {
+                    let buf = *snaps.get(&a[2].parse::<u64>()?).context("tp: restore of a snapshot this rank never took")?;
+                    drop(m1::session_from_snap(int(1)?, buf, 0)?)
+                }
+                "snap_drop" => {
+                    if let Some(b) = snaps.remove(&a[1].parse::<u64>()?) {
+                        snap_free.push(b);
+                    }
                 }
                 "verify" => drop(m1::verify(&split(a[1]))?),
                 "prefill_mm" => drop(m1::prefill_mm_blob(&agens_cuda::tp::take_blob(a[1])?)?),

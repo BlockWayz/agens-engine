@@ -3,6 +3,11 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#ifdef __CUDACC__
+#include <cuda_bf16.h>
+#else
+typedef struct { unsigned short x; } __nv_bfloat16;  // layout only (structs below)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,6 +71,7 @@ int ak_kda_decode_multi_b(const void* qkv, int qkv_stride, const void* a, int a_
                           float scale, int H, int HV, int K, int V, int T, int nb, const int* n_dev, int n_stride,
                           int write_state, void* stream);
 int ak_bf16_gemv_bi(const void* x, const void* w, const void* bias, void* y, int m, int n, int k, void* stream);
+int ak_bf16_gemv_bi_ld(const void* x, const void* w, const void* bias, void* y, int m, int n, int k, long ldy, void* stream);
 // per-token C[t][m][n] = A[t][m][k] . B[t][k][n], fp32 sequential sum over k, one bf16 rounding
 int ak_bf16_bmm_bi(const void* A, const void* B, void* C, int T, int m, int k, int n, void* stream);
 
@@ -111,6 +117,8 @@ int ak_scale_rows(const void* g, const void* v, void* y, int rows, int d, void* 
 int ak_argmax(const void* logits, int rows, int vocab, int vocab_valid, int* out, void* stream);
 int ak_embed(const int32_t* ids, const void* table, void* out, int tokens, int d, void* stream);
 int ak_bf16_bmm(const void* A, const void* B, void* C, int T, int m, int k, int n, void* stream);
+// the mHC shape (m = k = 4) of ak_bf16_bmm, same bits, memory bound (prefill)
+int ak_bf16_bmm44(const void* A, const void* B, void* C, int T, int n, void* stream);
 
 // ---- RMSNorm (gemma=1: x*r*(1+w), else x*r*w), bit-exact with sglv23 (flashinfer 0.6.15 CuTe-DSL RMSNormKernel)
 int ak_rmsnorm(const void* x, const void* w, void* y, int rows, int d, int stride_in, int stride_out, float eps, int gemma,
@@ -186,6 +194,23 @@ int ak_w4_set_lean(int rb);
 int ak_w4_set_kf(int on);              // W4 g128 repacked from now on in the KF layout (AGENS_W4F); previous setting
 int ak_w4_is_kf(const void* wt);
 int ak_w4_kf_forget(const void* wt);  // before freeing a KF weight
+// W4H (sm90 / sm100; kernels/src/w4h.cu, layout spec in its header): W4 g128 in a fragment-major layout built at load
+// time (n % 16 == 0, k % 128 == 0, k <= 9216; n * k / 2 weight bytes + n * k / 64 scale bytes, within the KT buffers of
+// the same linear), streamed by a bulk-copy ring. ak_w4h_gemm: 1 <= m <= 128, nseg <= 4 linears sharing x, output of
+// token j at y[i] + j * ldy[i] (ldy = nullptr: n[i]). Outputs bit-identical to the tensor-core KT path (ak_w4_mma_gemv & co.) for every m; rows bit-identical for any m.
+size_t ak_w4h_weight_bytes(int n, int k);
+size_t ak_w4h_scale_bytes(int n, int k);
+int ak_w4h_ok(int n, int k);
+int ak_w4h_repack(const int32_t* packed, const void* scales, void* wt, void* st, int n, int k, void* stream);
+int ak_w4h_gemm(const void* x, int m, int nseg, const void* const* wt, const void* const* st, void* const* y,
+                const int* n, const int* ldy, int k, void* stream);
+int ak_w4h_dequant_rows(const void* wt, const void* st, void* w, int n, int k, int r0, int nr, void* stream);
+// Engine use: with AGENS_W4H=1 (or ak_w4h_set_mode(1)) ak_w4_repack_kt / ak_wq_repack_kt (bits 4, group 128) write
+// eligible linears in W4H instead of KT, into the same buffers, and every KT entry point (GEMV / multi / batched,
+// dequant) routes those weights to the W4H kernels -- same bits. ak_w4h_forget before freeing a W4H weight.
+int ak_w4h_set_mode(int mode);  // 0 off, 1 on, -1 re-read AGENS_W4H; returns the previous mode
+int ak_w4h_is(const void* wt);
+int ak_w4h_forget(const void* wt);
 // W3 KT (3-bit values q in [-4, 3] in the W4 KT tiling, 3/8 byte per weight; scales as W4 KT): repack from the int4
 // container (cudaErrorInvalidValue if a value needs 4 bits), and the W4 KT entry points' W3 twins -- bit-identical to
 // the exact W4 KT path on the same values.
@@ -231,6 +256,80 @@ int ak_w4g128_gemv_kt_tune(int r, int u, int warps, int bps, const void* x, cons
 // fused residual add + RMSNorm (s = bf16(a + b) written to s_out, y = RMSNorm(s)); d in (3072, 6144]
 int ak_add_rmsnorm(const void* a, const void* b, void* s_out, const void* w, void* y, int rows, int d, float eps,
                    int gemma, void* stream);
+// Fused mHC layer boundary for decode / verify rows (hidden 5120): layer i's res.H bmm + combine (+ its last residual add
+// yb) -> layer i + 1's mean RMSNorm, dyn GEMV (batch-invariant), mix + Sinkhorn and input RMSNorm; bit-identical to
+// ak_bf16_bmm_bi, ak_mhc_combine(_add), ak_rmsnorm (gemma 0), ak_bf16_gemv_bi (n 24), ak_mhc_mix, ak_rmsnorm (gemma 1).
+typedef struct MhcFusedArgs {
+  const __nv_bfloat16 *dcur, *res_s_cur;  // layer i: dyn rows [T][24] and res_static (its res is recomputed from them)
+  const __nv_bfloat16 *Hold, *post, *Y, *Yb, *Xi;  // layer i: H [T][4][5120], post [T][4], rows [T][5120] (Yb nullable)
+  __nv_bfloat16 *Hn, *hmn, *cap;                   // out: H' [T][4][5120], mean [T][5120], stream 0 copy (nullable)
+  long cap_ld;
+  const __nv_bfloat16 *wn, *wdyn, *pre_s, *post_s, *res_s, *wln;  // layer i + 1: norm.weight, dyn [24][5120], statics, input_layernorm
+  __nv_bfloat16 *d, *xin, *post_o, *res_o, *h;     // out: dyn [T][24] (may be dcur), x_in (may be Xi), post, res, normalized x_in
+  float eps;
+  int iters, write_res;                            // write_res: also layer i + 1's res (else the next boundary computes it)
+  const __nv_bfloat16* wb;                         // nullable: layer i + 1's in_proj_b [nb_out][5120] (KDA), bout = h . wb^T
+  int nb_out;                                      // <= 48
+  __nv_bfloat16* bout;                             // [T][nb_out]
+} MhcFusedArgs;
+int ak_mhc_fused_ok(void);  // the device can launch it (thread-block clusters: sm90+)
+int ak_mhc_fused(const MhcFusedArgs* args, int T, void* stream);
+// the same with layer i's MLP tensor-parallel all-reduce folded in (Yb = this rank's partial; push path only);
+// ak_mhc_fused_ar_ok(T): whether it can take T rows (else all-reduce Yb and call ak_mhc_fused)
+int ak_mhc_fused_ar_ok(int T);
+int ak_mhc_fused_ar(const MhcFusedArgs* args, int T, void* stream);
+// Speculative commit of every KDA layer in one launch (K = V = 128, T <= 8): per layer the conv-state replay of the stashed
+// pre-conv rows sq and the recurrent-state replay of the stashed conv outputs sc / gates sa / betas sb over the n_dev
+// accepted tokens; bit-identical to ak_kda_conv_multi(_b) + ak_kda_decode_multi(_b) per layer (write_state 1, no outputs).
+#define kKdaCommitMaxLayers 64
+typedef struct KdaCommitLayer {
+  const __nv_bfloat16 *sq, *sc, *sa, *sb;
+  void* conv;
+  const float *conv_w, *A_log, *dt_bias;
+  float* ssm;
+} KdaCommitLayer;
+typedef struct KdaCommitArgs {
+  KdaCommitLayer L[kKdaCommitMaxLayers];
+  int nl, conv_dim, a_stride, b_stride, T, n_stride, H, HV;  // conv_dim = the stash row stride of sq / sc too
+  const int32_t* slot;                                    // [nb] state slots
+  const int* n_dev;                                       // accepted count of sequence z at n_dev[z * n_stride]
+  float scale;
+} KdaCommitArgs;
+int ak_kda_commit_all(const KdaCommitArgs* args, int nb, void* stream);
+// One KDA layer's speculative verify in one launch (K = V = 128, T <= 8 tokens per sequence, nb sequences): conv over the
+// stashed pre-conv rows x (state untouched) -> y (the stash sc), recurrence (state untouched), gated RMSNorm with gate g
+// -> out; bit-identical to ak_kda_conv_multi(_b) + ak_kda_decode_multi(_b) + ak_kda_gated_rmsnorm.
+typedef struct KdaVerifyArgs {
+  const __nv_bfloat16* x;      // [nb * T][x_stride] pre-conv q|k|v rows
+  __nv_bfloat16* y;            // [nb * T][dim] conv outputs (the commit's stash)
+  const __nv_bfloat16* conv;   // conv state [slots][3][dim]
+  const float* conv_w;         // [dim][4]
+  const __nv_bfloat16 *ag, *b; // gates [rows][a_stride], betas [rows][b_stride]
+  const float *A_log, *dt_bias;
+  const float* ssm;            // [slots][HV][V][K]
+  const int32_t* slot;         // [nb]
+  const __nv_bfloat16 *g, *w;  // the norm's gate z [rows][HV][128] and weight [128]
+  __nv_bfloat16* out;          // [rows][HV][128]
+  int x_stride, dim, a_stride, b_stride, H, HV, T;
+  float scale, eps;
+} KdaVerifyArgs;
+int ak_kda_verify_fused(const KdaVerifyArgs* args, int nb, void* stream);
+// Attention q / k prep for decode / verify rows (head_dim 256, rot 64): split_q_gate + q / k RMSNorm (gemma) + MRoPE +
+// store_kv in one launch, bit-identical to those kernels in that order.
+typedef struct QkPrepArgs {
+  const __nv_bfloat16* qg;            // [T][nq][2][256] (q | gate per head)
+  __nv_bfloat16 *q, *gate, *k;        // out q, gate [T][nq][256]; k [T][nk][256] in place
+  const __nv_bfloat16* v;             // [T][nk][256]
+  __nv_bfloat16 *kc, *vc;             // caches [rows][nk][256], row loc[t] (kc null: no store)
+  const int* loc;
+  const __nv_bfloat16 *wq, *wk;       // q_norm / k_norm weights [256]
+  const float* cache;                 // nullable cos|sin [pos][64]
+  const int64_t* pos;                 // [3][pstride] MRoPE positions (pstride 0: one row for every axis = plain RoPE)
+  long pstride;
+  int T, nq, nk, sec_h, sec_w;
+  float eps, theta;
+} QkPrepArgs;
+int ak_qk_prep(const QkPrepArgs* args, void* stream);
 // ak_mhc_combine with y = bf16(y + yb) folded in
 int ak_mhc_combine_add(const void* mixed, int m_st, int m_ss, const void* post, const void* y, const void* yb, int y_st,
                        const void* x_in, int x_st, void* out, int o_st, int o_ss, void* mean, int mean_st, int T, int dim,
@@ -244,10 +343,19 @@ int ak_tp_can_peer(int dev, int peer);
 int ak_tp_setup(int rank, int size, void* const* regions, long slot_elems);
 size_t ak_tp_region_bytes(long slot_elems);
 int ak_tp_allreduce(void* x, long n, void* stream);
+// the mixer all-reduce fused with its residual add + RMSNorm (bits of ak_tp_allreduce + ak_add_rmsnorm; mo unchanged);
+// cudaErrorNotSupported when the push path cannot take it (the caller runs the two calls)
+int ak_tp_allreduce_add_rmsnorm(const void* mo, const void* res, void* s_out, const void* w, void* y, int rows, int d,
+                                float eps, int gemma, void* stream);
+long ak_tp_push_selftest(int iters);
+double ak_tp_bench2(int iters, long rows, int which, int graph);
 // this process's head share for the far branch (q / kv heads, 6 q heads per kv head) and the KDA prefill (q / k heads)
 int ak_far_set_heads(int qh, int kvh);
 int ak_kda_prefill_set_heads(int h, int hv);
 int ak_kda_prefill_preload();  // load every module of the device's table now (init)
+// budget mode: the KDA prefill temporaries of calls up to T tokens from an arena reserved now (0: the stream-ordered pool)
+size_t ak_kda_prefill_temp_bytes(int T);
+int ak_kda_prefill_set_arena(int T);
 
 #ifdef __cplusplus
 }

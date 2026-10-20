@@ -376,6 +376,16 @@ static MTP_VOCAB: &[u8] = include_bytes!("mtp_vocab.bin");
 pub(crate) fn mtp_vocab_n() -> usize {
     std::env::var("AGENS_MTP_VOCAB").ok().and_then(|v| v.parse().ok()).unwrap_or(32768).min(MTP_VOCAB.len() / 4)
 }
+/// The draft shortlist head (1.3.2): a bf16 copy of the lm_head rows of the first N ids of mtp_vocab.bin, which
+/// the MTP chain's argmax reads instead of the whole 248K-row head (bf16 2.54 GB per chain step; the INT8 head already
+/// has its own 32K shortlist). Default N = 32768 when the MTP head runs on a bf16 target head (`mtp_bf16`), else off;
+/// AGENS_DRAFT_VOCAB = N sets it explicitly (0 = off) and then also gives the DFlash2 drafter's 16 candidates per slot
+/// from those rows. Drafts only propose: the output is the same. -> (ids, the drafter uses it too)
+pub(crate) fn draft_vocab_ids(mtp_bf16: bool) -> (Vec<u32>, bool) {
+    let env = std::env::var("AGENS_DRAFT_VOCAB").ok().and_then(|v| v.parse::<usize>().ok());
+    let n = env.unwrap_or(if mtp_bf16 { 32768 } else { 0 }).min(MTP_VOCAB.len() / 4);
+    (MTP_VOCAB.chunks_exact(4).take(n).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(), env.is_some())
+}
 pub(crate) fn finish_mtp(m: &Mtp, cap_rows: usize) -> Result<()> {
     let n = mtp_vocab_n();
     let ids: Vec<i32> = MTP_VOCAB.chunks_exact(4).take(n).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i32).collect();

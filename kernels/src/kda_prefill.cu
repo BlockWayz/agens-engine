@@ -85,6 +85,14 @@ struct AotLaunch {
 
 namespace {
 constexpr int K = 128, V = 128, BT = 64;
+// Temporaries arena (ak_kda_prefill_set_arena, budget mode): the call's temporaries bump-allocated from a buffer reserved
+// at load instead of the stream-ordered pool, so nothing allocated later (CUDA graphs) can take their room. One stream
+// per device runs the calls in order, so each call reuses the arena from its start.
+struct Arena {
+  char* p = nullptr;
+  size_t bytes = 0, off = 0;
+};
+std::map<int, Arena> g_arena;
 int H = 16, HV = 48;  // this process's q / k and v heads (tensor parallel: ak_kda_prefill_set_heads)
 
 struct Loaded {
@@ -283,8 +291,18 @@ extern "C" int ak_kda_prefill(const void* mixed_qkv, const void* a, const void* 
   const bool fused = cls.find("_fused") != std::string::npos;
   const int nt = (T + BT - 1) / BT;
   // ---- temporaries (stream-ordered)
+  int adev = 0;
+  cudaGetDevice(&adev);
+  Arena* ar = g_arena.count(adev) && g_arena[adev].p ? &g_arena[adev] : nullptr;
+  if (ar) ar->off = 0;
   auto alloc = [&](size_t bytes) {
     void* p = nullptr;
+    if (ar) {
+      const size_t b = ((bytes > 0 ? bytes : 16) + 255) & ~(size_t)255;
+      if (ar->off + b <= ar->bytes) p = ar->p + ar->off;
+      ar->off += b;
+      return p;
+    }
     cudaMallocAsync(&p, bytes > 0 ? bytes : 16, cs);
     return p;
   };
@@ -316,8 +334,9 @@ extern "C" int ak_kda_prefill(const void* mixed_qkv, const void* a, const void* 
     bool oom = false;
     for (void* p : tmps) oom |= p == nullptr;
     if (oom) {
-      for (void* p : tmps)
-        if (p) cudaFreeAsync(p, cs);
+      if (!ar)
+        for (void* p : tmps)
+          if (p) cudaFreeAsync(p, cs);
       cudaGetLastError();
       return (int)cudaErrorMemoryAllocation;
     }
@@ -388,7 +407,8 @@ extern "C" int ak_kda_prefill(const void* mixed_qkv, const void* a, const void* 
   L({{"q", P(qn)}, {"v", P(vnew)}, {"g", P(gcs)}, {"h", P(h)}, {"o", P(o)}, {"A", P(Aqk)}, {"cu_seqlens", P(qsl)},
      {"chunk_indices", P(chunk_indices)}, {"scale", Fl(scale)}, {"T", I(T)}},
     lo ? lo->rep_grid[0] : 1, nt, HV);
-  for (void* p : tmps) cudaFreeAsync(p, cs);
+  if (!ar)
+    for (void* p : tmps) cudaFreeAsync(p, cs);
   if (e) return e;
   return (int)cudaGetLastError();
 }
@@ -443,3 +463,31 @@ extern "C" int ak_kda_prefill_set_heads(int h, int hv) {
   return 0;
 }
 
+
+// Bytes of one call's temporaries at T tokens (this process's heads), as the arena lays them out (256-byte aligned).
+extern "C" size_t ak_kda_prefill_temp_bytes(int T) {
+  const size_t tq = (size_t)T * H * K, tv = (size_t)T * HV * V, tk48 = (size_t)T * HV * K;
+  const size_t nt = (T + BT - 1) / BT;
+  const size_t sz[] = {tq * 2, tq * 2, tv * 2, tk48 * 2, tk48 * 2, tk48 * 2, tk48 * 2, (size_t)T * HV * 4, tk48 * 4,
+                       (size_t)T * HV * BT * 2, (size_t)T * HV * 16 * 4, (size_t)T * HV * BT * 2, tk48 * 2, tv * 2,
+                       tk48 * 2, nt * HV * V * K * 2, tv * 2, nt * 2 * 4, 2 * 8, 2 * 4};
+  size_t b = 0;
+  for (size_t x : sz) b += (x + 255) & ~(size_t)255;
+  return b;
+}
+// Reserve the arena on the current device for calls of up to T tokens (0: back to the stream-ordered pool).
+extern "C" int ak_kda_prefill_set_arena(int T) {
+  int dev = 0;
+  cudaGetDevice(&dev);
+  Arena& a = g_arena[dev];
+  if (a.p) cudaFree(a.p), a = Arena{};
+  if (T <= 0) return 0;
+  const size_t b = ak_kda_prefill_temp_bytes(T);
+  if (cudaMalloc(&a.p, b) != cudaSuccess) {
+    cudaGetLastError();
+    a = Arena{};
+    return (int)cudaErrorMemoryAllocation;
+  }
+  a.bytes = b;
+  return 0;
+}

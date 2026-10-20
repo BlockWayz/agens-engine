@@ -14,6 +14,8 @@ mod sampler;
 #[cfg(feature = "m1")]
 mod serve;
 #[cfg(feature = "m1")]
+mod prefix;
+#[cfg(feature = "m1")]
 mod kv;
 mod lookup;
 mod tp;
