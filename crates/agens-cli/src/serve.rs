@@ -162,7 +162,7 @@ fn penalised(p: &SamplingParams) -> bool {
 fn sync_penalty(a: &mut Act, sess: i32) -> Result<()> {
     if !a.pset {
         let sp = &a.job.sp;
-        let (r, f, p, bias): (f32, f32, f32, Vec<(u32, f32)>) = if a.spec.map_or(false, |s| s.pen) {
+        let (r, f, p, bias): (f32, f32, f32, Vec<(u32, f32)>) = if a.spec.or(a.dsamp).map_or(false, |s| s.pen) {
             (sp.repetition_penalty as f32, sp.frequency_penalty as f32, sp.presence_penalty as f32,
              sp.logit_bias.iter().map(|&(t, b)| (t, b as f32)).collect())
         } else {
@@ -283,6 +283,7 @@ struct Act {
     vsteps: u64,                        // verify steps of this request (bs = 1 or batched) (AGENS_SERVE_REQ_STATS=1 log)
     guard: Option<ThinkGuard>,          // thinking-block repetition guard (--think-guard)
     pset: bool,                         // its session's device penalty state is set (sync_penalty)
+    dsamp: Option<SpecSampling>,        // plain decode steps sampled on the device (AGENS_DEV_SAMPLE != 0; t > 0)
     pen_new: Vec<u32>,                  // emitted tokens not yet in the device penalty counts (penalised requests)
 }
 
@@ -317,6 +318,7 @@ struct Engine {
     fork: bool,             // conversations generate on a fork of their main session (false: --no-fork)
     think_guard: Option<(usize, u32, usize)>, // --think-guard n-gram, repeats, window (None: off)
     pen_ok: bool,           // penalties / logit bias in the speculative accept (one device per rank, AGENS_SPEC_PEN != 0)
+    dev_sample: bool,       // sampled plain decode rows on the device (one device per rank, AGENS_DEV_SAMPLE != 0)
     pc: Option<crate::prefix::PrefixCache>, // prefix cache (--prefix-cache-gib; None: off)
 }
 
@@ -434,6 +436,9 @@ impl Engine {
         }
         // copy-only drafting verifies on the host's greedy rule: penalised requests decode on the host there
         let spec = if self.spec { spec_sampling(&job.sp, self.pen_ok && !self.copy) } else { None };
+        // (1.3.3) sampled requests' plain decode steps on the device: the host sampler sorted 248K logits per
+        // row per step (no-spec server mode at c13 with default sampling: 81 tok/s, CPU-bound)
+        let dsamp = if self.dev_sample { spec_sampling(&job.sp, self.pen_ok).filter(|s| s.t > 0.0) } else { None };
         let guard = self.think_guard.map(|(n, k, w)| ThinkGuard::new(n, k, w, &job.prompt, self.think.0, self.think.1));
         let t0 = Instant::now();
         let mk = |phase| Act {
@@ -451,6 +456,7 @@ impl Engine {
             guard,
             pset: false,
             pen_new: Vec::new(),
+            dsamp,
         };
         let l0 = hit.map_or(0, |h| h.1);
         if let Some((_, l)) = hit {
@@ -561,7 +567,7 @@ impl Engine {
     /// Emit a token; true when the request is finished.
     fn emit(act: &mut Act, tok: i32) -> bool {
         act.sampler.accept(tok as u32);
-        if act.spec.map_or(false, |s| s.pen) {
+        if act.spec.or(act.dsamp).map_or(false, |s| s.pen) {
             act.pen_new.push(tok as u32); // the device counts follow the host sampler's (sync_penalty)
         }
         act.produced += 1;
@@ -1011,13 +1017,29 @@ impl Engine {
                 } else {
                     m1::decode_batch(&sess, &toks)?
                 };
+                // sampled rows on the device: their session's sampling / penalty state set once, counts synced
+                let use_row: Vec<bool> = rows.iter().map(|&i| acts[i].dsamp.is_some()).collect();
+                let dev = if use_row.iter().any(|&u| u) {
+                    for (j, &i) in rows.iter().enumerate() {
+                        let a = &mut acts[i];
+                        let Some(s) = a.dsamp else { continue };
+                        if !a.bset {
+                            m1::session_sampling(sess[j], s.t, s.k, s.p, s.min_p, a.job.sp.seed.unwrap_or(a.job.id) as i32)?;
+                            a.bset = true;
+                        }
+                        sync_penalty(a, sess[j])?;
+                    }
+                    m1::sample_decode(&sess, &use_row)?
+                } else {
+                    Vec::new()
+                };
                 self.stats.0 += 1;
                 self.stats.1 += rows.len() as u64;
                 self.stats.2 += td.elapsed().as_secs_f64();
                 for (j, &i) in rows.iter().enumerate() {
                     let a = &mut acts[i];
                     a.fed.push(toks[j] as u32);
-                    let t = Self::choose(a, next[j], j)?;
+                    let t = if use_row[j] { dev[j] } else { Self::choose(a, next[j], j)? };
                     let t = Self::pick(a, t, true);
                     if let Phase::Decode { last, .. } = &mut a.phase {
                         *last = t;
@@ -1114,7 +1136,20 @@ pub fn run(args: &[String]) -> Result<()> {
         i += 2;
     }
     match mode.as_str() {
-        "personal" => max_batch = 1,
+        "personal" => {
+            max_batch = 1;
+            // AGENS_PERSONAL_SERVER_NUMERICS=1 (opt-in, 1.3.2): server mode's numerics in personal mode (batch-invariant
+            // GEMMs, the BI verify kernels, prefill chunks on the batched W4 kernels), so a request's tokens for a seed do
+            // not depend on the mode either (sampled and greedy; 1.3.3 srow0: row-0 verify logits bit-identical
+            // to server mode at every position). Off by default: personal greedy stays 1.3.1's.
+            if std::env::var("AGENS_PERSONAL_SERVER_NUMERICS").map_or(false, |v| v == "1") {
+                for (k, v) in [("AGENS_M1_BATCH_INVARIANT", "1"), ("AGENS_M1_BI", "1"), ("AGENS_M1_W4_BATCH_MAX", "128")] {
+                    if std::env::var(k).is_err() {
+                        std::env::set_var(k, v);
+                    }
+                }
+            }
+        }
         "server" => {
             if !(1..=16).contains(&max_batch) {
                 bail!("--max-batch must be 1..16");
@@ -1184,10 +1219,11 @@ pub fn run(args: &[String]) -> Result<()> {
             // under --tp the penalty state is forwarded to every rank (session_penalty / _add) and the logits are
             // replicated (vocab-parallel head + all-reduce): each rank's accept draws the same tokens
             let pen_ok = one_dev && std::env::var("AGENS_SPEC_PEN").map_or(true, |v| v != "0");
+            let dev_sample = one_dev && std::env::var("AGENS_DEV_SAMPLE").map_or(true, |v| v != "0");
             let pc = crate::prefix::PrefixCache::new(pc_gib, chunk(), pc_dev)?;
             Ok(Engine { pc, think, max_batch, max_convs, wctx: wctx - CHUNK, anchor, convs: HashMap::new(), stats: (0, 0, 0.0),
                         spec: drafting || copy, copy: copy && !drafting, fork, bstats: (0, 0, 0.0, 0), pstats: (0, 0.0, None),
-                        hstats: (0.0, 0.0), think_guard, pen_ok })
+                        hstats: (0.0, 0.0), think_guard, pen_ok, dev_sample })
         })();
         match r {
             Ok(mut e) => {

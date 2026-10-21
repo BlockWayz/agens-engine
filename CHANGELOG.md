@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.3.3
+
+### New
+
+- **Reproducible sampling.** With a fixed `seed`, a sampled reply (temperature, top-k / top-p / min-p, penalties) is
+  now the same token for token whether the request runs alone or batched with others, and with or without speculative
+  decoding: every token is drawn from the target distribution at its position by one rule. On a test set of 6 prompts
+  x 8 seeds x 2 samplings, 96 of 96 replies were identical alone vs four at a time, and with vs without `--mtp`. The
+  sampled distribution is unchanged (chi-square against plain decoding).
+- **Sampled requests without speculation sample on the GPU.** In server mode without a drafter, sampled requests no
+  longer copy each step's logits to the host: on 141 GB compute capability 9.0 GPUs, 2-way tensor parallel, Volundr
+  INT4, default sampling, 13 concurrent requests, aggregate decode rose from 83 to 725 tokens/s.
+- **More throughput under concurrency with `--mtp` (compute capability 9.0).** Server mode runs the MTP chain for every
+  batch and verifies shorter blocks when several requests decode: same setup with `--mtp`, aggregate decode tokens/s at
+  1 / 4 / 13 / 16 concurrent requests 223 / 627 / 750 / 872 -> 241 / 731 / 1,104 / 1,277.
+- **Faster sampled requests on the compute capability 8.9 profiles.** The sampling kernels' fast path now fits these
+  GPUs: single stream, vp_bench decode tokens/s, temperature 0.7 / top_p 0.95: 12-26% faster in the `16gb` and `24gb`
+  profiles (with and without `--mtp`, and `24gb --tp 2`); with a presence penalty 4-30% faster.
+- **Version reporting.** `agens --version` prints the engine version, and `/v1/models` reports it as `agens_version`.
+
+### Fixes
+
+- **Speculative greedy output at long contexts.** The verify step's dense attention could differ from plain decoding in
+  rare positions of long prompts; it now uses the same per-query plans as decoding on every path, so greedy output with
+  speculation is identical to greedy output without it.
+
+### Unchanged
+
+- Greedy output on our test prompts is identical to 1.3.2 (the verify fix above only changes the rare positions where
+  speculative greedy output differed from plain decoding). Every profile keeps 1.3.2's context, and greedy decode speed
+  is within 1% of 1.3.2.
+
 ## 1.3.2
 
 ### New

@@ -19,7 +19,7 @@
 #         (no drafter weights), INT8 dense-layer KV.
 #   24gb / 48gb  --budget-gib 23 / 46, server mode (batched requests and batched speculative decoding).
 set -euo pipefail
-PROFILE=16gb; MODEL=; DRAFTER=; MTP=; GPU=0; PORT=30000; IMAGE=${AGENS_IMAGE:-ghcr.io/blockwayz/agens-engine:1.3.2}; IMAGES=(); TP=(); EXTRA=()
+PROFILE=16gb; MODEL=; DRAFTER=; MTP=; GPU=0; PORT=30000; IMAGE=${AGENS_IMAGE:-ghcr.io/blockwayz/agens-engine:1.3.3}; IMAGES=(); TP=(); EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --profile) PROFILE=$2; shift 2;;

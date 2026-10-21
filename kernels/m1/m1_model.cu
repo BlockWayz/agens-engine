@@ -143,10 +143,13 @@ constexpr int kSpecT = 8;                                  // verify block (DFla
 constexpr int kStepInts = 64, kStepDelta = 40;
 // speculative verify attention in one launch per layer (ak_attn_decode_multi; AGENS_SPEC_MULTI_ATTN=0: per query)
 constexpr int MSLOT_DENSE = 0, MSLOT_WIN = 1, MSLOT_PACKED = 2;
-// dense layer verify as one causal request of the T queries (ak_attn_decode_packed; AGENS_SPEC_DENSE_PACKED=0: the
-// T-request multi launch)
+// dense layer verify as one causal request of the T queries (ak_attn_decode_packed), opt-in AGENS_SPEC_DENSE_PACKED=1
+// (1.3.1's default). Off by default (1.3.3, 1.3.3): the packed launch is not bit-identical to the T bs = 1
+// decode calls on real data (tools/test_attn_real.py: layer 71 of long_12k at tp2, rows of 2 of 7 verify steps), while
+// the T-request multi launch (+ per-query fallback when the chunk sizes differ) is; with it the verify == decode bitwise
+// and the single-sequence verify == the batched one. Cost at tp2 on compute capability 9.0: 11.10 -> 11.11 ms per bs = 1 verify step.
 bool dense_packed() {
-  static const int on = [] { const char* e = getenv("AGENS_SPEC_DENSE_PACKED"); return !(e && e[0] == '0'); }();
+  static const int on = [] { const char* e = getenv("AGENS_SPEC_DENSE_PACKED"); return e && e[0] == '1'; }();
   return on;
 }
 std::vector<cudaGraph_t>* g_seg_capture = nullptr;  // set while capturing a segmented verify graph
@@ -209,6 +212,13 @@ int g_BV = 0;
 // "tv1,tv2,..." for B = 1, 2, ..; the last entry applies to larger B). Default (sm90 conc_bench sweep, short prompts):
 // B x TV at or under 16 rows up to B = 4 (one 16-token GEMM tile), about 30 rows to B = 8, 2 drafts past B = 10
 int g_TV = kSpecT;
+// the MTP head alone on an sm90+ device: the 1.3.3 batched speculation defaults (batch_tv, AGENS_MTP_BATCH_MAX)
+bool sm90_mtp_only() {
+  int dev = 0, major = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  return major >= 9 && m1mtp::ready() && !m1draft::ready();
+}
 int batch_tv(int B) {
   static std::vector<int> tv;
   static bool init = false;
@@ -220,7 +230,10 @@ int batch_tv(int B) {
       while (*c && *c != ',') ++c;
       if (*c == ',') ++c;
     }
-    if (tv.empty()) tv = {8, 8, 5, 4, 6, 5, 4, 4, 3, 3, 2};
+    // sm90 + the MTP head alone (1.3.3, server mode on compute capability 9.0, steady state, default sampling): TV 2 from B = 2
+    // (c2 303.5 vs 285.1 at TV 8, c3 440.3 vs 330.0, c4 571.8 vs 534.9 at TV 4, c13 782.0, c16 906.2), TV 8 alone
+    // (c1 209.9 vs 198.8 at TV 4); other arches / drafters keep the 1.3 table until measured there
+    if (tv.empty()) tv = sm90_mtp_only() ? std::vector<int>{8, 2} : std::vector<int>{8, 8, 5, 4, 6, 5, 4, 4, 3, 3, 2};
   }
   return tv[std::min((size_t)B, tv.size()) - 1];
 }
@@ -744,6 +757,29 @@ __device__ int samp_draw(const R& A, int nv, const SampLay& L, const SampSet& f,
   __syncthreads();
   return out;
 }
+// The one device sampling rule (every device sampler: speculative verify on either route, any batch size, and plain decode
+// rows): the token at absolute sequence position n of a request with seed s is t = InvCDF_q(u(s, n)):
+//   q    the filtered target distribution at n (top-k, then top-p over the top-k set, then min-p; see samp_pos), over
+//        weights w(v) = rint(m(v) * 2^32) (u64, exact sums in any order), m(v) = __expf((x_v - max) / temperature) as f32
+//   u    u(s, n) = the first uniform of Philox4x32-10 (key s, subsequence n, offset 0), in (0, 1] (samp_u)
+//   InvCDF  walk the set in KEY ORDER -- keys descending (the order-preserving key of x_v: of the bf16 logit, or of the
+//        penalised f32 value), elements of one key in ascending index -- and pick the first element with cum + w > T,
+//        T = min(u * Z, Z - 0.5) (Z = the total weight; the clamp keeps u = 1 inside the set). Elements of one key share
+//        x, hence w: the key is found from per-key sums, then its element by r = floor((T - cum_key) / w).
+// A speculative verify accepts draft x at n iff x == t, so the emitted tokens are the target's own samples: they do not
+// depend on drafts, verify length, batch size or route (P(accept x) = q(x), as rejection sampling with a one-hot draft).
+// The parameter block passes n for row 0 in prm[5] (row j: prm[5] + j). samp_fast (bf16 rows, histogram) and samp_body
+// (bf16 / penalised rows, radix) implement the same rule with the same integer arithmetic.
+__device__ __forceinline__ float samp_u(unsigned seed, unsigned long long abs_pos) {
+  curandStatePhilox4_32_10_t rng;
+  curand_init(seed, abs_pos, 0, &rng);
+  return curand_uniform(&rng);
+}
+__device__ __forceinline__ unsigned long long samp_w(float m) { return (unsigned long long)llrint((double)m * 4294967296.0); }
+__device__ __forceinline__ double samp_target(float u, unsigned long long z) {
+  const double t = (double)u * (double)z;
+  return t < (double)z - 0.5 ? t : (double)z - 0.5;
+}
 struct SampShm {
   float red[32];
   double redd[32], wm[32], hm[256], shd[2];
@@ -845,6 +881,97 @@ __device__ unsigned samp_radix_mass(const R& A, int nv, const SampLay& L, double
   *above = cum;
   return pre;
 }
+// u64 weight sums (exact, order-free)
+__device__ unsigned long long block_sum_u64(unsigned long long v, unsigned long long* red) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(kFull, v, o);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+  __syncthreads();
+  unsigned long long t = 0;
+  for (int w = 0; w < (int)(blockDim.x >> 5); ++w) t += red[w];
+  __syncthreads();
+  return t;
+}
+// radix walk over the R::NP key bytes (high first) of the elements with in(v, x, key), weights w = samp_w(m(x)): the key
+// where the cumulative weight from the top first reaches target (ge: cum + w >= target; else cum + w > target); above =
+// the weight of the keys above it, kw = the key's own weight (u64, exact)
+template <class R, class In>
+__device__ unsigned samp_radix_w(const R& A, int nv, const SampLay& L, double target, bool ge, const SampSet& f, In in,
+                                 unsigned long long* above, unsigned long long* kw, SampShm& m) {
+  using U = unsigned long long;
+  U* hw = reinterpret_cast<U*>(m.hm);
+  unsigned pre = 0, pmask = 0;
+  U cum = 0, bw = 0;
+  for (int p = 0; p < R::NP; ++p) {
+    const int shift = 8 * (R::NP - 1 - p);
+    for (int b = threadIdx.x; b < 256; b += blockDim.x) hw[b] = 0;
+    __syncthreads();
+    for (int r = 0; r < L.rounds; ++r) {
+      const int v = samp_v(L, r, nv);
+      if (v < 0) continue;
+      const float x = A.val(v);
+      const unsigned key = A.key_of(x);
+      if ((key & pmask) == pre && in(v, x, key)) {
+        const U w = samp_w(f.mass(x));
+        if (w) atomicAdd(&hw[(key >> shift) & 255], w);
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      U c = cum;
+      int b = 255, last = -1;
+      for (; b >= 0; --b) {
+        if (!hw[b]) continue;
+        last = b;
+        const double e = (double)(c + hw[b]);
+        if (ge ? e >= target : e > target) break;
+        c += hw[b];
+      }
+      if (b < 0) b = last, c -= last >= 0 ? hw[last] : 0;  // rounding: the last bin with weight
+      m.sh[0] = b < 0 ? 0 : b;
+      reinterpret_cast<U*>(m.shd)[0] = c, reinterpret_cast<U*>(m.shd)[1] = b < 0 ? 0 : hw[b];
+    }
+    __syncthreads();
+    pre |= (unsigned)m.sh[0] << shift, pmask |= 255u << shift;
+    cum = reinterpret_cast<U*>(m.shd)[0], bw = reinterpret_cast<U*>(m.shd)[1];
+    __syncthreads();
+  }
+  *above = cum, *kw = bw;
+  return pre;
+}
+// the n-th (1-based, index order) element with pred(v); -1 if fewer
+template <class P>
+__device__ int samp_nth_pred(int nv, const SampLay& L, P pred, int n, int* wcnt, int* sh) {
+  auto pv = [&](int v) { return v >= 0 && pred(v); };
+  int c = 0;
+  for (int r = 0; r < L.rounds; ++r) c += __popc(__ballot_sync(kFull, pv(samp_v(L, r, nv))));
+  if ((threadIdx.x & 31) == 0) wcnt[threadIdx.x >> 5] = c;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const int nw = blockDim.x >> 5;
+    int acc = 0, w = 0;
+    for (; w < nw && acc + wcnt[w] < n; ++w) acc += wcnt[w];
+    sh[0] = w < nw ? w : -1, sh[1] = n - acc, sh[2] = -1;
+  }
+  __syncthreads();
+  if (sh[0] == (int)(threadIdx.x >> 5)) {
+    int rem = sh[1];
+    for (int r = 0; r < L.rounds; ++r) {
+      const unsigned bal = __ballot_sync(kFull, pv(samp_v(L, r, nv)));
+      const int k = __popc(bal);
+      if (rem <= k) {
+        unsigned bb = bal;
+        for (int i = 1; i < rem; ++i) bb &= bb - 1;
+        if ((threadIdx.x & 31) == 0) sh[2] = L.base + 32 * r + __ffs(bb) - 1;
+        break;
+      }
+      rem -= k;
+    }
+  }
+  __syncthreads();
+  const int out = sh[2];
+  __syncthreads();
+  return out;
+}
 template <class R>
 __device__ void samp_body(const R& A, int nv, const int* ids, int T, int j, const int* prm, int* scr, SampShm& m) {
   const float temp = __int_as_float(prm[0]), topp = __int_as_float(prm[2]), minp = __int_as_float(prm[3]);
@@ -873,20 +1000,23 @@ __device__ void samp_body(const R& A, int nv, const int* ids, int T, int j, cons
   }
   // top-p: the smallest prefix of A (key descending, ties by index) with mass >= top_p * Z_A, by radix passes over
   // fp64 masses; the boundary key's ties (equal masses) kept in index order as many as the prefix needs
-  if (topp < 1.f) {
-    double za = 0.0;
+  using U = unsigned long long;
+  U* ured = reinterpret_cast<U*>(m.redd);
+  if (topp < 1.f) {  // u64 weights (the sampling rule): exact sums, the same set as samp_fast
+    U za = 0;
     for (int r = 0; r < L.rounds; ++r) {
       const int v = samp_v(L, r, nv);
       if (v < 0) continue;
       const float x = A.val(v);
-      if (f.inA(v, A.key_of(x))) za += (double)f.mass(x);
+      if (f.inA(v, A.key_of(x))) za += samp_w(f.mass(x));
     }
-    const double target = (double)topp * block_sumd(za, m.redd);
-    double cum = 0.0;
-    const unsigned tp = samp_radix_mass(A, nv, L, target, &cum, f, m);
+    const double target = (double)topp * (double)block_sum_u64(za, ured);
+    U cum = 0, kw = 0;
+    const unsigned tp = samp_radix_w(A, nv, L, target, true, f,
+                                     [&](int v, float, unsigned key) { return f.inA(v, key); }, &cum, &kw, m);
     if (threadIdx.x == 0) {
-      const double ms = (double)f.mass(A.val_of_key(tp));
-      const double n = ms > 0.0 ? ceil((target - cum) / ms) : 1.0;
+      const U w1 = samp_w(f.mass(A.val_of_key(tp)));
+      const double n = w1 ? ceil((target - (double)cum) / (double)w1) : 1.0;
       m.sh[3] = n < 1.0 ? 1 : (n > 1e9 ? 1000000000 : (int)n);
     }
     __syncthreads();
@@ -894,35 +1024,34 @@ __device__ void samp_body(const R& A, int nv, const int* ids, int T, int j, cons
     const int need = m.sh[3];
     __syncthreads();
     const int cut = samp_tie_cut(A, nv, L, f.tp, need, f, true, m.wcnt, m.sh);
-    f.pcut = cut < 0 ? nv : cut;  // fewer ties than needed (fp64 rounding at the boundary): keep them all
+    f.pcut = cut < 0 ? nv : cut;  // fewer ties than needed (rounding at the boundary): keep them all
   }
-  double zf = 0.0;
+  U zf = 0;
   for (int r = 0; r < L.rounds; ++r) {
     const int v = samp_v(L, r, nv);
     if (v < 0) continue;
     const float x = A.val(v);
-    if (f.in(v, x, A.key_of(x))) zf += (double)f.mass(x);
+    if (f.in(v, x, A.key_of(x))) zf += samp_w(f.mass(x));
   }
-  const double z = block_sumd(zf, m.redd);
-  const unsigned long long seed = (unsigned)prm[4], sidx = (unsigned)prm[5];
-  curandStatePhilox4_32_10_t rng;
-  curand_init(seed, sidx * 64 + j, 0, &rng);
-  const float4 u4 = curand_uniform4(&rng);
-  if (j + 1 < T) {
-    const int x = ids[j + 1];
-    float xv = 0.f;
-    bool inx = false;
-    if (x >= 0 && x < nv) xv = A.val(x), inx = f.in(x, xv, A.key_of(xv));
-    const double px = inx ? (double)f.mass(xv) : 0.0;
-    bool acc = inx && (double)u4.x * z < px;
-    if (!acc && z - px <= 0.0) acc = true;  // x is the whole set
-    int tok = x;
-    if (!acc) tok = samp_draw(A, nv, L, f, x, z - px, u4.y, m.wm, m.sh, m.shd);
-    if (threadIdx.x == 0) scr[j] = acc, scr[8 + j] = tok;
-  } else {
-    const int tok = samp_draw(A, nv, L, f, -1, z, u4.y, m.wm, m.sh, m.shd);
-    if (threadIdx.x == 0) scr[j] = 0, scr[8 + j] = tok;
-  }
+  const U z = block_sum_u64(zf, ured);
+  // the target's own sample of the token at absolute position prm[5] + j (the sampling rule): the key by a radix walk in
+  // key order, then its element in index order; the draft x = ids[j + 1] is accepted iff it is that token
+  const float u = samp_u((unsigned)prm[4], (unsigned long long)(unsigned)prm[5] + (unsigned long long)j);
+  const double target = samp_target(u, z);
+  U cum = 0, kw = 0;
+  const unsigned kd = samp_radix_w(A, nv, L, target, false, f, [&](int v, float x, unsigned key) { return f.in(v, x, key); },
+                                   &cum, &kw, m);
+  const U w1 = samp_w(f.mass(A.val_of_key(kd)));
+  const int n = w1 ? (int)(kw / w1) : 1;
+  const double q = w1 ? floor((target - (double)cum) / (double)w1) : 0.0;
+  const int rr = q < 0.0 ? 0 : (q >= (double)n ? n - 1 : (int)q);
+  const int tok = samp_nth_pred(nv, L, [&](int v) {
+    const float x = A.val(v);
+    const unsigned key = A.key_of(x);
+    return key == kd && f.in(v, x, key);
+  }, rr + 1, m.wcnt, m.sh);
+  const int x = j + 1 < T ? ids[j + 1] : -1;
+  if (threadIdx.x == 0) scr[j] = x >= 0 && tok == x, scr[8 + j] = tok;
 }
 __device__ __forceinline__ const void* prm_ptr(const int* q) {
   return (const void*)(((unsigned long long)(unsigned)q[1] << 32) | (unsigned)q[0]);
@@ -930,13 +1059,16 @@ __device__ __forceinline__ const void* prm_ptr(const int* q) {
 // grid B x T blocks: sequence b = blockIdx.x / T, position j; its parameters prm + b * prm_stride = {temp, top_k, top_p,
 // min_p, seed, step, .., [12..19] penalties} (floats as bits); scr + 16 b; temp <= 0: the greedy accept from the target
 // argmax tok (penalised: the penalised argmax)
+// fast = 1: the sampled rows without penalties are left to samp_hist / samp_fast (below)
 __global__ void __launch_bounds__(1024) samp_pos(const bf16* logits, int ld, int nv, const int* ids_all, int T,
-                                                 const int* prm_all, int prm_stride, const int* tok, int* scr_all) {
+                                                 const int* prm_all, int prm_stride, const int* tok, int* scr_all,
+                                                 int fast = 0) {
   const int b = blockIdx.x / T, j = blockIdx.x % T;
   const int* ids = ids_all + (size_t)b * T;
   const int* prm = prm_all + (size_t)b * prm_stride;
   int* scr = scr_all + 16 * b;
   const bool pen = prm[kPrmPen] & 1;
+  if (fast && !pen && __int_as_float(prm[0]) > 0.f) return;
   if (__int_as_float(prm[0]) <= 0.f && !pen) {
     if (threadIdx.x == 0) {
       const int g = tok[(size_t)b * T + j];
@@ -961,6 +1093,327 @@ __global__ void __launch_bounds__(1024) samp_pos(const bf16* logits, int ld, int
     A.l = l;
     samp_body(A, nv, ids, T, j, prm, scr, m);
   }
+}
+// ---- fast sampled accept (1.3.3; rows with temperature > 0 and no penalties): the same target-only rule and
+// the same filtered distribution as samp_pos (top-k -> top-p over the top-k set -> min-p; at a boundary key its ties in
+// index order), found from an exact histogram of the 65536 bf16 keys instead of radix passes over the vocabulary.
+// Every element with a given key has the same logit, hence the same mass m(key) = __expf((val(key) - mx) / temp) (as
+// samp_pos computes it), so the integer counts (order-free atomics) determine every set, and every sum is a sum over
+// keys in one fixed order and shape (per lane over its keys, a fixed shuffle tree per warp, a serial sum over warps):
+// deterministic for a seed, and a function of the position's logits and parameters only -- the same for every batch
+// size, grid and route (bs = 1 or batched verify). Kernels: samp_hist (grid 16 x positions, a shared-memory 16-bit
+// histogram per block added into the position's global one), samp_fast (one 1024-thread block per position: select,
+// accept with Philox(seed, step * 64 + j) u.x as samp_pos, draw with u.y; re-zeroes the histogram). The draw walks the
+// set by key (highest first), within a key in index order: as exact as samp_pos's index-order walk but a different
+// order, so the sampled tokens differ from 1.3.1's for the same seed. AGENS_SAMP_FAST=0: samp_pos for every row.
+// Key layout in samp_fast: warp w owns keys 65535 - 2048 w - (0 .. 2047), lane l of it the keys 65535 - 2048 w - 32 i - l
+// (i = 0 .. 63): one row i of a warp = 32 consecutive keys (coalesced), descending key order = (w, i, l).
+constexpr int kSampKeys = 65536, kSampKW = kSampKeys / 32, kSampHB = 16;
+__device__ __forceinline__ unsigned bf_key(bf16 x) {
+  const unsigned short b = __bfloat16_as_ushort(x);
+  return (b & 0x8000) ? (unsigned)(unsigned short)~b : (unsigned)(b | 0x8000);
+}
+__device__ __forceinline__ float bf_val_of_key(unsigned k) {
+  const unsigned short kb = (unsigned short)k;
+  return __bfloat162float(__ushort_as_bfloat16((kb & 0x8000) ? (unsigned short)(kb & 0x7fff) : (unsigned short)~kb));
+}
+__device__ __forceinline__ bool samp_fast_row(const int* prm) {
+  return !(prm[kPrmPen] & 1) && __int_as_float(prm[0]) > 0.f;
+}
+// grid (kSampHB, positions, 2) x 1024, dynamic shared 64 KB (fits sm86 / sm89's 99 KB): z = which half of the keys,
+// two 16-bit counters per word (a block's segment < 65536)
+__global__ void __launch_bounds__(1024) samp_hist(const bf16* logits, int ld, int nv, int T, const int* prm_all,
+                                                  int prm_stride, unsigned* hist_all, unsigned* kmax_all) {
+  extern __shared__ unsigned hs[];
+  __shared__ unsigned bmax;
+  const int pos = blockIdx.y, b = pos / T;
+  if (!samp_fast_row(prm_all + (size_t)b * prm_stride)) return;
+  const bf16* l = logits + (size_t)pos * ld;
+  unsigned* h = hist_all + (size_t)pos * kSampKeys;
+  constexpr unsigned kHalf = kSampKeys / 2;
+  const unsigned k0 = blockIdx.z * kHalf;
+  for (int i = threadIdx.x; i < (int)kHalf / 2; i += blockDim.x) hs[i] = 0u;
+  if (threadIdx.x == 0) bmax = 0u;
+  __syncthreads();
+  const int seg = (nv + gridDim.x - 1) / gridDim.x, lo = blockIdx.x * seg, hi = min(nv, lo + seg);
+  unsigned km = 0u;
+  for (int v = lo + threadIdx.x; v < hi; v += blockDim.x) {
+    const unsigned key = bf_key(l[v]);
+    km = max(km, key + 1);
+    if (key - k0 < kHalf) atomicAdd(&hs[(key - k0) >> 1], 1u << ((key & 1) * 16));
+  }
+  for (int o = 16; o > 0; o >>= 1) km = max(km, __shfl_xor_sync(kFull, km, o));
+  if ((threadIdx.x & 31) == 0) atomicMax(&bmax, km);
+  __syncthreads();
+  if (threadIdx.x == 0 && blockIdx.z == 0) atomicMax(kmax_all + pos, bmax);  // highest key + 1 (0: none); samp_fast resets it
+  for (int i = threadIdx.x; i < (int)kHalf / 2; i += blockDim.x) {
+    const unsigned w = hs[i];
+    if (w & 0xFFFFu) atomicAdd(&h[k0 + 2 * i], w & 0xFFFFu);
+    if (w >> 16) atomicAdd(&h[k0 + 2 * i + 1], w >> 16);
+  }
+}
+// lane's keys in row order with their counts, 8 rows of loads in flight; f(row, key, count) -> false stops (warp-uniform
+// when the caller needs it)
+template <class F>
+__device__ __forceinline__ void samp_walk(const unsigned* h, F f) {
+  const unsigned base = kSampKeys - 1 - kSampKW * (threadIdx.x >> 5) - (threadIdx.x & 31);
+  for (int i0 = 0; i0 < kSampKW / 32; i0 += 8) {
+    unsigned cc[8];
+#pragma unroll
+    for (int q = 0; q < 8; ++q) cc[q] = __ldcg(h + base - 32 * (i0 + q));
+#pragma unroll
+    for (int q = 0; q < 8; ++q)
+      if (!f(i0 + q, base - 32 * (i0 + q), cc[q])) return;
+  }
+}
+// fixed-order sums: v per thread (lane partials) -> per-warp totals (shuffle-down tree to lane 0) -> block: exclusive
+// warp offsets ex[w] and the total, warp order, serial on one thread
+template <class V>
+__device__ V samp_tot(V v, V* wsum, V* wex) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(kFull, v, o);
+  if ((threadIdx.x & 31) == 0) wsum[threadIdx.x >> 5] = v;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    V a = V(0);
+    for (int w = 0; w < (int)(blockDim.x >> 5); ++w) wex[w] = a, a += wsum[w];
+    wex[32] = a;
+  }
+  __syncthreads();
+  return wex[32];
+}
+// the crossing key: in descending key order with weights g(key, count) (>= 0), the first key whose cumulative weight
+// reaches `target` (ge: cum + g >= target, else cum + g > target), searched row by row in the warp whose range holds it
+// (wex / wsum from samp_tot over the same weights); out = {key, cum before it as V}, found flag. One warp works.
+template <class V, class G>
+__device__ void samp_cross(const unsigned* h, double target, bool ge, const V* wsum, const V* wex, G g, unsigned* okey,
+                           V* ocum, int* ofound) {
+  const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+  if (threadIdx.x == 0) {  // the warp: the first whose range reaches target (else the last with weight)
+    int cw = -1, lastw = -1;
+    for (int q = 0; q < nw; ++q) {
+      if (wsum[q] > V(0)) lastw = q;
+      const double e = (double)(wex[q] + wsum[q]);
+      if (wsum[q] > V(0) && (ge ? e >= target : e > target)) { cw = q; break; }
+    }
+    ofound[1] = cw >= 0 ? cw : lastw, ofound[0] = 0;
+  }
+  __syncthreads();
+  if (w == ofound[1]) {
+    V cum = wex[w];
+    unsigned lastk = 0;
+    V lastc = V(0);
+    bool done = false;
+    samp_walk(h, [&](int, unsigned key, unsigned c) {
+      const V x = c ? g(key, c) : V(0);
+      V inc = x;
+      for (int o = 1; o < 32; o <<= 1) {
+        const V t = __shfl_up_sync(kFull, inc, o);
+        if (lane >= o) inc += t;
+      }
+      const V before = cum + inc - x;
+      const double e = (double)(before + x);
+      const bool hit = x > V(0) && (ge ? e >= target : e > target);
+      const unsigned bal = __ballot_sync(kFull, hit), has = __ballot_sync(kFull, x > V(0));
+      if (has) {  // the row's last key with weight (fallback: the lowest key of the warp's range)
+        const int ll = 31 - __clz(has);
+        lastk = __shfl_sync(kFull, key, ll), lastc = __shfl_sync(kFull, before, ll);
+      }
+      if (bal) {
+        const int fl = __ffs(bal) - 1;
+        if (lane == fl) *okey = key, *ocum = before, ofound[0] = 1;
+        done = true;
+      }
+      cum += __shfl_sync(kFull, inc, 31);
+      return !done;
+    });
+    if (!done && lane == 0) *okey = lastk, *ocum = lastc, ofound[0] = 2;  // rounding: the last key with weight
+  }
+  __syncthreads();
+}
+// the n-th (1-based, index order) element v != skip with key == key; block-wide. Warp w owns the contiguous segment
+// [w * seg, (w + 1) * seg) (seg a multiple of 256), lane l reads elements base + 256 r + 8 l .. + 7 as one uint4 in round r
+// (rows are 16-byte aligned: ld % 8 == 0): (warp, round, lane, element) order is index order.
+__device__ __forceinline__ unsigned samp_match8(const bf16* l, int v, int nv, unsigned key, int skip) {
+  unsigned m = 0;
+  if (v + 8 <= nv) {
+    const uint4 u = __ldcg(reinterpret_cast<const uint4*>(l + v));
+    const bf16* e = reinterpret_cast<const bf16*>(&u);
+#pragma unroll
+    for (int q = 0; q < 8; ++q) m |= (unsigned)(bf_key(e[q]) == key && v + q != skip) << q;
+  } else {
+    for (int q = 0; q < 8 && v + q < nv; ++q) m |= (unsigned)(bf_key(l[v + q]) == key && v + q != skip) << q;
+  }
+  return m;
+}
+__device__ int samp_nth_key(const bf16* l, int nv, unsigned key, int skip, int n, int* wcnt, int* sh) {
+  const int nw = blockDim.x >> 5, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int seg = ((nv + nw - 1) / nw + 255) & ~255, base = w * seg, rounds = seg / 256;
+  int c = 0;
+  for (int r0 = 0; r0 < rounds; r0 += 4) {
+    unsigned m[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const int v = base + 256 * (r0 + q) + 8 * lane;
+      m[q] = r0 + q < rounds && v < nv ? samp_match8(l, v, nv, key, skip) : 0u;
+    }
+#pragma unroll
+    for (int q = 0; q < 4; ++q) c += __popc(m[q]);
+  }
+  for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(kFull, c, o);
+  if (lane == 0) wcnt[w] = c;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int acc = 0, q = 0;
+    for (; q < nw && acc + wcnt[q] < n; ++q) acc += wcnt[q];
+    sh[0] = q < nw ? q : -1, sh[1] = n - acc, sh[2] = -1;
+  }
+  __syncthreads();
+  if (sh[0] == w) {
+    int rem = sh[1];
+    for (int r = 0; r < rounds; ++r) {
+      const int v = base + 256 * r + 8 * lane;
+      const unsigned m = v < nv ? samp_match8(l, v, nv, key, skip) : 0u;
+      const int k = __popc(m);
+      int inc = k;
+      for (int o = 1; o < 32; o <<= 1) {
+        const int t = __shfl_up_sync(kFull, inc, o);
+        if (lane >= o) inc += t;
+      }
+      const int tot = __shfl_sync(kFull, inc, 31);
+      if (rem <= tot) {  // in this round: the lane whose inclusive count reaches rem
+        const unsigned bal = __ballot_sync(kFull, inc >= rem);
+        const int fl = __ffs(bal) - 1;
+        if (lane == fl) {
+          int need = rem - (inc - k);
+          unsigned mm = m;
+          for (int i = 1; i < need; ++i) mm &= mm - 1;
+          sh[2] = v + __ffs(mm) - 1;
+        }
+        break;
+      }
+      rem -= tot;
+    }
+  }
+  __syncthreads();
+  const int out = sh[2];
+  __syncthreads();
+  return out;
+}
+// elements v < x with key == key (block-wide)
+__device__ int samp_rank_key(const bf16* l, int x, unsigned key, int* red) {
+  int c = 0;
+  for (int v = 8 * threadIdx.x; v < x; v += 8 * blockDim.x) c += __popc(samp_match8(l, v, x, key, -1));
+  for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(kFull, c, o);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = c;
+  __syncthreads();
+  int t = 0;
+  for (int w = 0; w < (int)(blockDim.x >> 5); ++w) t += red[w];
+  __syncthreads();
+  return t;
+}
+// InvCDF over a bf16-key histogram h with per-key weights g(key, count) = included count x w(key)
+template <class G, class W>
+__device__ int samp_icdf_bf16(const unsigned* h, const bf16* l, int nv, double target, unsigned long long* uws,
+                              unsigned long long* uwe, G g, W wkey, unsigned* skey, unsigned long long* ucum, int* fnd,
+                              int* wcnt, int* sh) {
+  using U = unsigned long long;
+  U s = 0;
+  samp_walk(h, [&](int, unsigned key, unsigned c) { if (c) s += g(key, c); return true; });
+  samp_tot<U>(s, uws, uwe);
+  samp_cross<U>(h, target, false, uws, uwe, g, skey, ucum, fnd);
+  const unsigned kd = *skey;
+  const U wk = wkey(kd), gk = g(kd, __ldcg(h + kd));
+  const int n = wk ? (int)(gk / wk) : 1;  // the key's elements in the set
+  const double q = wk ? floor((target - (double)*ucum) / (double)wk) : 0.0;
+  const int r = q < 0.0 ? 0 : (q >= (double)n ? n - 1 : (int)q);
+  __syncthreads();
+  return samp_nth_key(l, nv, kd, -1, r + 1, wcnt, sh);
+}
+__global__ void __launch_bounds__(1024) samp_fast(const bf16* logits, int ld, int nv, const int* ids_all, int T,
+                                                  const int* prm_all, int prm_stride, unsigned* hist_all,
+                                                  unsigned* kmax_all, int* scr_all, int stop = 0) {
+  const int pos = blockIdx.x, b = pos / T, j = pos % T;
+  const int* prm = prm_all + (size_t)b * prm_stride;
+  if (!samp_fast_row(prm)) return;
+  const int* ids = ids_all + (size_t)b * T;
+  int* scr = scr_all + 16 * b;
+  const bf16* l = logits + (size_t)pos * ld;
+  unsigned* h = hist_all + (size_t)pos * kSampKeys;
+  __shared__ unsigned long long uws[32], uwe[33], ucum;
+  __shared__ int iws[32], iwe[33], icum, red[32], sh[4], wcnt[32], fnd[2];
+  __shared__ unsigned skey;
+  const float temp = __int_as_float(prm[0]), topp = __int_as_float(prm[2]), minp = __int_as_float(prm[3]);
+  const float inv_t = 1.0f / temp;
+  const int topk = prm[1];
+  const bool kall = !(topk > 0 && topk < nv), pall = !(topp < 1.f);
+  // max: the highest key present (samp_hist)
+  if (threadIdx.x == 0) skey = kmax_all[pos] - 1u;
+  __syncthreads();
+  const float mx = bf_val_of_key(skey);
+  __syncthreads();
+  auto mass = [&](unsigned key) { return __expf((bf_val_of_key(key) - mx) * inv_t); };
+  using U = unsigned long long;
+  auto wkey = [&](unsigned key) -> U { return samp_w(mass(key)); };
+  if (stop == 1) return;  // AGENS_SAMP_STOP: timing bisection, debug only (wrong samples)
+  // top-k: the k-th largest key tk and how many of its ties (the first by index) are in
+  unsigned tk = 0;
+  int need_k = 0;
+  if (!kall) {
+    int s = 0;
+    samp_walk(h, [&](int, unsigned, unsigned c) { s += (int)c; return true; });
+    samp_tot<int>(s, iws, iwe);
+    samp_cross<int>(h, topk, true, iws, iwe, [](unsigned, unsigned c) { return (int)c; }, &skey, &icum, fnd);
+    tk = skey, need_k = topk - icum;
+    __syncthreads();
+  }
+  if (stop == 2) return;
+  auto inc_k = [&](unsigned key, unsigned c) -> unsigned {
+    if (kall) return c;
+    return key > tk ? c : (key == tk ? (unsigned)need_k : 0u);
+  };
+  // top-p over the top-k set: the smallest key-descending prefix with mass >= top_p * Z_A; at its last key as many ties
+  // (the first by index) as the prefix needs
+  unsigned tp = 0;
+  int need_p = 0;
+  if (!pall) {
+    auto gA = [&](unsigned key, unsigned c) -> U { const unsigned n = inc_k(key, c); return n ? (U)n * wkey(key) : 0ull; };
+    U s = 0;
+    samp_walk(h, [&](int, unsigned key, unsigned c) { if (c) s += gA(key, c); return true; });
+    const U za = samp_tot<U>(s, uws, uwe);
+    const double target = (double)topp * (double)za;
+    samp_cross<U>(h, target, true, uws, uwe, gA, &skey, &ucum, fnd);
+    if (fnd[0] == 1) {
+      tp = skey;
+      const U wt = wkey(tp);
+      const unsigned n = inc_k(tp, __ldcg(h + tp));
+      const double q = wt ? ceil((target - (double)ucum) / (double)wt) : 1.0;
+      const int nq = q < 1.0 ? 1 : (q > 1e9 ? 1000000000 : (int)q);
+      need_p = nq < (int)n ? nq : (int)n;
+    }  // else (rounding at the top end): the whole top-k set
+    __syncthreads();
+  }
+  auto inc = [&](unsigned key, unsigned c) -> unsigned {  // elements of the key in the filtered set
+    unsigned n = inc_k(key, c);
+    if (need_p) n = key > tp ? n : (key == tp ? min(n, (unsigned)need_p) : 0u);
+    if (n && minp > 0.f && mass(key) < minp) n = 0;
+    return n;
+  };
+  auto gF = [&](unsigned key, unsigned c) -> U { const unsigned n = inc(key, c); return n ? (U)n * wkey(key) : 0ull; };
+  U zs = 0;
+  samp_walk(h, [&](int, unsigned key, unsigned c) { if (c) zs += gF(key, c); return true; });
+  const U z = samp_tot<U>(zs, uws, uwe);
+  if (stop == 3) return;
+  // the target's own sample of the token at absolute position prm[5] + j (the rule above); the draft x = ids[j + 1] is
+  // accepted iff it is that token
+  const int x = j + 1 < T ? ids[j + 1] : -1;
+  const float u = samp_u((unsigned)prm[4], (unsigned long long)(unsigned)prm[5] + (unsigned long long)j);
+  const int tok = samp_icdf_bf16(h, l, nv, samp_target(u, z), uws, uwe, gF, wkey, &skey, &ucum, fnd, wcnt, sh);
+  const bool acc = x >= 0 && tok == x;
+  if (threadIdx.x == 0) scr[j] = x >= 0 ? acc : 0, scr[8 + j] = tok;
+  // re-arm the histogram (and the max) for the next call
+  __syncthreads();
+  if (threadIdx.x == 0) kmax_all[pos] = 0u;
+  samp_walk(h, [&](int, unsigned key, unsigned c) { if (c) h[key] = 0u; return true; });
 }
 // device penalty state of a session: counts += the tokens ids[0..n) (repeats add up)
 __global__ void pen_count_add(int* cnt, const int* ids, int n, int nv) {
@@ -1109,6 +1562,7 @@ struct State {
   int* vres = nullptr;                  // accept result {n, emitted[..]} (device), mirrored to pinned vres_h
   size_t big0_elems = 0;                // big0 capacity (bf16 elements)
   int* samp_scr = nullptr;              // sampled accept: per-position accept flags / tokens (samp_pos)
+  unsigned* samp_hist = nullptr;        // fast sampled accept: per-position bf16 key histograms (all-zero between calls)
   int* vres_h = nullptr;
   bf16* cap = nullptr;                  // drafter context features: [tokens][kCapLayers][HID] (stream 0 at layer entry)
   int cap_rows = 0;
@@ -1163,6 +1617,28 @@ int g_cur = 0, g_nslots = 1;
 std::vector<int> g_free, g_ref;                 // free page stack (top = lowest page), per-page refcount
 std::vector<char> g_slot_used;
 #define g_seq (g_sess[g_cur].seq)
+// debug dumps (AGENS_M1_DUMP_DIR): file tag "_seq<g_seq>", or with AGENS_M1_DUMP_CALLIDX=1 "_c<forward call>" (paths
+// whose g_seq differs, e.g. the batched verify); AGENS_M1_DUMP_MAXT=n: only forwards of <= n rows
+int g_dump_call = 0;
+bool dump_rows_ok(int T) {
+  static const int mx = getenv("AGENS_M1_DUMP_MAXT") ? atoi(getenv("AGENS_M1_DUMP_MAXT")) : 1 << 30;
+  return T <= mx;
+}
+std::string dump_tag() {
+  static const bool ci = getenv("AGENS_M1_DUMP_CALLIDX") != nullptr;
+  return ci ? "_c" + std::to_string(g_dump_call) : "_seq" + std::to_string(g_seq);
+}
+// AGENS_M1_DUMP_LAYER=i (with AGENS_M1_DUMP_DIR): attention intermediates of layer i per rank (<name>i_r<rank><tag>)
+void dbg_layer(int i, int T, const char* nm, const void* p, size_t bytes) {
+  static const int L = getenv("AGENS_M1_DUMP_LAYER") ? atoi(getenv("AGENS_M1_DUMP_LAYER")) : -1;
+  const char* dd = getenv("AGENS_M1_DUMP_DIR");
+  if (i != L || !dd || !dump_rows_ok(T)) return;
+  std::vector<char> h(bytes);
+  cudaDeviceSynchronize();
+  cudaMemcpy(h.data(), p, bytes, cudaMemcpyDeviceToHost);
+  FILE* f = fopen((std::string(dd) + "/" + nm + std::to_string(i) + "_r" + std::to_string(g_rank) + dump_tag() + ".bin").c_str(), "wb");
+  if (f) { fwrite(h.data(), 1, bytes, f); fclose(f); }
+}
 void bind_session() {  // point every device's State at the active session's per-device buffers
   for (int d = 0; d < g_ndev; ++d) {
     SD[d].r2t = g_sess[g_cur].r2t[d], SD[d].prev = g_sess[g_cur].prev[d], SD[d].slot = g_sess[g_cur].slot[d];
@@ -1710,6 +2186,9 @@ int attn_mixer(int i, const bf16* h, bf16* out, int T, bool prefill, bool bcsa) 
       attn_out = S.t3;
     }
   }
+  dbg_layer(i, T, "q", S.q, (size_t)T * QH * HD * 2); dbg_layer(i, T, "o", S.o, (size_t)T * QH * HD * 2);
+  dbg_layer(i, T, "lse", S.lse, (size_t)T * QH * 4); dbg_layer(i, T, "qi", S.qi, (size_t)T * IDXH * IDXD * 2);
+  dbg_layer(i, T, "ao", attn_out, (size_t)T * QH * HD * 2); dbg_layer(i, T, "gate", S.gate, (size_t)T * QH * HD * 2);
   CK(ak_bf16_binary(attn_out, S.gate, S.t2, (long)T * QH * HD, 2, S.s));  // out * sigmoid(gate)
   return linear(S.t2, "self_attn.o_proj.weight", i, out, T, HID, QH * HD);
 }
@@ -1821,6 +2300,13 @@ int attn_batch(int i, const bf16* h, bf16* out, bool bcsa) {
 // its own decode call), the far branch per sequence (as its single-sequence verify). Tiered / INT8 KV: per sequence,
 // the single-sequence verify layer itself (attn_mixer on its 8 rows, its plans).
 constexpr int MSLOT_BVWIN = 6, MSLOT_BVDENSE = 7;
+bool g_bv_packed = false;  // this batched verify (B = 1) runs the dense layers on the packed single-sequence plan
+// batched verify at B = 1 on the packed plan: only with AGENS_SPEC_DENSE_PACKED=1 (then it matches that bs = 1 verify),
+// AGENS_SPEC_BV_PACKED=0 off; by default the mode-2 multi plan at every B (exact)
+bool bv_packed_on() {
+  static const int on = [] { const char* e = getenv("AGENS_SPEC_BV_PACKED"); return !(e && e[0] == '0'); }();
+  return on && dense_packed() && multi_attn();
+}
 int plan_verify(int T);
 std::vector<int> g_bv_reg;  // per sequence: 0 near, 1 every query far, 2 mixed
 int attn_bv(int i, const bf16* h, bf16* out, bool bcsa) {
@@ -1871,7 +2357,33 @@ int attn_bv(int i, const bf16* h, bf16* out, bool bcsa) {
     store_rows<<<grid((long)R * IDXD), 256, 0, S.s>>>(S.ik, S.idx[i], S.loc, R, IDXD);
     block_keys_decode<<<R, IDXD, 0, S.s>>>(S.pos, S.loc, S.r2t_b, S.Wctx, S.idx[i], S.blk[i], S.rows, TV);
   }
-  CK(ak_attn_decode_multi(bcsa ? MSLOT_BVWIN : MSLOT_BVDENSE, S.q, S.kc[i], S.vc[i], QH, KVH, scale, S.o, S.lse, S.s));
+  if (!bcsa && g_bv_packed) {  // B = 1: the single-sequence verify's dense attention (plan in verify_body_b)
+    CK(ak_attn_decode_packed(MSLOT_PACKED, S.q, S.kc[i], S.vc[i], S.r2t_b, QH, KVH, scale, S.o, S.lse, S.s));
+    for (int t = 0; t < TV; ++t)
+      CK(ak_attn_decode(3 + 2 * t, S.q + (size_t)t * QH * HD, S.kc[i], S.vc[i], S.r2t_b, S.bv_rng + 4 * t + 2, QH, KVH,
+                        scale, S.o + (size_t)t * QH * HD, S.lse + t * QH, S.s));
+  } else
+    CK(ak_attn_decode_multi(bcsa ? MSLOT_BVWIN : MSLOT_BVDENSE, S.q, S.kc[i], S.vc[i], QH, KVH, scale, S.o, S.lse, S.s));
+  if (!bcsa && B == 1 && getenv("AGENS_M1_DUMP_KV")) {  // debug: this dense layer's K / V of sequence 0's positions
+    static const int L = getenv("AGENS_M1_DUMP_LAYER") ? atoi(getenv("AGENS_M1_DUMP_LAYER")) : -1;
+    const char* dd = getenv("AGENS_M1_DUMP_DIR");
+    if (i == L && dd) {
+      cudaDeviceSynchronize();
+      const int n = g_sess[g_bv_sess[0]].seq + TV;
+      std::vector<int> r2t(n);
+      cudaMemcpy(r2t.data(), S.r2t_b, (size_t)n * 4, cudaMemcpyDeviceToHost);
+      std::vector<uint16_t> k((size_t)n * KVH * HD), v(k.size());
+      for (int p = 0; p < n; ++p) {
+        cudaMemcpy(k.data() + (size_t)p * KVH * HD, S.kc[i] + (size_t)r2t[p] * KVH * HD, (size_t)KVH * HD * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(v.data() + (size_t)p * KVH * HD, S.vc[i] + (size_t)r2t[p] * KVH * HD, (size_t)KVH * HD * 2, cudaMemcpyDeviceToHost);
+      }
+      FILE* f = fopen((std::string(dd) + "/kv" + std::to_string(i) + "_r" + std::to_string(g_rank) + dump_tag() + ".bin").c_str(), "wb");
+      if (f) {
+        const int hdr[3] = {n, KVH, HD};
+        fwrite(hdr, 4, 3, f), fwrite(k.data(), 2, k.size(), f), fwrite(v.data(), 2, v.size(), f), fclose(f);
+      }
+    }
+  }
   bf16* attn_out = S.o;
   if (bcsa) {
     bool any = false;
@@ -1903,6 +2415,9 @@ int attn_bv(int i, const bf16* h, bf16* out, bool bcsa) {
       attn_out = S.t3;
     }
   }
+  dbg_layer(i, R, "q", S.q, (size_t)R * QH * HD * 2); dbg_layer(i, R, "o", S.o, (size_t)R * QH * HD * 2);
+  dbg_layer(i, R, "lse", S.lse, (size_t)R * QH * 4); dbg_layer(i, R, "qi", S.qi, (size_t)R * IDXH * IDXD * 2);
+  dbg_layer(i, R, "ao", attn_out, (size_t)R * QH * HD * 2); dbg_layer(i, R, "gate", S.gate, (size_t)R * QH * HD * 2);
   CK(ak_bf16_binary(attn_out, S.gate, S.t2, (long)R * QH * HD, 2, S.s));  // out * sigmoid(gate)
   return linear(S.t2, "self_attn.o_proj.weight", i, out, R, HID, QH * HD);
 }
@@ -1937,7 +2452,8 @@ int layer(int i, int T, bool prefill) {
   else CK(attn_mixer(i, h, a, T, prefill, kMixer[i] == 'b'));
   // the ranks' head shares of the mixer output: summed here, or (push path, peer GPUs) by the fused all-reduce + residual
   // add + post-attention norm below (same bits; AGENS_TP_AR_FUSE=0: separate launches)
-  const char* dump_dir = g_B ? nullptr : getenv("AGENS_M1_DUMP_DIR");
+  dbg_layer(i, T, "part", a, (size_t)T * HID * 2);  // this rank's share of the mixer output (before the all-reduce)
+  const char* dump_dir = g_B || !dump_rows_ok(T) ? nullptr : getenv("AGENS_M1_DUMP_DIR");
   bool ar_fused = false;
   bf16* h2 = S.y;
   if (g_tp > 1 && fuse_on() && tp_ar_fuse_on() && !dump_dir) {
@@ -1951,7 +2467,7 @@ int layer(int i, int T, bool prefill) {
       std::vector<uint16_t> hbuf((size_t)T * HID);
       cudaMemcpyAsync(hbuf.data(), a, hbuf.size() * 2, cudaMemcpyDeviceToHost, S.s);
       cudaStreamSynchronize(S.s);
-      std::string fn = std::string(dd) + "/att" + std::to_string(i) + "_seq" + std::to_string(g_seq) + ".bin";
+      std::string fn = std::string(dd) + "/att" + std::to_string(i) + dump_tag() + ".bin";
       FILE* f = fopen(fn.c_str(), "wb");
       if (f) { fwrite(hbuf.data(), 2, hbuf.size(), f); fclose(f); }
     }
@@ -2167,6 +2683,7 @@ int lm_head(const bf16* x, bf16* y, int m) {
 }
 int run_model(int T, bool prefill, int R) {
   g_dec = !prefill;
+  ++g_dump_call;
   // embeddings -> 4 identical streams; h_mean = embedding (mean of 4 equal values is exact)
   use(dev_of(0));
   CK(ak_embed(S.ids, WG("model.language_model.embed_tokens.weight"), S.t0, T, HID, S.s));
@@ -2222,11 +2739,11 @@ int run_model(int T, bool prefill, int R) {
                     HID, S.post, S.res, T, HID, 10, S.s));
     }
     pre_done = false;
-    if (const char* dd = getenv("AGENS_M1_DUMP_DIR")) {  // debug: layer inputs (sglv23 VOLUNDR_DUMP's in{i})
+    if (const char* dd = dump_rows_ok(T) ? getenv("AGENS_M1_DUMP_DIR") : nullptr) {  // debug: layer inputs (sglv23 VOLUNDR_DUMP's in{i})
       std::vector<uint16_t> hbuf((size_t)T * HID);
       cudaMemcpyAsync(hbuf.data(), S.xin, hbuf.size() * 2, cudaMemcpyDeviceToHost, S.s);
       cudaStreamSynchronize(S.s);
-      std::string fn = std::string(dd) + "/in" + std::to_string(i) + "_seq" + std::to_string(g_seq) + ".bin";
+      std::string fn = std::string(dd) + "/in" + std::to_string(i) + dump_tag() + ".bin";
       FILE* f = fopen(fn.c_str(), "wb");
       if (f) { fwrite(hbuf.data(), 2, hbuf.size(), f); fclose(f); }
     }
@@ -2598,6 +3115,30 @@ void put_pen(int* q, const Session& ss) {
   q[4] = (int)(unsigned)(c & 0xffffffffu), q[5] = (int)(unsigned)(c >> 32);
   q[6] = (int)(unsigned)(b & 0xffffffffu), q[7] = (int)(unsigned)(b >> 32);
 }
+// the accept of a verify step: B sequences x T positions, parameter blocks prm + b * stride (samp_pos); sampled rows
+// without penalties on the fast histogram path (samp_hist / samp_fast; AGENS_SAMP_FAST=0: samp_pos for every row)
+bool samp_fast_on() {
+  static const int on = [] { const char* e = getenv("AGENS_SAMP_FAST"); return !(e && e[0] == '0'); }();
+  return on;
+}
+void samp_accept(int T, int B, const int* prm, int stride) {
+  // the 64 KB shared half-histogram of samp_hist (over the 48 KB default; every sm80+ part allows it); if the attribute
+  // cannot be set, samp_pos takes every row (the same sampling rule), and the failed call's error is cleared
+  static const bool smem = [] {
+    const bool ok = cudaFuncSetAttribute(samp_hist, cudaFuncAttributeMaxDynamicSharedMemorySize, kSampKeys) == cudaSuccess;
+    if (!ok) cudaGetLastError();  // not sticky: clear it
+    return ok;
+  }();
+  const bool fast = samp_fast_on() && S.samp_hist && smem;
+  if (fast) {
+    unsigned* kmax = S.samp_hist + (size_t)kMaxBV * kSpecT * kSampKeys;
+    samp_hist<<<dim3(kSampHB, B * T, 2), 1024, kSampKeys, S.s>>>(S.big0, VOCAB, VOCAB_VALID, T, prm, stride, S.samp_hist, kmax);
+    static const int stop = getenv("AGENS_SAMP_STOP") ? atoi(getenv("AGENS_SAMP_STOP")) : 0;
+    samp_fast<<<B * T, 1024, 0, S.s>>>(S.big0, VOCAB, VOCAB_VALID, S.ids, T, prm, stride, S.samp_hist, kmax, S.samp_scr,
+                                       stop);
+  }
+  samp_pos<<<B * T, 1024, 0, S.s>>>(S.big0, VOCAB, VOCAB_VALID, S.ids, T, prm, stride, S.tok, S.samp_scr, fast);
+}
 int verify_body(int T, bool draft) {
   CK(cudaMemcpyAsync(S.step_d, S.step_h, kStepInts * sizeof(int), cudaMemcpyHostToDevice, S.s));
   if (draft) {
@@ -2613,7 +3154,7 @@ int verify_body(int T, bool draft) {
   CK(run_model(T, false));
   if (g_temp > 0.f || g_vpen) {  // sampled accept over the request's filtered distribution (temperature, top-k / top-p /
                                   // min-p), or any accept with penalties (the penalised argmax / distribution)
-    samp_pos<<<T, 1024, 0, S.s>>>(S.big0, VOCAB, VOCAB_VALID, S.ids, T, S.step_d + 32, 0, S.tok, S.samp_scr);
+    samp_accept(T, 1, S.step_d + 32, 0);
     samp_chain<<<1, 32, 0, S.s>>>(S.ids, 1, T, S.samp_scr, S.vres, 0);
   } else
     accept_greedy<<<1, 1, 0, S.s>>>(S.ids, S.tok, T, S.vres);
@@ -2626,6 +3167,34 @@ int verify_body(int T, bool draft) {
   CK(cudaMemcpyAsync(S.vres_h, S.vres, (1 + kSpecT) * sizeof(int), cudaMemcpyDeviceToHost, S.s));
   CK(cudaMemcpyAsync(S.vres_h + 1 + kSpecT, S.tok, kSpecT * sizeof(int), cudaMemcpyDeviceToHost, S.s));
   return (int)cudaMemcpyAsync(S.vres_h + 1 + 2 * kSpecT, S.ids, kSpecT * sizeof(int), cudaMemcpyDeviceToHost, S.s);
+}
+// debug (AGENS_M1_VLOGITS_DUMP=file): the verify logits of the first AGENS_M1_VLOGITS_STEPS (default 32) speculative steps
+// of this process (rank 0), rows [VOCAB_VALID] bf16 per verified position, appended; for comparing the logits of the
+// single-sequence verify and the batched verify bitwise (sequence 0 of a batch)
+// AGENS_M1_VLOGITS_ROW0=1: records {i64 position, row 0}; =2: {i64 position of row 0, i64 rows, those rows} with the rows
+// whose inputs were all committed (the step's emitted count: their prefix is the sequence, so a decode step at the same
+// position has the same inputs)
+void vlogits_dump(const bf16* rows, int n, long long pos0 = -1, int valid = 1) {
+  static const char* f = getenv("AGENS_M1_VLOGITS_DUMP");
+  static const int lim = getenv("AGENS_M1_VLOGITS_STEPS") ? atoi(getenv("AGENS_M1_VLOGITS_STEPS")) : 32;
+  static const int row0 = getenv("AGENS_M1_VLOGITS_ROW0") ? atoi(getenv("AGENS_M1_VLOGITS_ROW0")) : 0;
+  static int steps = 0;
+  if (!f || g_rank != 0 || steps >= lim) return;
+  ++steps;
+  std::vector<uint16_t> h((size_t)VOCAB_VALID);
+  FILE* o = fopen(f, "ab");
+  if (!o) return;
+  if (row0 == 1) fwrite(&pos0, 8, 1, o), n = 1;
+  if (row0 == 2) {
+    n = std::max(1, std::min(n, valid));
+    const long long nn = n;
+    fwrite(&pos0, 8, 1, o), fwrite(&nn, 8, 1, o);
+  }
+  for (int t = 0; t < n; ++t) {
+    cudaMemcpy(h.data(), rows + (size_t)t * VOCAB, h.size() * 2, cudaMemcpyDeviceToHost);
+    fwrite(h.data(), 2, h.size(), o);
+  }
+  fclose(o);
 }
 // tokens == nullptr: the drafter proposes (T = 8, tokens[0] = bonus passed in *n_out on entry)
 int g_hint_n = 0, g_hint[kSpecT];  // the next drafted verify's host proposal (ak_m1_spec_step_hint)
@@ -2654,7 +3223,8 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
   for (int t = 0; t < T; ++t) rows[t] = alloc_row(ss);
   S.step_h[0] = T, S.step_h[1] = g_seq, S.step_h[18] = g_spec_step++, S.step_h[19] = g_seed;
   memcpy(&S.step_h[32], &g_temp, 4), S.step_h[33] = g_topk, memcpy(&S.step_h[34], &g_topp, 4), memcpy(&S.step_h[35], &g_minp, 4);
-  S.step_h[36] = S.step_h[19], S.step_h[37] = S.step_h[18];  // samp_pos parameter block: seed, step
+  // samp_pos parameter block: seed, the absolute position of the token row 0 samples (g_seq + 1: the sampling rule)
+  S.step_h[36] = S.step_h[19], S.step_h[37] = g_seq + 1;
   put_pen(S.step_h + 32 + 12, ss);
   g_vpen = ss.pen;
   S.step_h[kStepDelta] = ss.rdelta;
@@ -2716,6 +3286,7 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
   const auto t_enq = std::chrono::steady_clock::now();
   CK(cudaStreamSynchronize(S.s));
   const auto t_end = std::chrono::steady_clock::now();
+  vlogits_dump(S.big0, T, g_seq, S.vres_h[0]);
   const int n = S.vres_h[0];
   for (int j = 0; j < n; ++j) emitted[j] = S.vres_h[1 + j];
   if (target)
@@ -2768,7 +3339,8 @@ int verify_body_b(int B) {
   // at most the batched verify's TV - 1 draft slots
   // (AGENS_MTP_BATCH_MAX, default 8: larger batched steps skip the chain -- 48gb profile c16 was 4% slower with it --
   // but every batch keeps the MTP context; the graph key holds B, so a graph never mixes the two)
-  static const int mtp_bmax = getenv("AGENS_MTP_BATCH_MAX") ? atoi(getenv("AGENS_MTP_BATCH_MAX")) : 8;
+  // (1.3.3: on sm90 with the MTP head alone every batch runs the chain: c13 539 -> 782, c16 627 -> 906 tok/s)
+  static const int mtp_bmax = getenv("AGENS_MTP_BATCH_MAX") ? atoi(getenv("AGENS_MTP_BATCH_MAX")) : (sm90_mtp_only() ? kMaxBV : 8);
   if (m1mtp::ready() && B <= mtp_bmax)
     CK(m1mtp::propose_b(draft_target(), B, S.bv_d, std::min(mtp_steps(), g_TV - 1)));
   seg_split_draft();
@@ -2777,14 +3349,23 @@ int verify_body_b(int B) {
   bv_r2t_stage<<<grid((long)B * S.Wctx), 256, 0, S.s>>>(S.bv_d, B, S.Wctx, S.r2t_b);
   if (!m1kv::on()) {  // all-GPU pools: every query its own request, over the B staged slot maps
     CK(ak_attn_decode_multi_plan_mode(MSLOT_BVWIN, R, S.bv_rng, 4, S.r2t_b, WIN + 8, QH, KVH, nullptr, 2, S.s));
-    CK(ak_attn_decode_multi_plan_mode(MSLOT_BVDENSE, R, S.bv_rng + 2, 4, S.r2t_b, S.Wctx, QH, KVH, nullptr, 2, S.s));
+    // dense layer: B = 1 takes the single-sequence verify's plan (one causal request of the TV queries, ak_attn_decode_
+    // packed, its per-query fallback launches disabled on device when it is valid) -- the same per-query results as the
+    // mode-2 multi plan, at the cost of the bs = 1 verify (AGENS_SPEC_BV_PACKED=0: the multi plan at every B)
+    g_bv_packed = B == 1 && bv_packed_on();
+    if (g_bv_packed) {
+      static const int dslots[8] = {3, 5, 7, 9, 11, 13, 15, 17};
+      for (int t = 0; t < g_TV; ++t) CK(ak_attn_decode_plan(3 + 2 * t, S.bv_rng + 4 * t + 2, QH, KVH, S.s));
+      CK(ak_attn_decode_packed_plan(MSLOT_PACKED, g_TV, S.bv_rng + 2, 4, QH, KVH, dslots, S.s));
+    } else
+      CK(ak_attn_decode_multi_plan_mode(MSLOT_BVDENSE, R, S.bv_rng + 2, 4, S.r2t_b, S.Wctx, QH, KVH, nullptr, 2, S.s));
   }
   g_BV = B;
   const int e = run_model(R, false);
   g_BV = 0;
   if (e) return e;
   // per sequence: greedy accept, or the sampled accept over its filtered distribution (record [34..39], 1.0.1)
-  samp_pos<<<B * g_TV, 1024, 0, S.s>>>(S.big0, VOCAB, VOCAB_VALID, S.ids, g_TV, S.bv_d + 34, kRI, S.tok, S.samp_scr);
+  samp_accept(g_TV, B, S.bv_d + 34, kRI);
   samp_chain<<<1, 32, 0, S.s>>>(S.ids, B, g_TV, S.samp_scr, S.bv_res, kBVRes);
   CK(spec_commit_b(B));
   if (m1draft::ready() && g_capture) CK(m1draft::materialize_b(draft_target(), S.cap, B, S.bv_res, kBVRes, S.pos, S.bv_d, g_TV));
@@ -2835,7 +3416,7 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
     for (int t = 0; t < TV; ++t) r[10 + t] = alloc_row(ss);
     r[18] = ss.kslot, r[19] = ss.kslot < m1draft::rings() ? ss.kslot : 0;
     memcpy(r + 34, &ss.samp_t, 4), r[35] = ss.samp_k, memcpy(r + 36, &ss.samp_p, 4), memcpy(r + 37, &ss.samp_minp, 4);
-    r[38] = ss.samp_seed, r[39] = ss.samp_step++;
+    r[38] = ss.samp_seed, r[39] = ss.seq + 1;  // seed, the absolute position of row 0's token (the sampling rule)
     put_pen(r + 34 + 12, ss);
     r[kRecDelta] = ss.rdelta;
     put_ptr(r + 20, ss.r2t[0]), put_ptr(r + 22, ss.prev[0]);
@@ -2909,6 +3490,7 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
   const auto t_enq = std::chrono::steady_clock::now();
   CK(cudaStreamSynchronize(S.s));
   const auto t_end = std::chrono::steady_clock::now();
+  vlogits_dump(S.big0, TV, g_sess[sess[0]].seq, S.bv_res_h[0]);  // sequence 0's TV rows
   for (int b = 0; b < B; ++b) {
     Session& ss = g_sess[sess[b]];
     const int* res = S.bv_res_h + b * kBVRes;
@@ -3206,6 +3788,10 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
   CK(cudaMallocHost(&S.bstep_h, kMaxBatch * kBRec * sizeof(int)));
   S.step_d = dalloc<int>(kStepInts), S.rng = dalloc<int>(4 * kSpecT);  // decode uses [0..3]; speculative verify the rest
   S.samp_scr = dalloc<int>(16 * kMaxBV);
+  if (samp_fast_on()) {  // kMaxBV sequences x 8 positions x 65536 keys (32 MB), zeroed once (samp_fast re-zeroes)
+    S.samp_hist = dalloc<unsigned>((size_t)kMaxBV * kSpecT * (kSampKeys + 1));  // + the per-position max keys
+    cudaMemset(S.samp_hist, 0, (size_t)kMaxBV * kSpecT * (kSampKeys + 1) * 4);
+  }
   for (int i = 0; i < NL; ++i)
     if (kMixer[i] == 'b' && dev_of(i) == my && !S.far_ws) S.far_ws = dalloc<char>(ak_far_decode_ws_bytes(Wctx));
   // AGENS_FAR_EXTEND_GPU=1 (all-GPU KV): the prefill far branch on engine kernels (m1_kv's tiered path has its own,
@@ -3322,6 +3908,11 @@ int ak_m1_spec_init(int bi, const int* cap_layers, int cap_rows) {
     g_capture = true;
   }
   g_graphs.clear(), g_warm.clear(), g_vgraphs.clear(), g_vwarm.clear();  // decode graphs were built for the old mode
+  if (const char* e = getenv("AGENS_M1_DBG_PAD_MB")) {  // debug: shift later allocations (memory-layout sensitivity)
+    void* pad = nullptr;
+    cudaMalloc(&pad, (size_t)atoi(e) << 20);
+    if (pad) cudaMemset(pad, 0x5a, (size_t)atoi(e) << 20);
+  }
   return (int)cudaDeviceSynchronize();
 }
 // Verify tokens[0..T-1] = [bonus, d1..d(T-1)] (T <= 8) at the current position; commits n (1..T) tokens and returns
@@ -3401,6 +3992,41 @@ int ak_m1_decode(int token, int* next) { return g_ndev == 1 ? decode1(token, nex
 // Batched decode step (server mode): row r feeds tok[r] to session sess[r]; next[r] = greedy token, logits of row r
 // via ak_m1_logits_row. Each row is bit-identical to a bs = 1 ak_m1_decode of that session (see bf16_lin).
 int ak_m1_decode_batch(const int* sess, const int* tok, int B, int* next) { return forward_rows(sess, tok, B, next); }
+
+// Device sampling of the last decode step's rows (1.3.3): row b of the step (ak_m1_decode: row 0;
+// ak_m1_decode_batch: row b = sess[b]) with use[b] != 0 draws its token from its session's filtered distribution
+// (ak_m1_session_sampling: temperature > 0, top-k / top-p / min-p; ak_m1_session_penalty: penalties and logit bias) with
+// the speculative accept's kernels as a one-position verify without a draft: samp_hist / samp_fast for the rows without
+// penalties, samp_pos for the penalised ones, under the one device sampling rule: the token at absolute position n is
+// InvCDF_q(u(seed, n)), so a request's tokens for a seed do not depend on batch size, route or speculation.
+// out[b] = the token of each use[b] row. One device per process.
+int ak_m1_sample_decode(const int* sess, const int* use_row, int B, int* out) {
+  if (B < 1 || B > kMaxBV || g_ndev != 1) return (int)cudaErrorInvalidValue;
+  use(0);
+  static int *prm_h = nullptr, *prm_d = nullptr, *res_h = nullptr;
+  constexpr int kPrm = 20;
+  if (!prm_h) {
+    CK(cudaMallocHost(&prm_h, (size_t)kMaxBV * kPrm * 4));
+    CK(cudaMallocHost(&res_h, (size_t)kMaxBV * 16 * 4));
+    if (!(prm_d = dalloc<int>((size_t)kMaxBV * kPrm))) return (int)cudaErrorMemoryAllocation;
+  }
+  memset(prm_h, 0, (size_t)B * kPrm * 4);
+  for (int b = 0; b < B; ++b) {
+    if (!use_row[b]) continue;  // temperature 0, no penalties: the trivial greedy branch, result unused
+    if (sess[b] < 0 || sess[b] >= (int)g_sess.size() || !g_sess[sess[b]].live) return (int)cudaErrorInvalidValue;
+    Session& ss = g_sess[sess[b]];
+    int* q = prm_h + (size_t)b * kPrm;
+    memcpy(q, &ss.samp_t, 4), q[1] = ss.samp_k, memcpy(q + 2, &ss.samp_p, 4), memcpy(q + 3, &ss.samp_minp, 4);
+    q[4] = ss.samp_seed, q[5] = ss.seq;  // the sampling rule: the absolute position of the token drawn (the decode fed seq - 1)
+    put_pen(q + 12, ss);
+  }
+  CK(cudaMemcpyAsync(prm_d, prm_h, (size_t)B * kPrm * 4, cudaMemcpyHostToDevice, S.s));
+  samp_accept(1, B, prm_d, kPrm);
+  CK(cudaMemcpyAsync(res_h, S.samp_scr, (size_t)B * 16 * 4, cudaMemcpyDeviceToHost, S.s));
+  CK(cudaStreamSynchronize(S.s));
+  for (int b = 0; b < B; ++b) out[b] = use_row[b] ? res_h[16 * b + 8] : -1;
+  return 0;
+}
 
 // Batched speculative decoding (server mode): buffers for up to max_b sequences per step; call after ak_m1_spec_init
 // and before ak_m1_draft_setup (the drafter then gets one context ring per KDA slot and max_b-sequence buffers).

@@ -1342,8 +1342,9 @@ pub fn models_json(name: &str, created: u64, max_model_len: usize) -> String {
 
 pub fn model_card_json(name: &str, created: u64, max_model_len: usize) -> String {
     format!(
-        "{{\"id\":{},\"object\":\"model\",\"created\":{created},\"owned_by\":\"sglang\",\"root\":{},\"parent\":null,\"max_model_len\":{max_model_len}}}",
+        "{{\"id\":{},\"object\":\"model\",\"created\":{created},\"agens_version\":\"{}\",\"owned_by\":\"sglang\",\"root\":{},\"parent\":null,\"max_model_len\":{max_model_len}}}",
         q(name),
+        env!("CARGO_PKG_VERSION"),
         q(name)
     )
 }

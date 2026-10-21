@@ -353,6 +353,7 @@ pub mod m1 {
         fn ak_m1_session_penalty(sess: c_int, rep: f32, freq: f32, pres: f32, bias_ids: *const c_int, bias_vals: *const f32,
                                  nb: c_int) -> c_int;
         fn ak_m1_session_penalty_add(sess: c_int, ids: *const c_int, n: c_int) -> c_int;
+        fn ak_m1_sample_decode(sess: *const c_int, use_row: *const c_int, b: c_int, out: *mut c_int) -> c_int;
         fn ak_m1_spec_batch_hint(sess: *const c_int, b: c_int, bonus: *const c_int, hint: *const c_int, nh: *const c_int,
                                  emitted: *mut c_int, n: *mut c_int) -> c_int;
         fn ak_m1_spec_batch(sess: *const c_int, b: c_int, bonus: *const c_int, emitted: *mut c_int, n: *mut c_int) -> c_int;
@@ -760,6 +761,18 @@ pub mod m1 {
                                 if vals.is_empty() { "-".into() } else { vals.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",") }));
         check(unsafe { ak_m1_session_penalty(sess, rep, freq, pres, ids.as_ptr(), vals.as_ptr(), ids.len() as c_int) },
               "m1_session_penalty")
+    }
+    /// Device sampling of the last decode step's rows (row b = sessions[b]; a bs = 1 decode: one row): the rows with
+    /// use_row[b] draw from their session's filtered, penalised distribution (session_sampling / session_penalty) with the
+    /// speculative accept's kernels; -> the token per row (-1 where not used). Forwarded under --tp (every rank advances
+    /// the same sample streams).
+    pub fn sample_decode(sessions: &[i32], use_row: &[bool]) -> Result<Vec<i32>> {
+        let u: Vec<c_int> = use_row.iter().map(|&x| x as c_int).collect();
+        crate::tp::fwd(&format!("sample_decode {} {}", crate::tp::join(sessions), crate::tp::join(&u)));
+        let mut out = vec![-1; sessions.len()];
+        check(unsafe { ak_m1_sample_decode(sessions.as_ptr(), u.as_ptr(), sessions.len() as c_int, out.as_mut_ptr()) },
+              "m1_sample_decode")?;
+        Ok(out)
     }
     /// The penalty counts of a session += these emitted tokens.
     pub fn session_penalty_add(sess: i32, ids: &[u32]) -> Result<()> {

@@ -431,6 +431,21 @@ __global__ void pt_fill(bf16* x, long n, int r, int it, float scale) {
     x[i] = i % 997 == r || i % 991 == 0 ? __ushort_as_bfloat16(0x8000) : (i % 983 == 0 ? __float2bfloat16_rn(0.f) : __float2bfloat16_rn(v));
   }
 }
+// PDL bench: a memory-bound producer (reads wb bytes, grid-strided, then writes x[n]) -- the shape of a W4 GEMV feeding
+// the all-reduce; pdl: it waits on its own predecessor (griddepcontrol) and lets its dependents launch at the start
+__global__ void __launch_bounds__(256) pt_prod(const uint4* w, long wn, bf16* x, long n, int pdl) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
+  if (pdl) asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  uint4 acc = {0, 0, 0, 0};
+  for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < wn; i += (long)gridDim.x * blockDim.x) {
+    const uint4 v = __ldcs(w + i);
+    acc.x ^= v.x, acc.y ^= v.y, acc.z ^= v.z, acc.w ^= v.w;
+  }
+  for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x)
+    x[i] = __float2bfloat16_rn((float)((acc.x ^ acc.w) & 7) * 0.f + 0.125f);
+}
 __global__ void pt_nop(bf16* x) {
   if (threadIdx.x == 0 && blockIdx.x == 0 && x == nullptr) x[0] = bf16{};
 }
@@ -488,6 +503,10 @@ extern "C" double ak_tp_bench2(int iters, long rows, int which, int graph) {
   cudaMemset(mo, 0, m * 2), cudaMemset(res, 0, m * 2), cudaMemset(w, 0, H * 2);
   cudaStream_t st;
   cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+  // the producer's weight read: AGENS_TP_PDL_MB (default 13: a 5120 x 2 x 13824 / tp2 W4 share, ~ the MLP down)
+  const long pwn = (long)(getenv("AGENS_TP_PDL_MB") ? atoi(getenv("AGENS_TP_PDL_MB")) : 13) << 16;  // uint4s
+  uint4* pw = nullptr;
+  if (which >= 5) cudaMalloc(&pw, pwn * 16), cudaMemset(pw, 0, pwn * 16);
   auto one = [&]() {
     switch (which) {
       case 0: g_force_pull = true; ak_tp_allreduce(mo, m, st); g_force_pull = false; break;   // pull AR
@@ -495,6 +514,21 @@ extern "C" double ak_tp_bench2(int iters, long rows, int which, int graph) {
       case 2: g_force_pull = true; ak_tp_allreduce(mo, m, st); g_force_pull = false;            // pull AR + add_rmsnorm
               ak_add_rmsnorm(res, mo, s, w, y, (int)rows, H, 1e-6f, 1, st); break;
       case 3: ak_tp_allreduce_add_rmsnorm(mo, res, s, w, y, (int)rows, H, 1e-6f, 1, st); break;  // fused
+      case 5: case 6: case 7: case 8: {  // producer (W4-GEMV-sized read) -> push AR; 6: with PDL on both; 7: producer
+        // alone; 8: PDL attribute on the AR launch only (the producer unchanged: no trigger, implicit at its end)
+        const int pdl = which == 6;
+        cudaLaunchConfig_t c{};
+        cudaLaunchAttribute at[1];
+        at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization, at[0].val.programmaticStreamSerializationAllowed = 1;
+        c.stream = st, c.attrs = at, c.numAttrs = pdl;
+        c.gridDim = dim3(132), c.blockDim = dim3(256);
+        cudaLaunchKernelEx(&c, pt_prod, (const uint4*)pw, pwn, mo, m, pdl);
+        if (which == 7) break;
+        c.gridDim = dim3(g_push.grid), c.blockDim = dim3(256);
+        c.numAttrs = which == 6 || which == 8;
+        cudaLaunchKernelEx(&c, push_ar_kernel, mo, m / 8, g_push);
+        break;
+      }
       default: pt_nop<<<1, 32, 0, st>>>(mo); break;                                                // launch floor
     }
   };
@@ -522,5 +556,6 @@ extern "C" double ak_tp_bench2(int iters, long rows, int which, int graph) {
   if (ge) cudaGraphExecDestroy(ge);
   cudaStreamDestroy(st);
   cudaFree(mo), cudaFree(res), cudaFree(s), cudaFree(y), cudaFree(w);
+  if (pw) cudaFree(pw);
   return cudaGetLastError() == cudaSuccess ? 1000.0 * ms / ((double)iters * per) : -1;
 }

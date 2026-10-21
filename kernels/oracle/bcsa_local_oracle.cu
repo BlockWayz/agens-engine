@@ -534,7 +534,10 @@ extern "C" int ak_attn_decode_multi(int mslot, void* q, void* kc, void* vc, int 
   DTypeO* tmp_v = reinterpret_cast<DTypeO*>(fb);                                       // <= T * 64 partial rows
   float* tmp_s = reinterpret_cast<float*>(fb + (size_t)m->padded * qo_heads * 256 * 2);
   p.block_valid_mask = m->valid;
-  p.padded_batch_size = m->padded;
+  // the CTAs of the planned rows only: CTA b = (chunk b / Tcur, request b % Tcur) is valid only for chunk < nch <= mbis,
+  // so CTAs >= Tcur * mbis never are -- a batched slot sized for kMaxT rows launched all T_slot * mbis of them (16896 at
+  // tp2 for one sequence's 8 rows: ~50 us per BCSA window layer). Same CTAs do the work, same bits.
+  p.padded_batch_size = (m->Tcur > 0 && m->Tcur < m->T) ? m->Tcur * m->mbis : m->padded;
   p.max_total_num_rows = m->Tcur;
   p.total_num_rows = m->rows;
   p.partition_kv = true;

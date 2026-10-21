@@ -85,7 +85,14 @@ __device__ __forceinline__ unsigned nosent(unsigned w) {  // -0.0 halves -> +0.0
 }
 __device__ __forceinline__ bool has_sent(unsigned w) { return (w & 0xFFFFu) == 0x8000u || (w >> 16) == 0x8000u; }
 
-__device__ __forceinline__ unsigned begin(const Desc& d) { return *reinterpret_cast<volatile unsigned*>(d.epoch + blockIdx.x); }
+// the block's epoch; then (programmatic dependent launch) wait for the producer of x -- a no-op without PDL
+__device__ __forceinline__ unsigned begin(const Desc& d) {
+  const unsigned e = *reinterpret_cast<volatile unsigned*>(d.epoch + blockIdx.x);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  return e;
+}
 // uint4 unit i of x (8 bf16) -> data[buffer][rank][i] of every peer
 __device__ __forceinline__ void push(const Desc& d, unsigned e, const uint4* x, long i) {
   uint4 v = x[i];

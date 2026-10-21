@@ -150,6 +150,9 @@ pub fn setup_allreduce(slot_elems: usize) -> Result<()> {
                 [false, true].map(|g| format!("{nm}{} {:.2}", if g { "/graph" } else { "" }, agens_cuda::m1::tp_bench2(50, rows, w, g)))
             }).collect();
             eprintln!("tp: rank {r} {rows} rows, us per call: {}", v.join(", "));
+            let p: Vec<String> = [(7, "producer"), (5, "producer+AR"), (6, "producer+AR PDL"), (8, "producer+AR PDL on AR only")].iter()
+                .map(|&(w, nm)| format!("{nm}/graph {:.2}", agens_cuda::m1::tp_bench2(50, rows, w, true))).collect();
+            eprintln!("tp: rank {r} {rows} rows, PDL bench: {}", p.join(", "));
         }
     }
     let _ = std::fs::remove_file(f(r, "h"));
@@ -216,6 +219,10 @@ fn follow() -> Result<()> {
                     let vals: Vec<f32> = if a[6] == "-" { Vec::new() } else { a[6].split(',').map(|x| x.parse()).collect::<Result<_, _>>()? };
                     let bias: Vec<(u32, f32)> = ids.iter().zip(&vals).map(|(&t, &v)| (t as u32, v)).collect();
                     m1::session_penalty(int(1)?, a[2].parse()?, a[3].parse()?, a[4].parse()?, &bias)?
+                }
+                "sample_decode" => {
+                    let u: Vec<bool> = split(a[2]).iter().map(|&x| x != 0).collect();
+                    drop(m1::sample_decode(&split(a[1]), &u)?)
                 }
                 "session_penalty_add" => {
                     let ids: Vec<u32> = split(a[2]).iter().map(|&t| t as u32).collect();

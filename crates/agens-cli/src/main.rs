@@ -27,6 +27,7 @@ mod spec;
 mod mm;
 
 const USAGE: &str = "usage:
+  agens --version                       the engine version
   agens inspect  <ckpt_dir>             layer map + byte budget
   agens validate <ckpt_dir>             check every tensor's dtype/shape against the config
   agens verify   <ckpt_dir> [threads]   sha256 shards against SHA256SUMS
@@ -48,6 +49,10 @@ fn main() -> Result<()> {
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let dir = || args.get(1).context(USAGE);
     match cmd {
+        "--version" | "-V" | "version" => {
+            println!("agens {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "inspect" => inspect(&Checkpoint::open(dir()?)?),
         "validate" => {
             let ck = Checkpoint::open(dir()?)?;
