@@ -30,6 +30,7 @@
 //                    with the raw x tile of the tokens; x converted once per stage, reused across the pass.
 // ak_w4h_gemm picks among them; up to 4 linears sharing x per launch (q|k|v, qkv|z|f_down), each with a row stride.
 #include "agens_kernels.h"
+#include "agens_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -39,6 +40,7 @@
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace {
@@ -176,6 +178,7 @@ w4h_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant__ W
     return;
   }
   const int c = warp >> 3, i = warp & 7, g = lane >> 2, t4 = lane & 3;
+  ak_pdl_entry();  // the producer above streams weights only (constant): it starts before the previous kernel ends
   // x -> B fragments of slot i's groups (G = i + 8 r; set c converts r = c, c + CS, ...): the loads of XB groups are
   // issued together (one L2 round trip per batch instead of per group)
   {
@@ -346,7 +349,7 @@ w4h_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant__ W
 // records]; the producer fills them in groups of CS row blocks, k-tile-interleaved across the group's sets (no consumer
 // waits more than CS stages past the producer). Per row block: the KT path's MMA chain and sum order (bit-identical).
 // registers: one block per SM (shared memory); 65536 / (threads rounded to 4 warps) per thread
-template <int NTILE, int CS>
+template <int NTILE, int CS, bool PAIR>
 __global__ void __launch_bounds__((8 * CS + 1) * 32, 1)
 w4h_xr_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant__ W4hSegs segs, int k, int stages) {
   extern __shared__ __align__(128) unsigned char sm[];
@@ -393,6 +396,7 @@ w4h_xr_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant_
     return;
   }
   const int c = warp >> 3, i = warp & 7, g = lane >> 2, t4 = lane & 3;
+  ak_pdl_entry();  // the producer above streams weights only (constant): it starts before the previous kernel ends
   // B fragments of this warp's groups, in registers: xb[t][q4] = (b0, b1 of MMA 2 q4, b0, b1 of MMA 2 q4 + 1)
   uint4 xb[NTILE][4];
   {
@@ -425,8 +429,11 @@ w4h_xr_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant_
     if (c >= cnt) break;
     int seq = j0 * NTILE + c;  // stage (j0 + c, t) = j0 * NTILE + t * cnt + c
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    uint4 w0[2], w1[2];
-    uint32_t sc[2];
+    // PAIR: k-tiles two at a time -- both stages fetched, their two MMA chains interleaved (independent), then the
+    // scaled adds in k-tile order; the next pair is fetched before. The same per-group chains and add order: same bits.
+    constexpr int NB = PAIR ? 4 : 2;
+    uint4 w0[NB], w1[NB];
+    uint32_t sc[NB];
     auto fetch = [&](int b) {
       const int slot = seq & (stages - 1);
       mbar_wait(full0 + 8 * slot, (seq >> lgs) & 1);
@@ -436,27 +443,67 @@ w4h_xr_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant_
       if (lane == 0) mbar_arrive(empty0 + 8 * slot);
       seq += cnt;
     };
-    fetch(0);
+    auto chain = [&](float* cf, int t, int b) {
 #pragma unroll
-    for (int t = 0; t < NTILE; ++t) {
-      const int b = t & 1;
-      if (t + 1 < NTILE) fetch(b ^ 1);
-      if (8 * t + i < ng) {
-        float cf[4] = {0.f, 0.f, 0.f, 0.f};
+      for (int q = 0; q < 8; ++q) {
+        const int wd = q >> 1, j0q = 2 * (q & 1);
+        const uint32_t u0 = wd == 0 ? w0[b].x : wd == 1 ? w0[b].y : wd == 2 ? w0[b].z : w0[b].w;
+        const uint32_t u1 = wd == 0 ? w1[b].x : wd == 1 ? w1[b].y : wd == 2 ? w1[b].z : w1[b].w;
+        const uint32_t b0 = (q & 1) ? xb[t][q >> 1].z : xb[t][q >> 1].x, b1 = (q & 1) ? xb[t][q >> 1].w : xb[t][q >> 1].y;
+        mma16816(cf, deq_pair(u0, j0q), deq_pair(u1, j0q), deq_pair(u0, j0q + 1), deq_pair(u1, j0q + 1), b0, b1);
+      }
+    };
+    auto scaled_add = [&](const float* cf, int b) {
+      const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(&sc[b]);
+      const float s0 = __low2float(s2), s1 = __high2float(s2);
+      acc[0] = fmaf(cf[0], s0, acc[0]);
+      acc[1] = fmaf(cf[1], s0, acc[1]);
+      acc[2] = fmaf(cf[2], s1, acc[2]);
+      acc[3] = fmaf(cf[3], s1, acc[3]);
+    };
+    if (PAIR) {
+      fetch(0);
+      if (NTILE > 1) fetch(1);
 #pragma unroll
-        for (int q = 0; q < 8; ++q) {
-          const int wd = q >> 1, j0q = 2 * (q & 1);
-          const uint32_t u0 = wd == 0 ? w0[b].x : wd == 1 ? w0[b].y : wd == 2 ? w0[b].z : w0[b].w;
-          const uint32_t u1 = wd == 0 ? w1[b].x : wd == 1 ? w1[b].y : wd == 2 ? w1[b].z : w1[b].w;
-          const uint32_t b0 = (q & 1) ? xb[t][q >> 1].z : xb[t][q >> 1].x, b1 = (q & 1) ? xb[t][q >> 1].w : xb[t][q >> 1].y;
-          mma16816(cf, deq_pair(u0, j0q), deq_pair(u1, j0q), deq_pair(u0, j0q + 1), deq_pair(u1, j0q + 1), b0, b1);
+      for (int t = 0; t < NTILE; t += 2) {
+        const int b = t & 3;
+        if (t + 2 < NTILE) fetch((t + 2) & 3);
+        if (t + 3 < NTILE) fetch((t + 3) & 3);
+        const bool va = 8 * t + i < ng, vb = t + 1 < NTILE && 8 * (t + 1) + i < ng;
+        float ca[4] = {0.f, 0.f, 0.f, 0.f}, cb[4] = {0.f, 0.f, 0.f, 0.f};
+        if (vb) {
+#pragma unroll
+          for (int q = 0; q < 8; ++q) {  // the two chains interleaved, MMA by MMA
+            const int wd = q >> 1, j0q = 2 * (q & 1);
+            const int ba = b, bb = (t + 1) & 3;
+            const uint32_t ua0 = wd == 0 ? w0[ba].x : wd == 1 ? w0[ba].y : wd == 2 ? w0[ba].z : w0[ba].w;
+            const uint32_t ua1 = wd == 0 ? w1[ba].x : wd == 1 ? w1[ba].y : wd == 2 ? w1[ba].z : w1[ba].w;
+            const uint32_t ub0 = wd == 0 ? w0[bb].x : wd == 1 ? w0[bb].y : wd == 2 ? w0[bb].z : w0[bb].w;
+            const uint32_t ub1 = wd == 0 ? w1[bb].x : wd == 1 ? w1[bb].y : wd == 2 ? w1[bb].z : w1[bb].w;
+            const int tb = t + 1 < NTILE ? t + 1 : t;
+            const uint32_t xa0 = (q & 1) ? xb[t][q >> 1].z : xb[t][q >> 1].x, xa1 = (q & 1) ? xb[t][q >> 1].w : xb[t][q >> 1].y;
+            const uint32_t xb0 = (q & 1) ? xb[tb][q >> 1].z : xb[tb][q >> 1].x, xb1 = (q & 1) ? xb[tb][q >> 1].w : xb[tb][q >> 1].y;
+            mma16816(ca, deq_pair(ua0, j0q), deq_pair(ua1, j0q), deq_pair(ua0, j0q + 1), deq_pair(ua1, j0q + 1), xa0, xa1);
+            mma16816(cb, deq_pair(ub0, j0q), deq_pair(ub1, j0q), deq_pair(ub0, j0q + 1), deq_pair(ub1, j0q + 1), xb0, xb1);
+          }
+          scaled_add(ca, b);  // vb implies va (groups ascend with t)
+          scaled_add(cb, (t + 1) & 3);
+        } else if (va) {
+          chain(ca, t, b);
+          scaled_add(ca, b);
         }
-        const __nv_bfloat162 s2 = *reinterpret_cast<const __nv_bfloat162*>(&sc[b]);
-        const float s0 = __low2float(s2), s1 = __high2float(s2);
-        acc[0] = fmaf(cf[0], s0, acc[0]);
-        acc[1] = fmaf(cf[1], s0, acc[1]);
-        acc[2] = fmaf(cf[2], s1, acc[2]);
-        acc[3] = fmaf(cf[3], s1, acc[3]);
+      }
+    } else {
+      fetch(0);
+#pragma unroll
+      for (int t = 0; t < NTILE; ++t) {
+        const int b = t & 1;
+        if (t + 1 < NTILE) fetch(b ^ 1);
+        if (8 * t + i < ng) {
+          float cf[4] = {0.f, 0.f, 0.f, 0.f};
+          chain(cf, t, b);
+          scaled_add(cf, b);
+        }
       }
     }
     // slot-order sum, handed to warp pass % 8 through red[c][p] (p = pass parity; use u = pass / 2 of that buffer)
@@ -519,6 +566,7 @@ w4h_bt_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant_
     W4H_SM90(asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");)
   }
   __syncthreads();
+  ak_pdl_entry();  // the producer copies x too
   if (warp == 8) {
     if (lane == 0) {
       int slot = 0, ph = 0;
@@ -735,10 +783,12 @@ struct W4hCfg {
   int cs;          // consumer sets of 8 warps of the generic (x in shared memory) kernel
   int max_stages;  // ring depth cap (shared memory permitting)
   int xr;          // m <= 8: x fragments in registers (w4h_xr_kernel) for k-tile counts with an instance
+  int pair;        // w4h_xr_kernel: k-tiles two at a time, chains interleaved (AGENS_W4H_XR_PAIR=0: one at a time)
 };
 const W4hCfg& w4h_cfg() {
   static const W4hCfg c = [] {
-    W4hCfg v{2, kMaxStages, 1};
+    W4hCfg v{2, kMaxStages, 1, 1};
+    if (const char* e = getenv("AGENS_W4H_XR_PAIR")) v.pair = atoi(e);
     if (const char* e = getenv("AGENS_W4H_XR")) v.xr = atoi(e);
     if (const char* e = getenv("AGENS_W4H_CS")) v.cs = atoi(e);
     if (const char* e = getenv("AGENS_W4H_STAGES")) v.max_stages = std::min(kMaxStages, atoi(e));
@@ -767,9 +817,9 @@ int launch_cs(const void* x, int m, const W4hSegs& s, int k, int max_stages, cud
   kern<<<grid, (8 * CS + 1) * 32, xbytes + stages * kStageB, st>>>(static_cast<const __nv_bfloat16*>(x), m, s, k, stages);
   return (int)cudaGetLastError();
 }
-template <int NTILE, int CS>
+template <int NTILE, int CS, bool PAIR>
 int launch_xr(const void* x, int m, const W4hSegs& s, int k, int max_stages, cudaStream_t st) {
-  auto kern = w4h_xr_kernel<NTILE, CS>;
+  auto kern = w4h_xr_kernel<NTILE, CS, PAIR>;
   static int static_smem = -1;
   if (static_smem < 0) {
     cudaFuncAttributes fa;
@@ -798,10 +848,10 @@ int launch(const void* x, int m, const W4hSegs& s, int k, cudaStream_t st) {
   const W4hCfg& c = w4h_cfg();
   if (NT == 1 && c.xr) {
     switch ((k / 128 + 7) / 8) {  // k-tiles
-      case 3: return launch_xr<3, 1>(x, m, s, k, c.max_stages, st);
-      case 5: return launch_xr<5, 1>(x, m, s, k, c.max_stages, st);
-      case 6: return launch_xr<6, 1>(x, m, s, k, c.max_stages, st);
-      case 9: return launch_xr<9, 1>(x, m, s, k, c.max_stages, st);
+      case 3: return c.pair ? launch_xr<3, 1, true>(x, m, s, k, c.max_stages, st) : launch_xr<3, 1, false>(x, m, s, k, c.max_stages, st);
+      case 5: return c.pair ? launch_xr<5, 1, true>(x, m, s, k, c.max_stages, st) : launch_xr<5, 1, false>(x, m, s, k, c.max_stages, st);
+      case 6: return c.pair ? launch_xr<6, 1, true>(x, m, s, k, c.max_stages, st) : launch_xr<6, 1, false>(x, m, s, k, c.max_stages, st);
+      case 9: return c.pair ? launch_xr<9, 1, true>(x, m, s, k, c.max_stages, st) : launch_xr<9, 1, false>(x, m, s, k, c.max_stages, st);
       default: break;
     }
   }
@@ -883,7 +933,10 @@ extern "C" int ak_w4h_gemm(const void* x, int m, int nseg, const void* const* wt
 // ---- engine hooks (w4_gemv.cu): which W4 g128 linears are repacked as W4H, and the registry of W4H weights.
 // AGENS_W4H: 0 = off (default), 1 = every eligible W4 g128 linear (ak_w4h_ok) on a device with the shared memory these
 // kernels need (>= 200 KB per block opt-in: sm90 / sm100), 2 = "auto": only the shape classes where W4H measured faster
-// than KT at m = 1 / 8 on compute capability 9.0 (n >= 12288: MLP gate_up; n <= 1024: attention k / v, KDA f_down). ak_w4h_set_mode
+// than KT at m = 1 / 8 on compute capability 9.0 (n >= 12288: MLP gate_up; n <= 1024: attention k / v, KDA f_down), and
+// (compute capability 9.0) k 4096 .. 6144: the hidden-state projections that share x, so the verify runs them as one
+// multi-segment W4H launch
+// (KDA qkv | z | f_down, attention q | k | v: one launch instead of three; linear_shared). ak_w4h_set_mode
 // overrides (tests).
 namespace {
 int g_w4h_mode = -1;
@@ -900,12 +953,58 @@ int w4h_mode() {
   }
   return g_w4h_mode;
 }
+
+// Dual layout (AGENS_W4H_MMAX = N > 0, with AGENS_W4H on; 1.3.4): an eligible linear keeps its KT layout in the engine's
+// buffers and gets a W4H copy of its own; launches of m <= N tokens take the copy, larger m the KT GEMM (W4H's batched
+// kernel streams the weights once per 32 tokens: on sm90 tp2 at m = 96 the KT path's step was 42 vs 50 ms). Same bits
+// either way (W4H == KT); the copy costs the W4H bytes again (memory: ak_w4h_dual_bytes).
+struct W4hDual {
+  void *wt, *st;
+  int n, k;
+};
+std::unordered_map<const void*, W4hDual> g_w4h_dual;
+size_t g_w4h_dual_bytes = 0;
+int w4h_mmax() {
+  static const int v = [] { const char* e = getenv("AGENS_W4H_MMAX"); return e ? atoi(e) : 0; }();
+  return v;
+}
+void w4h_dual_drop(const void* wt) {  // under g_w4h_mu
+  auto it = g_w4h_dual.find(wt);
+  if (it == g_w4h_dual.end()) return;
+  g_w4h_set.erase(it->second.wt);
+  cudaFree(it->second.wt), cudaFree(it->second.st);
+  g_w4h_dual_bytes -= ak_w4h_weight_bytes(it->second.n, it->second.k) + ak_w4h_scale_bytes(it->second.n, it->second.k);
+  g_w4h_dual.erase(it);
+}
 }  // namespace
 // 1 = not handled (W4H off, shape or device unsupported): the caller repacks KT; else a CUDA error code (0 = ok)
+// (dual layout: the W4H copy is made here and 1 returned, so the caller writes KT into wt / st as without W4H)
 int agens_w4h_repack(const int32_t* packed, const void* scales, void* wt, void* st, int n, int k, cudaStream_t s) {
+  {
+    std::lock_guard<std::mutex> l(g_w4h_mu);
+    w4h_dual_drop(wt);  // a weight at an address an earlier one (with a copy) had
+  }
   const int mode = w4h_mode();
   if (!mode || !ak_w4h_ok(n, k) || !w4h_device_ok()) return 1;
-  if (mode == 2 && !(n >= 12288 || n <= 1024)) return 1;
+  if (mode == 2 && !(n >= 12288 || n <= 1024 || (k >= 4096 && k <= 6144 && ak_cc90()))) return 1;
+  if (w4h_mmax() > 0) {
+    void *w2 = nullptr, *s2 = nullptr;
+    const size_t wb = ak_w4h_weight_bytes(n, k), sb = ak_w4h_scale_bytes(n, k);
+    if (cudaMalloc(&w2, wb) != cudaSuccess || cudaMalloc(&s2, sb) != cudaSuccess) {
+      cudaFree(w2);
+      return (int)cudaErrorMemoryAllocation;
+    }
+    const int e = ak_w4h_repack(packed, scales, w2, s2, n, k, s);
+    if (e) {
+      cudaFree(w2), cudaFree(s2);
+      return e;
+    }
+    std::lock_guard<std::mutex> l(g_w4h_mu);
+    g_w4h_set.insert(w2);
+    g_w4h_dual[wt] = W4hDual{w2, s2, n, k};
+    g_w4h_dual_bytes += wb + sb;
+    return 1;
+  }
   const int e = ak_w4h_repack(packed, scales, wt, st, n, k, s);
   if (e == 0) {
     std::lock_guard<std::mutex> l(g_w4h_mu);
@@ -916,6 +1015,25 @@ int agens_w4h_repack(const int32_t* packed, const void* scales, void* wt, void* 
 bool agens_w4h_is(const void* wt) {
   std::lock_guard<std::mutex> l(g_w4h_mu);
   return !g_w4h_set.empty() && g_w4h_set.count(wt);
+}
+// dual layout: the W4H copy of KT weight wt for an m-token launch (m <= AGENS_W4H_MMAX), else false
+bool agens_w4h_dual(const void* wt, int m, const void** w2, const void** s2) {
+  if (m > w4h_mmax()) return false;
+  std::lock_guard<std::mutex> l(g_w4h_mu);
+  auto it = g_w4h_dual.find(wt);
+  if (it == g_w4h_dual.end()) return false;
+  *w2 = it->second.wt, *s2 = it->second.st;
+  return true;
+}
+extern "C" size_t ak_w4h_dual_bytes() { return g_w4h_dual_bytes; }
+// the W4H layout to use for an m-token launch of weight wt: wt itself (W4H) or its dual-layout copy; 0 = none (KT)
+extern "C" int ak_w4h_ptrs(const void* wt, const void* st, int m, const void** w, const void** s) {
+  if (agens_w4h_is(wt)) return *w = wt, *s = st, 1;
+  return agens_w4h_dual(wt, m, w, s) ? 1 : 0;
+}
+extern "C" int ak_w4h_is_m(const void* wt, int m) {
+  const void *a, *b;
+  return agens_w4h_is(wt) || agens_w4h_dual(wt, m, &a, &b);
 }
 void agens_w4h_forget(const void* wt) {
   std::lock_guard<std::mutex> l(g_w4h_mu);

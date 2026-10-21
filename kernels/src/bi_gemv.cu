@@ -10,6 +10,7 @@
 //  * ak_bf16_bmm_bi: per-token C[t] = A[t] [mr x kk] . B[t] [kk x nc], fp32 sequential sum over kk, one rounding
 //    (mHC res . H: kk = 4).
 #include "agens_kernels.h"
+#include "agens_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -34,15 +35,38 @@ __device__ __forceinline__ uint4 ld_nc(const uint4* p) {
   return v;
 }
 
+// L2 prefetch of the weight rows of row block rb (16 rows of k bf16, contiguous) before ak_pdl_wait (constant data)
+__device__ __forceinline__ void bi_prefetch_rb(const bf16* w, int rb, int n, int k) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const int r = (rb << 4) + (int)threadIdx.x;
+  if (threadIdx.x < 16 && r < n && (k & 7) == 0)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(w + (size_t)r * k), "r"(k * 2) : "memory");
+#endif
+}
 // m <= 8 per launch (MMA width); x [m][k], y [m][n] (row stride n)
 template <int kU>
 __global__ void __launch_bounds__(kWarps * 32)
 bf16_gemv_bi_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ w, const bf16* __restrict__ bias,
                     bf16* __restrict__ y, int n, int k, long ldy) {
   __shared__ float red[kWarps][32][4];
+  bi_prefetch_rb(w, blockIdx.x, n, k);
   const int steps = k >> 5;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
   const int nblk = (n + 15) >> 4;
+  // the block's first kU steps' weights (constant) before the programmatic wait; x after it
+  uint4 pw0[kU], pw1[kU];
+  {
+    const int r0 = (blockIdx.x << 4) + g, r1 = r0 + 8;
+#pragma unroll
+    for (int u = 0; u < kU; ++u) {
+      const int s = warp + u * kWarps, c = 32 * s + 8 * t4;
+      const bool in = s < steps && (int)blockIdx.x < nblk;
+      pw0[u] = in && r0 < n ? ld_nc(reinterpret_cast<const uint4*>(w + (size_t)r0 * k + c)) : make_uint4(0, 0, 0, 0);
+      pw1[u] = in && r1 < n ? ld_nc(reinterpret_cast<const uint4*>(w + (size_t)r1 * k + c)) : make_uint4(0, 0, 0, 0);
+    }
+  }
+  ak_pdl_entry();
+  bool first = true;
   for (int rb = blockIdx.x; rb < nblk; rb += gridDim.x) {
     const int r0 = (rb << 4) + g, r1 = r0 + 8;
     const bool ok0 = r0 < n, ok1 = r1 < n;
@@ -55,10 +79,15 @@ bf16_gemv_bi_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ 
       for (int u = 0; u < kU; ++u) {
         const int s = s0 + u * kWarps, c = 32 * s + 8 * t4;
         const bool in = s < steps;
-        w0[u] = in && ok0 ? ld_nc(reinterpret_cast<const uint4*>(w + (size_t)r0 * k + c)) : make_uint4(0, 0, 0, 0);
-        w1[u] = in && ok1 ? ld_nc(reinterpret_cast<const uint4*>(w + (size_t)r1 * k + c)) : make_uint4(0, 0, 0, 0);
+        if (first) {
+          w0[u] = pw0[u], w1[u] = pw1[u];
+        } else {
+          w0[u] = in && ok0 ? ld_nc(reinterpret_cast<const uint4*>(w + (size_t)r0 * k + c)) : make_uint4(0, 0, 0, 0);
+          w1[u] = in && ok1 ? ld_nc(reinterpret_cast<const uint4*>(w + (size_t)r1 * k + c)) : make_uint4(0, 0, 0, 0);
+        }
         xv[u] = in && g < m ? __ldg(reinterpret_cast<const uint4*>(x + (size_t)g * k + c)) : make_uint4(0, 0, 0, 0);
       }
+      first = false;
 #pragma unroll
       for (int u = 0; u < kU; ++u) {
         if (s0 + u * kWarps >= steps) break;
@@ -95,6 +124,8 @@ __global__ void __launch_bounds__(kWarps * 32)
 bf16_gemv_bi_nt_kernel(const bf16* __restrict__ x, int m, const bf16* __restrict__ w, const bf16* __restrict__ bias,
                        bf16* __restrict__ y, int n, int k, long ldy) {
   __shared__ float red[kWarps][32][4 * NT];
+  bi_prefetch_rb(w, blockIdx.x, n, k);
+  ak_pdl_entry();
   const int steps = k >> 5;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
   const int nblk = (n + 15) >> 4;

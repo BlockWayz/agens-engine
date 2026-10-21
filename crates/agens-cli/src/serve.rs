@@ -68,6 +68,7 @@ fn chunk() -> usize {
 }
 /// KV rows taken at admission beyond the prompt (rows grow lazily from there: Engine::ensure_rows)
 const DECODE_HEADROOM: usize = 64;
+const MAX_BATCH: usize = 64; // --max-batch in server mode (kernels/m1/m1_model.cu kMaxBatch)
 static PROF_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PROF_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// AGENS_SERVE_MEM_TRACE=1: device memory after each prefill (free, the KDA temporaries' pool, torch's cache)
@@ -142,9 +143,18 @@ fn spec_sampling(p: &SamplingParams, pen_ok: bool) -> Option<SpecSampling> {
 
 /// AGENS_SERVE_PROFILE=N (benchmarks): the CUDA profiler capture range (nsys --capture-range=cudaProfilerApi) over
 /// verify steps 8 .. 8 + N of each speculative request (`vsteps`: the request's verify steps so far).
-fn serve_profile(vsteps: u64) -> Result<()> {
+/// AGENS_SERVE_PROFILE_B=B (with it): instead over batched steps 64 .. 64 + N of those verifying >= B sequences.
+fn serve_profile(vsteps: u64, batch: usize) -> Result<()> {
     static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static PB: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static K: AtomicU64 = AtomicU64::new(0);
     if let Some(n) = *N.get_or_init(|| std::env::var("AGENS_SERVE_PROFILE").ok().and_then(|v| v.parse().ok())) {
+        let pb = *PB.get_or_init(|| std::env::var("AGENS_SERVE_PROFILE_B").ok().and_then(|v| v.parse().ok()));
+        let vsteps = match pb {
+            Some(b) if batch >= b => (K.fetch_add(1, Ordering::Relaxed) + 1).saturating_sub(56),  // the 64th such step -> 8
+            Some(_) => return Ok(()),
+            None => vsteps,
+        };
         if vsteps == 8 || vsteps == 8 + n {
             agens_cuda::m1::profiler(vsteps == 8)?;
         }
@@ -880,7 +890,7 @@ impl Engine {
                         lookup_of(&mut a.lk, &a.job.prompt, l, false).propose()
                     })
                     .collect();
-                serve_profile(acts[spec_rows[0]].vsteps)?;
+                serve_profile(acts[spec_rows[0]].vsteps, spec_rows.len())?;
                 let td = Instant::now();
                 let em = if hints.iter().all(|h| h.is_empty()) {
                     m1::spec_batch(&sess, &last)?
@@ -952,7 +962,7 @@ impl Engine {
                 let copy = self.copy;
                 let l = lookup_of(&mut a.lk, &a.job.prompt, last, copy);
                 let hint = l.propose();
-                serve_profile(a.vsteps)?;
+                serve_profile(a.vsteps, 1)?;
                 let td = Instant::now();
                 let em = if copy && hint.is_empty() && a.spec.map_or(false, |s| s.t > 0.0) {
                     // copy-only drafting, no proposal, sampled request: a plain decode step sampled on the host
@@ -1151,8 +1161,10 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         }
         "server" => {
-            if !(1..=16).contains(&max_batch) {
-                bail!("--max-batch must be 1..16");
+            // 1.3.4: up to 64 (was 16); batched speculation verifies up to 64 sequences per step with the MTP head
+            // alone (16 with the drafter), batched decode up to 64 rows
+            if !(1..=MAX_BATCH).contains(&max_batch) {
+                bail!("--max-batch must be 1..{MAX_BATCH}");
             }
             std::env::set_var("AGENS_M1_BATCH_INVARIANT", "1");
             // one set of numerics for server mode, with or without --spec-drafter (1.0.1): the verify's batch-invariant
@@ -1168,12 +1180,26 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         m => bail!("--mode {m}: personal or server"),
     }
+    // budget mode (the consumer profiles): at most 16 rows per batched step -- the memory plan's graph allowance
+    // (plan.rs runtime_reserve) is measured up to --max-batch 16 only
+    let budget = rest.windows(2).any(|w| w[0] == "--budget-gib" && w[1].parse::<f64>().map_or(false, |v| v > 0.0));
+    if mode == "server" && budget && max_batch > 16 {
+        eprintln!("serve: --max-batch {max_batch} -> 16 (budget mode: the memory plan covers batched steps of up to 16 rows)");
+        max_batch = 16;
+    }
     // the memory plan's graph allowance follows the batch (plan.rs runtime_reserve)
     std::env::set_var("AGENS_SERVE_MAX_BATCH", max_batch.to_string());
+    // (1.3.4) batched steps past 16 rows: the W4H dual layout (kernels/src/w4h.cu; native mode, where m1.rs turns W4H on):
+    // W4H for launches of <= 16 tokens, KT above (sm90 tp2 steady state, default sampling, --mtp: c16 1275 -> 1326,
+    // c32 1440 -> 1605, c48 1577 -> 1855 tok/s with KT; c1 / c4 keep W4H's lead); costs the W4H weights' bytes again
+    // (not in budget mode: W4H is off there, and its plan has no room for the copies)
+    if mode == "server" && !budget && max_batch > 4 && std::env::var_os("AGENS_W4H_MMAX").is_none() {
+        std::env::set_var("AGENS_W4H_MMAX", "16");
+    }
     let drafting = drafter.is_some() || mtp.is_some();
     if drafting && mode != "personal" && std::env::var("AGENS_SPEC_BATCH_MAX").is_err() {
         // server mode: batched speculative decoding of up to --max-batch greedy requests per step
-        std::env::set_var("AGENS_SPEC_BATCH_MAX", max_batch.min(16).to_string());
+        std::env::set_var("AGENS_SPEC_BATCH_MAX", max_batch.min(crate::spec::BATCH_MAX).to_string());
     }
     if !fork && mode != "personal" {
         bail!("--no-fork 1: personal mode only");
@@ -1221,6 +1247,15 @@ pub fn run(args: &[String]) -> Result<()> {
             let pen_ok = one_dev && std::env::var("AGENS_SPEC_PEN").map_or(true, |v| v != "0");
             let dev_sample = one_dev && std::env::var("AGENS_DEV_SAMPLE").map_or(true, |v| v != "0");
             let pc = crate::prefix::PrefixCache::new(pc_gib, chunk(), pc_dev)?;
+            // tiered / INT8 BCSA KV (decided at load): its batched decode tables and batched verify hold 16 rows
+            let tiered = ["AGENS_KV_TIER", "AGENS_KV_INT8"].iter()
+                .any(|k| std::env::var(k).map_or(false, |v| !v.is_empty() && v != "0"));
+            let max_batch = if tiered && max_batch > 16 {
+                eprintln!("serve: --max-batch {max_batch} -> 16 (tiered / INT8 KV cache)");
+                16
+            } else {
+                max_batch
+            };
             Ok(Engine { pc, think, max_batch, max_convs, wctx: wctx - CHUNK, anchor, convs: HashMap::new(), stats: (0, 0, 0.0),
                         spec: drafting || copy, copy: copy && !drafting, fork, bstats: (0, 0, 0.0, 0), pstats: (0, 0.0, None),
                         hstats: (0.0, 0.0), think_guard, pen_ok, dev_sample })

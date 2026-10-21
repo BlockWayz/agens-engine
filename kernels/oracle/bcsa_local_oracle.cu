@@ -1,4 +1,5 @@
 #include <algorithm>
+#include "../include/agens_pdl.cuh"
 // ORACLE TREE: sglv23's BCSA local-branch decode = flashinfer 0.6.15 BatchDecodeWithPagedKVCacheWrapper(NHD, fa2,
 // use_tensor_cores=True) -> the batch_prefill fa2 module (AOT build flags: -use_fast_math -O3 -DNDEBUG). This file
 // re-creates that module's plan + paged run for Volundr's shape (bf16, head_dim 256, mask none, no posenc/window/
@@ -224,6 +225,7 @@ __global__ void decode_plan_kernel(const int* kv_range, int max_batch_if_split, 
                                    int* request_indices, int* qo_tile_indices, int* kv_tile_indices, int* o_indptr,
                                    int* kv_chunk_size, int* merge_indptr, bool* block_valid_mask,
                                    uint32_t* total_num_rows) {
+  ak_pdl_entry();
   __shared__ int chunk, nchunks;
   if (threadIdx.x == 0) {
     const int64_t kv_len = (int64_t)kv_range[1] - kv_range[0];
@@ -382,6 +384,7 @@ __global__ void multi_plan_kernel(int T, const int* rng, int stride, int mbis, i
                                   int* qtile, int* ktile, int* o_indptr, int* chunk, int* merge, int* q_indptr,
                                   int* kv_indptr, int* last, bool* valid, uint32_t* rows, int* flag, int* lo_out,
                                   int mode) {
+  ak_pdl_entry();
   __shared__ int nch[kMaxT], ok;
   if (threadIdx.x == 0) {
     // mode 2 (batched verify): every request with its own bs = 1 chunk size (chunk[0] = 0, chunk[1 + t]; the paged
@@ -414,6 +417,7 @@ __global__ void multi_plan_kernel(int T, const int* rng, int stride, int mbis, i
   }
 }
 __global__ void multi_idx_kernel(int T, const int* flag, const int* kv_indptr, const int* lo, const int* indices, int* idx) {
+  ak_pdl_entry();
   if (!*flag) return;
   for (int t = 0; t < T; ++t) {
     const int n = kv_indptr[t + 1] - kv_indptr[t];
@@ -422,6 +426,7 @@ __global__ void multi_idx_kernel(int T, const int* flag, const int* kv_indptr, c
   }
 }
 __global__ void single_disable_kernel(const int* flag, bool* valid, int padded, uint32_t* rows) {
+  ak_pdl_entry();
   if (!*flag) return;
   for (int b = threadIdx.x; b < padded; b += blockDim.x) valid[b] = false;
   if (threadIdx.x == 0) *rows = 0;
@@ -557,6 +562,7 @@ namespace agens_dev_attn {
 __global__ void packed_plan_kernel(int T, const int* rng, int stride, int mbis, int qtiles, int padded, int group_size,
                                    int* req, int* qtile, int* ktile, int* o_indptr, int* chunk, int* merge,
                                    int* q_indptr, int* kv_indptr, int* last, bool* valid, uint32_t* rows, int* flag) {
+  ak_pdl_entry();
   __shared__ int nch, ok;
   if (threadIdx.x == 0) {
     int c0 = 0, all = T > 1;

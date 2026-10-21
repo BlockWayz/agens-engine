@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.3.4
+
+### New
+
+- **Faster single-stream decoding on compute capability 9.0.** Measured on 141 GB compute capability 9.0 GPUs, 2-way
+  tensor parallel (`--tp 2`), Volundr INT4, server mode, one request at a time, vp_bench decode tokens/s, greedy: with
+  `--mtp` 241 -> 315 on a short chat prompt, 242 -> 293 at a 6K-token prompt and 258 -> 312 at a 22K-token prompt
+  (+21-31%); with the DFlash2 drafter 194 -> 215 and 224 -> 240. The speculative verify step launches fewer, larger
+  kernels and overlaps their start-up. Greedy output is identical to 1.3.3.
+- **Server mode batches up to 64 requests (`--max-batch 1..64`, was 16).** On the same setup with `--mtp`, default
+  sampling, aggregate decode tokens/s at 16 / 24 / 32 / 48 concurrent requests: 1,273 / 1,288 / 1,288 / 1,289 (1.3.3,
+  `--max-batch 16`) -> 1,329 / 1,361 / 1,620 / 1,857 (`--max-batch 48`). One request alone: 234 -> 314. Without
+  speculation (no drafter, no `--mtp`), 13 concurrent requests: 727 -> 806.
+- **Recommended on compute capability 9.0:** `--mode server --max-batch 48 --max-convs 48 --mtp <dir>`. With
+  `--max-batch` above 4 the server keeps a second copy of some weights in a layout for small batches (about 5 GB per
+  GPU with Volundr INT4 at `--tp 2`); the context stays at 258,052 tokens with `--gpu-gib 110`. This applies only
+  without `--budget-gib`.
+- **Budget mode (`--budget-gib`, all `--profile` settings) keeps at most 16 requests per batch:** a larger
+  `--max-batch` is lowered to 16, because the memory plan covers batches of up to 16. No profile changes: contexts,
+  memory use and speed are as in 1.3.3.
+
+### Unchanged
+
+- Greedy output on our test prompts is identical to 1.3.3, alone and batched (up to 48 requests per batch), with and
+  without speculative decoding. Seeded sampled replies are the same alone, four at a time and 48 at a time, with and
+  without `--mtp`, and the sampled distribution is unchanged (chi-square against plain decoding).
+- The `16gb`, `24gb` and `24gb --tp 2` profiles (compute capability 8.9) keep 1.3.3's context (258,052; with `--mtp`
+  on `24gb` 258,052, on `16gb` 237,572; `--tp 2` 245,764) and decode speed (within 1-2%; `--tp 2` within run-to-run
+  noise).
+
 ## 1.3.3
 
 ### New

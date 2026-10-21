@@ -411,6 +411,7 @@ pub mod m1 {
         fn ak_m1_session_parked(id: c_int) -> c_int;
         fn ak_m1_snap_bytes() -> usize;
         fn ak_m1_w4_cache_bytes() -> usize;
+        fn ak_w4h_dual_bytes() -> usize;
         fn ak_m1_w4_cache_build() -> c_int;
         fn ak_m1_session_snap(src: c_int, dst: *mut c_void) -> c_int;
         fn ak_m1_session_from_snap(snap: c_int, src: *const c_void) -> c_int;
@@ -478,6 +479,10 @@ pub mod m1 {
     /// Bytes of the W4 prefill weight cache (every W4 linear dequantized to bf16) on this device.
     pub fn w4_cache_bytes() -> usize {
         unsafe { ak_m1_w4_cache_bytes() }
+    }
+    /// Bytes of the W4H copies of the dual layout (AGENS_W4H_MMAX; kernels/src/w4h.cu).
+    pub fn w4h_dual_bytes() -> usize {
+        unsafe { ak_w4h_dual_bytes() }
     }
     /// Build the W4 prefill weight cache (all or nothing). Every rank builds its own at load (no forwarding).
     pub fn w4_cache_build() -> Result<()> {

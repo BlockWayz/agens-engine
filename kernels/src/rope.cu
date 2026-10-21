@@ -5,6 +5,7 @@
 // Also builds the cos|sin cache the way sglang's RotaryEmbedding does with torch (inv_freq = 1 / base^(2j/rot),
 // freqs = pos * inv_freq, cat(cos, sin)).
 #include "agens_kernels.h"
+#include "agens_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -106,6 +107,7 @@ __global__ void rope_m_kernel(__nv_bfloat16* q, __nv_bfloat16* k, const float* _
 // d = 256 (TPR 32: one 8-element fma chain per lane, butterfly 1 .. 16, other + self); the rotary pairs (j, j + 32)
 // sit in lanes l and l ^ 4 (l < 8) and use rope_m_kernel's per-pair arithmetic.
 __global__ void __launch_bounds__(256) qk_prep_kernel(const __grid_constant__ QkPrepArgs a, int bf16_img) {
+  ak_pdl_entry();
   const int w = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
   const int nh = a.nq + a.nk;
   if (w >= a.T * nh) return;

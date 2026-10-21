@@ -52,7 +52,7 @@ The same flags work on the image directly:
 ```bash
 docker run --gpus device=0 --ipc=host -p 30000:30000 \
   -v /path/to/model:/model:ro -v /path/to/drafter:/drafter:ro \
-  ghcr.io/blockwayz/agens-engine:1.3.3 --profile 16gb --model /model --drafter /drafter
+  ghcr.io/blockwayz/agens-engine:1.3.4 --profile 16gb --model /model --drafter /drafter
 ```
 
 ## Profiles
@@ -408,6 +408,10 @@ weights, the DFlash2 drafter and the MTP head (`--profile 48gb ... -- --budget-g
 after the `--` as well, or part of the weights is placed in host memory and decoding is slow (fixed in 1.3.1).
 
 If you run the engine on another GPU, please open an issue with your numbers.
+
+## Community ports
+
+- [volundr-mlx](https://github.com/iggerask/volundr-mlx) (MIT): a community MLX port for Apple silicon.
 
 ## Roadmap
 

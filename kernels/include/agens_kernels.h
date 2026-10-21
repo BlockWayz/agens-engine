@@ -26,6 +26,19 @@ int ak_mem_info(size_t* free_bytes, size_t* total_bytes);
 const char* ak_error_string(int code);
 int ak_host_alloc(void** ptr, size_t bytes);  // pinned + mapped (device-accessible via UVA)
 int ak_host_free(void* ptr);
+// programmatic dependent launch in captured graphs (runtime.cu; kernels/include/agens_pdl.cuh)
+int ak_pdl_on(void);
+int ak_cc90(void);        // the device is compute capability 9.0 (the tuned defaults of the PDL / side-stream / split paths)
+int ak_tp_push_on(void);  // tensor parallel: the push all-reduce is set up (peer GPUs; tp_ar.cu)
+int ak_graph_pdl(void* graph);
+// tensor-parallel greedy head (torch_ops.cu): this rank's encoded best of its vocabulary share per row, then (after the
+// caller's all-reduce of hx) the argmax of the whole row -- ak_argmax's result
+int ak_argmax_tp_part(const void* logits, int rows, int vocab, int base, int base_end, int rank, int nx, void* hx,
+                      void* stream);
+int ak_argmax_tp_combine(const void* hx, int rows, int nx, int tp, int* out, void* stream);
+// two RMSNorms in one launch: of the embedding rows table[ids[b]] (w0 -> y0) and of the rows x1 (w1 -> y1) (rmsnorm.cu)
+int ak_rmsnorm_pair_embed(const int32_t* ids, const void* table, const void* w0, void* y0, const void* x1, const void* w1,
+                          void* y1, int B, int H, int so, float eps, int gemma, void* stream);
 
 // ---- W4A16 GEMV, compressed-tensors pack-quantized, symmetric, group 128 (the Volundr INT4 release format).
 // x [k] bf16; packed [n, k/8] int32 (nibble = q + 8, low nibble first); scales [n, k/128] bf16; y [n] bf16.
@@ -93,6 +106,9 @@ int ak_host_unregister(void* ptr);
 
 // ---- SiLU(gate) * up, bit-exact with sglv23's act_and_mul_kernel: gate_up [T][2*inter] -> out [T][inter] bf16.
 int ak_silu_mul(const void* gate_up, void* out, int tokens, int inter, void* stream);
+// one token: SiLU(gate) * up of a tensor-parallel share ([gate share | up share], np each) into out[lo, lo + np) of the
+// full row of inter, zeros elsewhere (silu_mul.cu: ak_silu_mul's bits)
+int ak_silu_mul_part(const void* gate_up_part, void* out, int inter, int lo, int np, void* stream);
 
 // ---- RoPE NeoX, partial rotary (first rot_dim of each head), in place; cache [max_pos][rot_dim] fp32 = cos|sin.
 int ak_rope_neox(void* q, void* k, const float* cos_sin_cache, const int64_t* positions, int tokens, int nq, int nk,
@@ -211,6 +227,11 @@ int ak_w4h_dequant_rows(const void* wt, const void* st, void* w, int n, int k, i
 int ak_w4h_set_mode(int mode);  // 0 off, 1 on, -1 re-read AGENS_W4H; returns the previous mode
 int ak_w4h_is(const void* wt);
 int ak_w4h_forget(const void* wt);
+// dual layout (AGENS_W4H_MMAX = N > 0): KT kept, W4H copies for launches of m <= N; their bytes; W4H for an m-token launch
+size_t ak_w4h_dual_bytes();
+int ak_w4h_is_m(const void* wt, int m);
+// the W4H weight / scales an m-token launch of wt uses (wt itself, or its dual-layout copy); 0: none (KT layout)
+int ak_w4h_ptrs(const void* wt, const void* st, int m, const void** w, const void** s);
 // W3 KT (3-bit values q in [-4, 3] in the W4 KT tiling, 3/8 byte per weight; scales as W4 KT): repack from the int4
 // container (cudaErrorInvalidValue if a value needs 4 bits), and the W4 KT entry points' W3 twins -- bit-identical to
 // the exact W4 KT path on the same values.
@@ -271,6 +292,8 @@ typedef struct MhcFusedArgs {
   const __nv_bfloat16* wb;                         // nullable: layer i + 1's in_proj_b [nb_out][5120] (KDA), bout = h . wb^T
   int nb_out;                                      // <= 48
   __nv_bfloat16* bout;                             // [T][nb_out]
+  const __nv_bfloat16* res_cur;                    // nullable: layer i's res [T][16], written by the previous boundary's
+                                                   // write_res (then dcur / res_s_cur are not read)
 } MhcFusedArgs;
 int ak_mhc_fused_ok(void);  // the device can launch it (thread-block clusters: sm90+)
 int ak_mhc_fused(const MhcFusedArgs* args, int T, void* stream);

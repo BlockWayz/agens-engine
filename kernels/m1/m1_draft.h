@@ -47,6 +47,7 @@ struct Target {      // what the drafter borrows from the target
   const int* sl_ids = nullptr;    // [nsl]
   int nsl = 0;
   bool sl_drafter = false;  // the drafter's candidates from it too (else only the MTP chain uses it)
+  int tp_rank = 0, tp_size = 1;  // tensor parallel: the MTP chain's shortlist head is split over the ranks (m1_mtp.cu)
 };
 // Context KV of n target tokens at positions pos[0..n-1] (int64, device) from their features cap [n][5][5120]
 // (n_dev, nullable: n read on device, capped at n_max).

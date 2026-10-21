@@ -8,6 +8,7 @@
 // Not the M2 design: one kernel per op, plain buffers, no batching. M2a adds sessions: one shared KV row pool, per-session
 // slot map (r2t) / KDA state slot / Engram prev pair / position; switching is a pointer swap, fork shares prefix rows.
 #include "agens_kernels.h"
+#include "agens_pdl.cuh"
 #include "agens_kv.h"
 #include "m1_kv.h"
 #include "m1_draft.h"
@@ -198,14 +199,18 @@ double g_stat[4] = {};
 // Batched decode (server mode): g_B rows, row r = session g_brow[r]; attention runs per row, everything else on B rows.
 // g_binv (AGENS_M1_BATCH_INVARIANT=1): decode bf16 linears use the batch-invariant engine GEMV (also at bs = 1);
 // otherwise a batched decode issues them per row (cuBLAS m = 1), so either way a row is bit-identical to its bs = 1 run.
-constexpr int kMaxBatch = 16;
+// (1.3.4: 64 rows, was 16: server mode at --max-batch 32 / 48 on 141 GB compute capability 9.0 parts)
+constexpr int kMaxBatch = 64;
 int g_B = 0, g_binv = 0;
 bool g_bdev = false, g_bfar = false;
 int g_pad_row = 0;  // batched attention on device tables (attn_batch); far branch in this step
 bool g_dec = false;
 std::vector<int> g_brow;
 // batched speculative verify: g_BV sequences of kSpecT tokens (rows 8 * g_BV, sequence b's at 8 b); 0 = off
-constexpr int kMaxBV = 16, kBVRes = 16;
+// rows of a batched verify (B x TV) at most kMaxBVRows: the multi-request attention slots (bcsa_local_oracle.cu kMaxT)
+// and the batch-invariant decode GEMVs (m <= 128) are sized for it; B up to kMaxBV at TV 2 (1.3.4: 64 sequences, was 16)
+constexpr int kMaxBV = 64, kBVRes = 16, kMaxBVRows = 128;
+constexpr int kBThreads = 64;  // one thread per sequence / row (>= kMaxBV, kMaxBatch): the per-batch bookkeeping kernels
 int g_BV = 0;
 // batched verify length per sequence (2..kSpecT; rows j = g_TV b + t): verifying fewer drafts per sequence at large B
 // trades a little acceptance for a proportionally smaller verify forward (AGENS_SPEC_BATCH_TV: one value, or a list
@@ -235,7 +240,7 @@ int batch_tv(int B) {
     // (c1 209.9 vs 198.8 at TV 4); other arches / drafters keep the 1.3 table until measured there
     if (tv.empty()) tv = sm90_mtp_only() ? std::vector<int>{8, 2} : std::vector<int>{8, 8, 5, 4, 6, 5, 4, 4, 3, 3, 2};
   }
-  return tv[std::min((size_t)B, tv.size()) - 1];
+  return std::max(2, std::min(tv[std::min((size_t)B, tv.size()) - 1], kMaxBVRows / std::max(1, B)));
 }
 std::vector<int> g_bv_sess;              // engine sessions of the current batched verify
 const long long* g_tag_ptr = nullptr;    // far-branch cache tag the verify reads (default S.step_d + 30)
@@ -257,7 +262,8 @@ void* WG(const char* s) {                                             // == w(s)
 }
 
 // ---------------------------------------------------------------- small helper kernels (pure data movement)
-__global__ void split_q_gate(const bf16* qg, bf16* q, bf16* g, int T, int QH) {  // [T][QH][2*256] -> q, gate [T][QH*256]
+__global__ void split_q_gate(const bf16* qg, bf16* q, bf16* g, int T, int QH) {
+  ak_pdl_entry();  // [T][QH][2*256] -> q, gate [T][QH*256]
   const long n = (long)T * QH * HD;
   for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x) {
     const long t = i / (QH * HD), r = i % (QH * HD), h = r / HD, d = r % HD;
@@ -270,6 +276,7 @@ __global__ void scale_f32(float* x, int n, float s) {  // lse.float() * _LN2 (to
   if (i < n) x[i] = x[i] * s;
 }
 __global__ void store_kv(const bf16* k, const bf16* v, bf16* kc, bf16* vc, const int* loc, int T, int KVH) {
+  ak_pdl_entry();
   const long n = (long)T * KVH * HD;
   for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x) {
     const long t = i / (KVH * HD), r = i % (KVH * HD);
@@ -278,6 +285,7 @@ __global__ void store_kv(const bf16* k, const bf16* v, bf16* kc, bf16* vc, const
   }
 }
 __global__ void store_rows(const bf16* x, bf16* cache, const int* loc, int T, int d) {
+  ak_pdl_entry();
   const long n = (long)T * d;
   for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x)
     cache[(long)loc[i / d] * d + i % d] = x[i];
@@ -294,7 +302,8 @@ __global__ void scatter_rows(const uint4* in, const int* map, int n, int d16, ui
   for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < m; i += (long)gridDim.x * blockDim.x)
     cache[(long)(map[i / d16] >> shift) * d16 + i % d16] = in[i];
 }
-__global__ void broadcast_streams(const bf16* x, bf16* H, int T) {  // H[t][s][:] = x[t][:]
+__global__ void broadcast_streams(const bf16* x, bf16* H, int T) {
+  ak_pdl_entry();  // H[t][s][:] = x[t][:]
   const long n = (long)T * NS * HID;
   for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x)
     H[i] = x[(i / (NS * HID)) * HID + i % HID];
@@ -307,6 +316,7 @@ __device__ unsigned long long eg_fold(const long long* ids, int n) {
   return code;
 }
 __global__ void engram_rows_extend(const int* ids, const long long* pos, int T, int* prev, long long* r2, long long* r3) {
+  ak_pdl_entry();
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
   const long long s0 = prev[0], s1 = prev[1];
   if (t < T) {
@@ -320,6 +330,7 @@ __global__ void engram_rows_extend(const int* ids, const long long* pos, int T, 
   }
 }
 __global__ void engram_prev_update(const int* ids, const long long* pos, int T, int* prev) {
+  ak_pdl_entry();
   const long long last = T - 1;
   const int old1 = prev[1];
   const long long np2 = T >= 2 ? ids[last - 1] : (pos[last] >= 1 ? old1 : -1);
@@ -328,6 +339,7 @@ __global__ void engram_prev_update(const int* ids, const long long* pos, int T, 
 }
 __global__ void gather_engram(const long long* r2, const long long* r3, const uint4* t2, const uint4* t3, uint4* e,
                               int T) {
+  ak_pdl_entry();
   const int t = blockIdx.x;
   const int per = ENG_DIM * 2 / 16;
   for (int i = threadIdx.x; i < 2 * per; i += blockDim.x)
@@ -344,6 +356,7 @@ __device__ __forceinline__ void put_rpos(long long* rpos, int rmax, int t, long 
 }
 __global__ void decode_step_prep(const int* in, int* ids, long long* pos, int* loc, long long* outloc, int* r2t,
                                  int* rng, long long* rpos, int rmax) {
+  ak_pdl_entry();
   const int tok = in[0], p = in[1], l = in[2];
   ids[0] = tok, pos[0] = p, loc[0] = l, outloc[0] = l;
   put_rpos(rpos, rmax, 0, (long long)p + in[4]);
@@ -400,6 +413,7 @@ __global__ void decode_ranges(const long long* pos, int* rng) {  // the eager fo
 // blk_cache at this step's row if the position closes the block, else into the trash row hi. 128 threads = idx_dim.
 __global__ void block_keys_decode(const long long* pos, const int* loc, const int* r2t, int r2t_w, const bf16* idx,
                                   bf16* blk, int hi, int seq_rows = 0) {
+  ak_pdl_entry();
   constexpr int C = 4;
   if (seq_rows) r2t += (size_t)(blockIdx.x / seq_rows) * r2t_w;  // batched verify: row's sequence map in r2t_b
   pos += blockIdx.x, loc += blockIdx.x;  // one block per token (verify: T tokens; each token's write is independent)
@@ -421,11 +435,13 @@ __global__ void block_keys_decode(const long long* pos, const int* loc, const in
 // hybrid drafting: the host's copy-from-context proposal (step[20] tokens at step[21..27]) replaces the drafter's
 // first step[20] drafts (step[3..]) after the drafter ran (graph-safe: the switch is data)
 __global__ void apply_hint(int* step) {
+  ak_pdl_entry();
   const int t = threadIdx.x, nh = step[20];
   if (t < nh && t < kSpecT - 1) step[3 + t] = step[21 + t];
 }
 __global__ void verify_step_prep(const int* in, int* ids, long long* pos, int* loc, long long* outloc, int* r2t,
                                  int* rng, long long* rpos, int rmax) {
+  ak_pdl_entry();
   const int t = threadIdx.x, T = in[0], P = in[1];
   if (t >= T) return;
   const int p = P + t, l = in[10 + t];
@@ -435,10 +451,30 @@ __global__ void verify_step_prep(const int* in, int* ids, long long* pos, int* l
   rng[4 * t] = p + 1 > WIN ? p + 1 - WIN : 0, rng[4 * t + 1] = p + 1;
   rng[4 * t + 2] = 0, rng[4 * t + 3] = p + 1;
 }
+// verify_step_prep in two parts: the positions / rows / ranges (from the staged positions only) and the token ids (the
+// drafts): the first runs beside the draft chain (side stream), the second after it; the same values
+__global__ void verify_step_pos(const int* in, long long* pos, int* loc, long long* outloc, int* r2t, int* rng,
+                                long long* rpos, int rmax) {
+  ak_pdl_entry();
+  const int t = threadIdx.x, T = in[0], P = in[1];
+  if (t >= T) return;
+  const int p = P + t, l = in[10 + t];
+  pos[t] = p, loc[t] = l, outloc[t] = l;
+  put_rpos(rpos, rmax, t, (long long)p + in[kStepDelta]);
+  r2t[p] = l;
+  rng[4 * t] = p + 1 > WIN ? p + 1 - WIN : 0, rng[4 * t + 1] = p + 1;
+  rng[4 * t + 2] = 0, rng[4 * t + 3] = p + 1;
+}
+__global__ void verify_step_ids(const int* in, int* ids) {
+  ak_pdl_entry();
+  const int t = threadIdx.x, T = in[0];
+  if (t < T) ids[t] = in[2 + t];
+}
 // Greedy accept of a verified chain: ids = [bonus, d1..d(T-1)], tok = target argmax per position.
 // a = matching prefix of the drafts; commit n = a + 1 tokens (bonus, d1..da); emitted = d1..da, tok[a].
 // res = {n, emitted[0..n-1]}.
 __global__ void accept_greedy(const int* ids, const int* tok, int T, int* res) {
+  ak_pdl_entry();
   int a = 0;
   while (a + 1 < T && ids[a + 1] == tok[a]) ++a;
   res[0] = a + 1;
@@ -1426,6 +1462,7 @@ __global__ void pen_bias_set(float* bias, const int* ids, const float* vals, int
 }
 // thread b: sequence b's chain (ids + b T, scr + 16 b) -> res + b * res_stride = {n, emitted[..]}
 __global__ void samp_chain(const int* ids_all, int B, int T, const int* scr_all, int* res_all, int res_stride) {
+  ak_pdl_entry();
   const int b = threadIdx.x;
   if (b >= B) return;
   const int *ids = ids_all + (size_t)b * T, *scr = scr_all + 16 * b;
@@ -1438,6 +1475,7 @@ __global__ void samp_chain(const int* ids_all, int B, int T, const int* scr_all,
 }
 // Engram prev pair after committing n of the verify tokens (engram_prev_update with T = n)
 __global__ void engram_prev_commit(const int* ids, const long long* pos, const int* res, int* prev) {
+  ak_pdl_entry();
   const int n = res[0];
   const int old1 = prev[1];
   const long long np2 = n >= 2 ? ids[n - 2] : (pos[n - 1] >= 1 ? old1 : -1);
@@ -1454,6 +1492,7 @@ constexpr int kRI = m1draft::kRecInts;
 constexpr int kRecDelta = 40;  // batched verify record: the sequence's rope delta ([34..39] sampling)
 __global__ void bv_prep(const int* rec, int Wctx, int* ids, long long* pos, int* loc, long long* outloc, int* rng,
                         int* slots, int T, long long* rpos, int rmax) {
+  ak_pdl_entry();
   const int b = blockIdx.x, t = threadIdx.x;
   if (t >= T) return;
   const int* r = rec + b * kRI;
@@ -1466,12 +1505,14 @@ __global__ void bv_prep(const int* rec, int Wctx, int* ids, long long* pos, int*
   rng[4 * j + 2] = off, rng[4 * j + 3] = off + p + 1;
   if (t == 0) slots[b] = r[18];
 }
-__global__ void bv_apply_hint(int* rec) {  // sequence b's host proposal over its first rec[26] drafts
+__global__ void bv_apply_hint(int* rec) {
+  ak_pdl_entry();  // sequence b's host proposal over its first rec[26] drafts
   int* r = rec + blockIdx.x * kRI;
   const int t = threadIdx.x;
   if (t < r[26] && t < kSpecT - 1) r[3 + t] = r[27 + t];
 }
 __global__ void bv_engram(const int* rec, const int* ids, const long long* pos, long long* r2, long long* r3, int T) {
+  ak_pdl_entry();
   const int b = blockIdx.x, t = threadIdx.x;
   if (t >= T) return;
   const int* prev = rec_ptr(rec + b * kRI + 22);
@@ -1486,7 +1527,8 @@ __global__ void bv_engram(const int* rec, const int* ids, const long long* pos, 
   r2[b * T + t] = (long long)(eg_fold(g2, 2) % ENG_ROWS);
   r3[b * T + t] = (long long)(eg_fold(g3, 3) % ENG_ROWS);
 }
-__global__ void bv_r2t_stage(const int* rec, int B, int W, int* r2t_b) {  // r2t_b[b][:] = sequence b's slot map
+__global__ void bv_r2t_stage(const int* rec, int B, int W, int* r2t_b) {
+  ak_pdl_entry();  // r2t_b[b][:] = sequence b's slot map
   const long n = (long)B * W;
   for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < n; i += (long)gridDim.x * blockDim.x)
     r2t_b[i] = rec_ptr(rec + (i / W) * kRI + 20)[i % W];
@@ -1503,6 +1545,7 @@ __global__ void bv_accept(const int* ids, const int* tok, int B, int* res, int T
   r[1 + a] = tk[a];
 }
 __global__ void bv_engram_commit(const int* rec, const int* ids, const long long* pos, const int* res, int B, int T) {
+  ak_pdl_entry();
   const int b = threadIdx.x;
   if (b >= B) return;
   int* prev = rec_ptr(rec + b * kRI + 22);
@@ -1525,6 +1568,8 @@ __global__ void bv_seq_ranges(const long long* pos, int* rng, int T) {
 struct State {
   int Wctx = 0, rows = 0;  // r2t width (sglv23 req_to_token width) and KV pool rows (+1 trash row = index rows)
   cudaStream_t s = nullptr;
+  cudaStream_t s2 = nullptr;                // side stream: the BCSA indexer keys of a near verify (bcsa_side)
+  cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
   // per-layer caches
   std::vector<bf16*> kc, vc, idx, blk;  // BCSA/dense: KV [rows+1][4][256]; idx/blk [rows+1][128]
   std::vector<bf16*> conv;              // KDA: [nslots+1][3][KDIM] (slot 0 unused, as sglang's pool)
@@ -1569,7 +1614,7 @@ struct State {
   bf16* wdq = nullptr;                  // W4 prefill: dequantized weight of the current linear (largest W4 n*k)
   // batched speculative verify (server mode, ak_m1_spec_batch): records [kMaxBV][kRecInts] (pinned / device), per-row
   // ranges (window, dense: both in the B x Wctx space of r2t_b), KDA slots, accept results [kMaxBV][16], KDA verify
-  // stash for bv_max * 8 rows
+  // stash for min(bv_max * 8, kMaxBVRows) rows (bv_stash_rows)
   int *bv_h = nullptr, *bv_d = nullptr, *bv_rng = nullptr, *bv_slot = nullptr, *bv_res = nullptr, *bv_res_h = nullptr;
   std::vector<bf16*> kstb;
   int bv_max = 0;
@@ -1580,6 +1625,8 @@ struct State {
 State SD[2];
 State* SP = &SD[0];
 #define S (*SP)
+// rows of the batched verify's KDA stash (and verify logits): B x TV <= kMaxBVRows for every B <= bv_max (rows b TV + t)
+size_t bv_stash_rows() { return std::min((size_t)S.bv_max * kSpecT, (size_t)kMaxBVRows); }
 int g_ndev = 1, g_split = 1 << 30;
 int dev_of(int layer) { return layer < g_split ? 0 : 1; }
 void use(int k) {
@@ -1762,7 +1809,11 @@ int w4_tile_rows(int k, int n) {
 // ---------------------------------------------------------------- layer pieces
 // bf16 linear: prefill / parity decode = cuBLAS as torch issues it; decode rows in a batch see the same bits as bs = 1
 int bf16_lin(const bf16* x, const void* wp, bf16* y, int m, int n, int k) {
-  if (g_dec && g_binv && m <= kMaxBatch) return ak_bf16_gemv_rows(x, wp, y, m, n, k, S.s);
+  if (g_dec && g_binv && m <= kMaxBatch) {  // rows of 16 per launch (ak_bf16_gemv_rows: m <= 16, rows bit-identical)
+    for (int r = 0; r < m; r += 16)
+      CK(ak_bf16_gemv_rows(x + (size_t)r * k, wp, y + (size_t)r * n, std::min(16, m - r), n, k, S.s));
+    return 0;
+  }
   if (g_dec && m > 1) {
     for (int r = 0; r < m; ++r) CK(ak_bf16_linear(x + (size_t)r * k, wp, y + (size_t)r * n, 1, n, k, S.s));
     return 0;
@@ -1841,7 +1892,7 @@ int linear_shared(const bf16* x, int nl, const char* const* wnames, int layer, b
     for (int j = 0; j < nl && ok; ++j) {
       q[j] = lin_ref(layer, wnames[j]).w4;
       ok = q[j] && q[j]->np == 1 && q[j]->n == ns[j] && q[j]->k == k;
-      w4h = w4h && ok && q[j]->p[0].bits == 4 && ak_w4h_is(q[j]->p[0].wt);
+      w4h = w4h && ok && q[j]->p[0].bits == 4 && ak_w4h_is_m(q[j]->p[0].wt, m);  // (or its dual-layout copy at m)
     }
     ok = ok && (m == 1 || w4h);
     if (ok) {  // one launch per (bits, group) class of the linears (mixed precision: up to 3)
@@ -1871,7 +1922,7 @@ int linear_shared(const bf16* x, int nl, const char* const* wnames, int layer, b
 bf16* kda_b_out(int i, int T, bool prefill) {
   const bool verify = !prefill && T > 1 && !g_B;
   if (verify && g_BV) {
-    const size_t MR = (size_t)S.bv_max * kSpecT;
+    const size_t MR = bv_stash_rows();
     return S.kstb[i] + 2 * MR * KDIM + MR * KHV * KK;
   }
   if (verify) return S.kst[i] + 2 * (size_t)kSpecT * KDIM + (size_t)kSpecT * KHV * KK;
@@ -1887,7 +1938,7 @@ int kda_mixer(int i, const bf16* h, bf16* out, int T, bool prefill) {
   bf16* sc = nullptr;
   if (verify && g_BV) {  // batched verify: g_BV sequences of kSpecT rows, stash sized for bv_max sequences
     if (S.kstb.empty() || !S.kstb[i] || T != g_BV * g_TV || g_BV > S.bv_max) return (int)cudaErrorInvalidValue;
-    const size_t MR = (size_t)S.bv_max * kSpecT;
+    const size_t MR = bv_stash_rows();
     qkv = S.kstb[i], sc = qkv + MR * KDIM, ag = sc + MR * KDIM, b = ag + MR * KHV * KK;
   } else if (verify) {
     if (S.kst.empty() || !S.kst[i] || T > kSpecT) return (int)cudaErrorInvalidValue;
@@ -1978,6 +2029,20 @@ int fake_int8_rows(bf16* x, int T) {
   return ak_kv_dequant_rows(q, sc, nullptr, T, KVH, HD, x, S.s);
 }
 
+// the BCSA indexer key -> idx_cache and (decode / verify) the block keys
+int idx_keys(int i, const bf16* h, int T, bool prefill) {
+  CK(linear(h, "self_attn.idx_k.weight", i, S.ik, T, IDXD, HID));
+  CK(ak_rmsnorm(S.ik, WL(i, "self_attn.idx_norm.weight"), S.ik, T, IDXD, IDXD, IDXD, EPS, 1, S.s));
+  store_rows<<<grid((long)T * IDXD), 256, 0, S.s>>>(S.ik, S.idx[i], S.loc, T, IDXD);
+  if (!prefill) block_keys_decode<<<T, IDXD, 0, S.s>>>(S.pos, S.loc, S.r2t, S.Wctx, S.idx[i], S.blk[i], S.rows);
+  return (int)cudaGetLastError();
+}
+bool g_side_pending = false;  // a side-stream branch (S.s2, recorded in S.ev_join) not yet joined into S.s
+int side_join() {
+  if (!g_side_pending) return 0;
+  g_side_pending = false;
+  return (int)cudaStreamWaitEvent(S.s, S.ev_join, 0);
+}
 int attn_mixer(int i, const bf16* h, bf16* out, int T, bool prefill, bool bcsa) {
   bf16* qg = S.big0;
   g_qk_layer = i;
@@ -2031,12 +2096,16 @@ int attn_mixer(int i, const bf16* h, bf16* out, int T, bool prefill, bool bcsa) 
     store_kv<<<grid((long)T * KVH * HD), 256, 0, S.s>>>(S.k, S.v, S.kc[i], S.vc[i], S.loc, T, KVH);
   }
   const float scale = 1.0f / 16.0f;
-  if (bcsa) {
+  // single-sequence verify with every query in the window (no far branch reads this step's index keys or block keys):
+  // the indexer key chain runs on a side stream after the attention launches, joined back before the next BCSA layer's
+  // fork, a graph segment's end or the head (side_join; the same kernels and inputs: the same bits; AGENS_BCSA_SIDE=0 / 1,
+  // default on for compute capability 9.0)
+  static const bool side_on = getenv("AGENS_BCSA_SIDE") ? getenv("AGENS_BCSA_SIDE")[0] == '1' : ak_cc90() != 0;
+  const bool side = bcsa && side_on && S.s2 && !prefill && T > 1 && !g_B && !g_BV && !kvm && g_seq + T <= WIN &&
+                    !getenv("AGENS_M1_DBG_DIR");
+  if (bcsa && !side) {
     // indexer key -> idx_cache; block keys (decode: here; extend: inside the far bridge, before the far branch)
-    CK(linear(h, "self_attn.idx_k.weight", i, S.ik, T, IDXD, HID));
-    CK(ak_rmsnorm(S.ik, WL(i, "self_attn.idx_norm.weight"), S.ik, T, IDXD, IDXD, IDXD, EPS, 1, S.s));
-    store_rows<<<grid((long)T * IDXD), 256, 0, S.s>>>(S.ik, S.idx[i], S.loc, T, IDXD);
-    if (!prefill) block_keys_decode<<<T, IDXD, 0, S.s>>>(S.pos, S.loc, S.r2t, S.Wctx, S.idx[i], S.blk[i], S.rows);
+    CK(idx_keys(i, h, T, prefill));
   }
   // KV list: BCSA = last min(seq, W) tokens; dense = all tokens (r2t row is the identity slot map here)
   const int seq_after = g_seq + T;
@@ -2096,6 +2165,18 @@ int attn_mixer(int i, const bf16* h, bf16* out, int T, bool prefill, bool bcsa) 
       CK(ak_oracle_bcsa_local(S.q, S.kc[i], S.vc[i], S.rows + 1, S.kv_indptr, S.kv_idx, S.last1, kv_indptr_h, qo_h,
                               S.qo_dev, 1, QH, KVH, scale, S.o, S.lse, decode_graph_mode(), S.s));
     }
+  }
+  if (side) {
+    CK(side_join());
+    CK(cudaEventRecord(S.ev_fork, S.s));
+    CK(cudaStreamWaitEvent(S.s2, S.ev_fork, 0));
+    const cudaStream_t s_main = S.s;
+    S.s = S.s2;
+    const int e = idx_keys(i, h, T, prefill);
+    S.s = s_main;
+    CK(e);
+    CK(cudaEventRecord(S.ev_join, S.s2));
+    g_side_pending = true;
   }
   bf16* attn_out = S.o;
   if (const char* dd = getenv("AGENS_M1_DBG_DIR")) {  // debug: q,k,v (post-RoPE), o_loc of one layer/position
@@ -2582,6 +2663,8 @@ int forward_rows(const int* sess, const int* tok, int B, int* next) {
   const auto t_start = std::chrono::steady_clock::now();
   g_lin = g_lin_w4 = 0;
   if (B < 1 || B > kMaxBatch) return (int)cudaErrorInvalidValue;
+  // tiered KV: its batched-decode row tables hold 16 rows (m1_kv.cu brows; agens serve keeps --max-batch <= 16 there)
+  if (m1kv::on() && B > 16) return (int)cudaErrorNotSupported;
   int need = 0;
   for (int r = 0; r < B; ++r) {
     const Session& ss = g_sess[sess[r]];
@@ -2660,6 +2743,35 @@ bool tp_vocab(int m) {
   return on && g_tp > 1 && VOCAB % (16 * g_tp) == 0 && g_bi && (m <= 16 || (g_dec && m <= 128)) &&
          (long)m * VOCAB <= (long)g_chunk * HID;  // the all-reduce slot holds a prefill chunk of hidden rows
 }
+// Greedy verify under the vocab-parallel head (only S.tok is read: no sampling, no penalties; AGENS_HEAD_ARGMAX_TP=0
+// off): each rank's share of the logits, its best per row, the (logit, index digits) slots all-reduced, the best slot
+// (ak_argmax_tp_*: ak_argmax's result over the whole row) -- no all-reduce of the vocabulary-wide rows
+bool g_head_argmax = false;  // set by the single-sequence greedy verify around run_model
+bf16* g_head_hx = nullptr;
+bool head_argmax_tp(int m) {
+  static const bool on = !(getenv("AGENS_HEAD_ARGMAX_TP") && getenv("AGENS_HEAD_ARGMAX_TP")[0] == '0') &&
+                         !getenv("AGENS_M1_VLOGITS_DUMP") && !getenv("AGENS_M1_DUMP_LOGITS");
+  if (!on || !lmh_bf16() || !tp_vocab(m) || g_tp > 8 || m > 16 || (VOCAB / g_tp) % 8) return false;
+  if (!lin_ref(-1, "lm_head.weight").bf16) return false;
+  if (!g_head_hx) {
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(S.s, &cs);
+    if (cs != cudaStreamCaptureStatusNone) return false;
+    g_head_hx = dalloc<bf16>(16 * 32);
+    if (!g_head_hx) return false;
+  }
+  return true;
+}
+int lm_head_argmax_tp(const bf16* x, int m) {
+  const LinRef& r = lin_ref(-1, "lm_head.weight");
+  const int vs = VOCAB / g_tp, nx = 8 * ((4 * g_tp + 7) / 8);
+  ++g_lin;
+  CK(ak_bf16_gemv_bi_ld(x, static_cast<const bf16*>(r.bf16) + (size_t)g_rank * vs * HID, nullptr, S.big0 + (size_t)g_rank * vs,
+                        m, vs, HID, VOCAB, S.s));
+  CK(ak_argmax_tp_part(S.big0, m, VOCAB, g_rank * vs, std::min(VOCAB_VALID, (g_rank + 1) * vs), g_rank, nx, g_head_hx, S.s));
+  CK(ak_tp_allreduce(g_head_hx, (long)m * nx, S.s));
+  return ak_argmax_tp_combine(g_head_hx, m, nx, g_tp, S.tok, S.s);
+}
 int lm_head(const bf16* x, bf16* y, int m) {
   if (lmh_bf16() && tp_vocab(m)) {
     const LinRef& r = lin_ref(-1, "lm_head.weight");
@@ -2721,6 +2833,7 @@ int run_model(int T, bool prefill, int R) {
     }
     if (g_seg_capture && i > 0 && i % std::max(1, NL / graph_segs()) == 0 && NL - i >= NL / graph_segs() / 2) {
       // segmented verify graph: close this segment and continue the capture in the next (same stream, same order)
+      CK(side_join());  // (a capture must end with every branch joined)
       cudaGraph_t g = nullptr;
       CK(cudaStreamEndCapture(S.s, &g));
       g_seg_capture->push_back(g);
@@ -2767,7 +2880,12 @@ int run_model(int T, bool prefill, int R) {
       fa.pre_s = (const bf16*)WM(i + 1, "pre_static"), fa.post_s = (const bf16*)WM(i + 1, "post_static");
       fa.res_s = (const bf16*)WM(i + 1, "res_static"), fa.wln = (const bf16*)WL(i + 1, "input_layernorm.weight");
       fa.d = S.d, fa.xin = S.xin, fa.post_o = S.post, fa.res_o = S.res, fa.h = S.t0, fa.eps = EPS, fa.iters = 10;
-      fa.write_res = i + 2 >= NL;  // the last layer's bmm is not fused: it reads S.res
+      // every boundary also writes layer i + 1's res (the next boundary reads it instead of running its Sinkhorn; the
+      // last layer's unfused bmm reads it too); layer i's res: S.res (the first boundary: mhc_mix's of layer 0)
+      // (AGENS_MHC_RES_AHEAD=0: each boundary recomputes its own)
+      static const bool res_ahead = !(getenv("AGENS_MHC_RES_AHEAD") && getenv("AGENS_MHC_RES_AHEAD")[0] == '0');
+      fa.write_res = res_ahead || i + 2 >= NL;
+      fa.res_cur = res_ahead ? S.res : nullptr;
       if (kMixer[i + 1] == 'k' && KHV <= 48 && !(getenv("AGENS_MHC_FUSE_B") && getenv("AGENS_MHC_FUSE_B")[0] == '0')) {
         const LinRef& rb = lin_ref(i + 1, "linear_attn.in_proj_b.weight");  // bf16 in the INT4 recipe (fake-quantized)
         if (rb.bf16 && !rb.w4) fa.wb = (const bf16*)rb.bf16, fa.nb_out = KHV, fa.bout = kda_b_out(i + 1, T, prefill);
@@ -2799,11 +2917,16 @@ int run_model(int T, bool prefill, int R) {
   }
   S.H = H, S.H2 = Hn, S.hmean = hm, S.hmean2 = hmn;
   // final norm on stream 0 of the last R tokens (speculative verify: of every token), lm_head, mask + greedy
+  CK(side_join());
   const int nh = !prefill && T > 1 && !g_B ? T : R;
   const bf16* last = H + (size_t)(T - nh) * NS * HID;
   CK(ak_rmsnorm(last, WG("model.language_model.norm.weight"), S.t0, nh, HID, NS * HID, HID, EPS, 1, S.s));
-  CK(lm_head(S.t0, S.big0, nh));
-  CK(ak_argmax(S.big0, nh, VOCAB, VOCAB_VALID, S.tok, S.s));
+  if (g_head_argmax && head_argmax_tp(nh)) {
+    CK(lm_head_argmax_tp(S.t0, nh));
+  } else {
+    CK(lm_head(S.t0, S.big0, nh));
+    CK(ak_argmax(S.big0, nh, VOCAB, VOCAB_VALID, S.tok, S.s));
+  }
   if (getenv("AGENS_M1_DUMP_LOGITS")) {  // debug: top-5 logits of this step
     std::vector<uint16_t> lg(VOCAB_VALID);
     cudaMemcpyAsync(lg.data(), S.big0, (size_t)VOCAB_VALID * 2, cudaMemcpyDeviceToHost, S.s);
@@ -2891,6 +3014,19 @@ void drop_all_graphs();  // every cached graph (single-sequence and batched), de
 // cap can run out: then every cached graph is freed (recaptured on demand) and it retries once; false when that fails
 // too (error state cleared, exs empty): the caller runs the step eagerly, with the same kernels and results.
 bool instantiate(std::vector<cudaGraph_t>& segs, std::vector<cudaGraphExec_t>& exs, const char* what) {
+  if (ak_pdl_on()) {  // programmatic edges into the PDL kernels (kernels/include/agens_pdl.cuh; AGENS_PDL=0: off)
+    static const bool glog = getenv("AGENS_M1_GRAPH_LOG") != nullptr;
+    int conv = 0;
+    for (cudaGraph_t g : segs) {
+      const int c = ak_graph_pdl(g);
+      if (c < 0) {
+        fprintf(stderr, "m1: %s graph: programmatic edges stopped (%s): the remaining edges stay plain\n", what, cudaGetErrorString((cudaError_t)-c));
+        break;
+      }
+      conv += c;
+    }
+    if (glog) fprintf(stderr, "m1: %s graph: %d programmatic edges\n", what, conv);
+  }
   for (int attempt = 0; attempt < 2; ++attempt) {
     cudaError_t e = cudaSuccess;
     exs.clear();
@@ -2992,6 +3128,7 @@ int decode1(int token, int* next) {
 int g_draft_nsl = 0;  // shortlist head rows (ak_m1_draft_vocab; "lm_head.weight.draftsl" / "lm_head.draftsl.ids")
 bool g_draft_sl_drafter = false;  // the DFlash2 drafter's candidates from it too
 void set_draft_sl(m1draft::Target& t) {
+  t.tp_rank = g_rank, t.tp_size = g_tp;
   if (g_draft_nsl > 0 && W.count("lm_head.weight.draftsl") && W.count("lm_head.draftsl.ids"))
     t.sl_head = W["lm_head.weight.draftsl"], t.sl_ids = (const int*)W["lm_head.draftsl.ids"], t.nsl = g_draft_nsl,
     t.sl_drafter = g_draft_sl_drafter;
@@ -3021,7 +3158,7 @@ bool commit_all(bool batched, int B) {
   if (!on || KK != 128) return false;
   static KdaCommitArgs ca;  // ~4.7 KB: kept off the stack
   ca = KdaCommitArgs{};
-  const size_t MR = batched ? (size_t)S.bv_max * kSpecT : (size_t)kSpecT;
+  const size_t MR = batched ? bv_stash_rows() : (size_t)kSpecT;
   int n = 0;
   for (int i = 0; i < NL; ++i) {
     if (kMixer[i] != 'k') continue;
@@ -3096,6 +3233,10 @@ int mtp_steps() {
 // segmented verify graphs: close the capture's current segment here and continue in a new one (same stream order).
 // AGENS_M1_GRAPH_SPLIT_DRAFT=1: a segment ends after the drafting, so the GPU starts on a small first graph launch
 // instead of waiting for the host to submit the drafter + the first quarter of the layers.
+bool g_seg_capture_draft() {  // AGENS_M1_GRAPH_SPLIT_DRAFT: a graph segment ends after drafting
+  static const bool on = getenv("AGENS_M1_GRAPH_SPLIT_DRAFT") && getenv("AGENS_M1_GRAPH_SPLIT_DRAFT")[0] == '1';
+  return on;
+}
 void seg_split_draft() {
   static const bool on = [] { const char* e = getenv("AGENS_M1_GRAPH_SPLIT_DRAFT"); return e && e[0] == '1'; }();
   if (!on || !g_seg_capture) return;
@@ -3131,7 +3272,7 @@ void samp_accept(int T, int B, const int* prm, int stride) {
   }();
   const bool fast = samp_fast_on() && S.samp_hist && smem;
   if (fast) {
-    unsigned* kmax = S.samp_hist + (size_t)kMaxBV * kSpecT * kSampKeys;
+    unsigned* kmax = S.samp_hist + (size_t)kMaxBVRows * kSampKeys;
     samp_hist<<<dim3(kSampHB, B * T, 2), 1024, kSampKeys, S.s>>>(S.big0, VOCAB, VOCAB_VALID, T, prm, stride, S.samp_hist, kmax);
     static const int stop = getenv("AGENS_SAMP_STOP") ? atoi(getenv("AGENS_SAMP_STOP")) : 0;
     samp_fast<<<B * T, 1024, 0, S.s>>>(S.big0, VOCAB, VOCAB_VALID, S.ids, T, prm, stride, S.samp_hist, kmax, S.samp_scr,
@@ -3141,6 +3282,24 @@ void samp_accept(int T, int B, const int* prm, int stride) {
 }
 int verify_body(int T, bool draft) {
   CK(cudaMemcpyAsync(S.step_d, S.step_h, kStepInts * sizeof(int), cudaMemcpyHostToDevice, S.s));
+  // drafted verify with the MTP head alone: the step's positions / ranges and the attention plans (they read the staged
+  // positions only) on the side stream beside the draft chain, joined before the model (AGENS_VERIFY_PREP_SIDE=0 / 1,
+  // default on for compute capability 9.0)
+  static const bool pside_on =
+      getenv("AGENS_VERIFY_PREP_SIDE") ? getenv("AGENS_VERIFY_PREP_SIDE")[0] == '1' : ak_cc90() != 0;
+  const bool pside = pside_on && draft && S.s2 && m1mtp::ready() && !m1draft::ready() && !g_seg_capture_draft();
+  if (pside) {
+    CK(cudaEventRecord(S.ev_fork, S.s));
+    CK(cudaStreamWaitEvent(S.s2, S.ev_fork, 0));
+    const cudaStream_t s_main = S.s;
+    S.s = S.s2;
+    verify_step_pos<<<1, kSpecT, 0, S.s>>>(S.step_d, S.pos, S.loc, S.outloc, S.r2t, S.rng, S.rpos, S.rmax);
+    const int e = plan_verify(T);
+    S.s = s_main;
+    CK(e);
+    CK(cudaEventRecord(S.ev_join, S.s2));
+    g_side_pending = true;
+  }
   if (draft) {
     if (m1draft::ready()) CK(m1draft::propose(draft_target(), S.step_d));  // writes the 7 drafts into the staged tokens
     apply_hint<<<1, 32, 0, S.s>>>(S.step_d);
@@ -3148,10 +3307,19 @@ int verify_body(int T, bool draft) {
     if (m1mtp::ready()) CK(m1mtp::propose(draft_target(), S.step_d, mtp_steps()));
     seg_split_draft();
   }
-  verify_step_prep<<<1, kSpecT, 0, S.s>>>(S.step_d, S.ids, S.pos, S.loc, S.outloc, S.r2t, S.rng, S.rpos, S.rmax);
-  engram_rows_extend<<<1, 128, 0, S.s>>>(S.ids, S.pos, T, S.prev, S.r2, S.r3);
-  CK(plan_verify(T));
-  CK(run_model(T, false));
+  if (pside) {
+    verify_step_ids<<<1, kSpecT, 0, S.s>>>(S.step_d, S.ids);
+    CK(side_join());  // (engram_rows_extend reads the positions)
+    engram_rows_extend<<<1, 128, 0, S.s>>>(S.ids, S.pos, T, S.prev, S.r2, S.r3);
+  } else {
+    verify_step_prep<<<1, kSpecT, 0, S.s>>>(S.step_d, S.ids, S.pos, S.loc, S.outloc, S.r2t, S.rng, S.rpos, S.rmax);
+    engram_rows_extend<<<1, 128, 0, S.s>>>(S.ids, S.pos, T, S.prev, S.r2, S.r3);
+    CK(plan_verify(T));
+  }
+  g_head_argmax = !(g_temp > 0.f || g_vpen);  // greedy accept: only the argmax of the head is read
+  const int erm = run_model(T, false);
+  g_head_argmax = false;
+  CK(erm);
   if (g_temp > 0.f || g_vpen) {  // sampled accept over the request's filtered distribution (temperature, top-k / top-p /
                                   // min-p), or any accept with penalties (the penalised argmax / distribution)
     samp_accept(T, 1, S.step_d + 32, 0);
@@ -3198,6 +3366,7 @@ void vlogits_dump(const bf16* rows, int n, long long pos0 = -1, int valid = 1) {
 }
 // tokens == nullptr: the drafter proposes (T = 8, tokens[0] = bonus passed in *n_out on entry)
 int g_hint_n = 0, g_hint[kSpecT];  // the next drafted verify's host proposal (ak_m1_spec_step_hint)
+std::chrono::steady_clock::time_point g_vend;  // the last verify1's sync return (AGENS_M1_STEP_TIMING)
 int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int* drafts) {
   const auto t_start = std::chrono::steady_clock::now();
   use(0);
@@ -3246,7 +3415,26 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
   const auto key = std::make_pair(g_cur, regime + (draft ? 4 : 0) + 8 * d8t + (g_vpen ? 1 << 28 : 0));
   auto it = g_vgraphs.find(key);
   if (it != g_vgraphs.end() && T == kSpecT) {
+    // AGENS_M1_STEP_TIMING=1: host time of the replayed steps (before the first launch, the launches, and the host
+    // turnaround from the previous step's sync), averaged every 256 steps on stderr
+    static const bool timing = getenv("AGENS_M1_STEP_TIMING") != nullptr;
+    std::chrono::steady_clock::time_point& prev_end = g_vend;
+    static double a_pre = 0, a_launch = 0, a_turn = 0;
+    static int a_n = 0;
+    const auto t_l0 = std::chrono::steady_clock::now();
     for (auto ex : it->second) CK(cudaGraphLaunch(ex, S.s));
+    if (timing) {
+      const auto t_l1 = std::chrono::steady_clock::now();
+      a_pre += std::chrono::duration<double, std::milli>(t_l0 - t_start).count();
+      a_launch += std::chrono::duration<double, std::milli>(t_l1 - t_l0).count();
+      if (a_n && prev_end.time_since_epoch().count()) a_turn += std::chrono::duration<double, std::milli>(t_start - prev_end).count();
+      if (++a_n == 256) {
+        fprintf(stderr, "m1: verify host ms/step: before launch %.3f, launches %.3f, turnaround %.3f\n", a_pre / 256,
+                a_launch / 256, a_turn / 255);
+        a_pre = a_launch = a_turn = 0, a_n = 0;
+      }
+    }
+
   } else if (graphs_on() && T == kSpecT && regime != 2 && g_vwarm[key] > 0) {
     std::vector<cudaGraph_t> segs;
     g_seg_capture = &segs;
@@ -3286,6 +3474,7 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
   const auto t_enq = std::chrono::steady_clock::now();
   CK(cudaStreamSynchronize(S.s));
   const auto t_end = std::chrono::steady_clock::now();
+  g_vend = t_end;
   vlogits_dump(S.big0, T, g_seq, S.vres_h[0]);
   const int n = S.vres_h[0];
   for (int j = 0; j < n; ++j) emitted[j] = S.vres_h[1 + j];
@@ -3315,7 +3504,7 @@ int verify1(const int* tokens, int T, int* emitted, int* n_out, int* target, int
 // set of sessions; a mixed-regime sequence (some queries past the window) makes the step eager.
 int spec_commit_b(int B) {
   const float scale = 1.0f / sqrtf(128.0f);
-  const size_t MR = (size_t)S.bv_max * kSpecT;  // stash capacity (rows b * g_TV + t)
+  const size_t MR = bv_stash_rows();  // stash capacity (rows b * g_TV + t)
   const bool all = commit_all(true, B);
   for (int i = 0; i < NL && !all; ++i) {
     if (kMixer[i] != 'k') continue;
@@ -3327,7 +3516,7 @@ int spec_commit_b(int B) {
                              (float*)WL(i, "linear_attn.dt_bias.f32"), S.ssm[i], S.bv_slot, nullptr, scale, KH, KHV, KK,
                              KK, g_TV, B, S.bv_res, kBVRes, 1, S.s));
   }
-  bv_engram_commit<<<1, 32, 0, S.s>>>(S.bv_d, S.ids, S.pos, S.bv_res, B, g_TV);
+  bv_engram_commit<<<1, kBThreads, 0, S.s>>>(S.bv_d, S.ids, S.pos, S.bv_res, B, g_TV);
   return (int)cudaGetLastError();
 }
 int verify_body_b(int B) {
@@ -3366,7 +3555,7 @@ int verify_body_b(int B) {
   if (e) return e;
   // per sequence: greedy accept, or the sampled accept over its filtered distribution (record [34..39], 1.0.1)
   samp_accept(g_TV, B, S.bv_d + 34, kRI);
-  samp_chain<<<1, 32, 0, S.s>>>(S.ids, B, g_TV, S.samp_scr, S.bv_res, kBVRes);
+  samp_chain<<<1, kBThreads, 0, S.s>>>(S.ids, B, g_TV, S.samp_scr, S.bv_res, kBVRes);
   CK(spec_commit_b(B));
   if (m1draft::ready() && g_capture) CK(m1draft::materialize_b(draft_target(), S.cap, B, S.bv_res, kBVRes, S.pos, S.bv_d, g_TV));
   if (m1mtp::ready())  // MTP context of each sequence's committed tokens (+ its new pending row)
@@ -3391,6 +3580,7 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
   // tiered / INT8 KV: each sequence's attention runs as its own verify layer, whose single-sequence plans are sized
   // for kSpecT queries -> the full verify length there
   const int TV = g_TV = m1kv::on() || m1d8::on() ? kSpecT : batch_tv(B);
+  if (B * TV > kMaxBVRows) return (int)cudaErrorInvalidValue;
   int need = 0;
   for (int b = 0; b < B; ++b) {
     const Session& ss = g_sess[sess[b]];
@@ -3404,7 +3594,8 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
   };
   g_bv_sess.assign(sess, sess + B);
   g_bv_reg.assign(B, 0);
-  long long rkey = 0;
+  long long rkey = 0;  // the regimes of rows 0..31 in base 3 (rkeys: one per 32 rows; 3^32 < 2^63)
+  std::vector<long long> rkeys;
   bool mixed = false;
   for (int b = 0; b < B; ++b) {
     Session& ss = g_sess[sess[b]];
@@ -3425,10 +3616,14 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
     memcpy(r + 24, &ss.cache_epoch, 8);
     const int reg = ss.seq + TV <= WIN ? 0 : (ss.seq + 1 > WIN ? 1 : 2);
     g_bv_reg[b] = reg, mixed |= reg == 2;
+    if (b > 0 && b % 32 == 0) rkeys.push_back(rkey), rkey = 0;
     rkey = rkey * 3 + reg;
   }
+  rkeys.push_back(rkey);
+  rkey = rkeys[0];
   g_lin = g_lin_w4 = 0;
-  std::vector<long long> key{B, TV, rkey};
+  std::vector<long long> key{B, TV};
+  key.insert(key.end(), rkeys.begin(), rkeys.end());
   const bool tiered = m1kv::on() || m1d8::on();
   // INT8 dense KV: the dense layer's attention bakes its tile count (ceil((seq + TV) / TILE), from the host seq) into
   // the graph, so it is part of the key as in the single-sequence verify (r101 fix: a graph captured for a session at
@@ -3511,7 +3706,7 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
 }
 
 // ---------------------------------------------------------------- batched decode on device tables + graphs per bucket
-// The batch is padded to a bucket (1, 2, 4, 8, 16); a padding row decodes token 0 at position 3 in KDA slot 0 (unused
+// The batch is padded to a bucket (1, 2, 4, 8, 16, then multiples of 8 up to kMaxBatch); a padding row decodes token 0 at position 3 in KDA slot 0 (unused
 // by sessions) into the reserved pool row g_pad_row with a slot map of trash rows, so it reads and writes nothing a
 // session reads. All session state is reached through the staged table, so one graph per (bucket, far step) serves
 // every set of sessions. A far step (any row past the window) runs the far branch on every row.
@@ -3530,7 +3725,7 @@ void drop_all_graphs() {  // warm counts are kept: the next step of a key captur
 }
 int batch_body(int Bp, bool far) {
   CK(cudaMemcpyAsync(S.bstep_d, S.bstep_h, (size_t)Bp * kBRec * sizeof(int), cudaMemcpyHostToDevice, S.s));
-  batch_step_prep<<<1, 32, 0, S.s>>>(S.bstep_d, Bp, S.ids, S.pos, S.loc, S.outloc, S.slots_b, S.rng_b, S.r2, S.r3, S.rpos,
+  batch_step_prep<<<1, kBThreads, 0, S.s>>>(S.bstep_d, Bp, S.ids, S.pos, S.loc, S.outloc, S.slots_b, S.rng_b, S.r2, S.r3, S.rpos,
                                      S.rmax);
   batch_r2t_stage<<<grid((long)Bp * S.Wctx), 256, 0, S.s>>>(S.bstep_d, Bp, S.Wctx, S.r2t_b);
   CK(m1kv::prep_rows(0, S.slots_b, Bp, S.s));
@@ -3545,8 +3740,9 @@ int rows_dev(const int* sess, const int* tok, int B, const std::vector<long long
              const std::vector<int>& slots, int* next, std::chrono::steady_clock::time_point t_start) {
   const int cur0 = g_cur;
   use(0);
-  int Bp = 1;
-  while (Bp < B) Bp <<= 1;
+  int Bp = 1;  // buckets 1, 2, 4, 8, 16, then multiples of 8 (1.3.4: up to kMaxBatch = 64 rows)
+  while (Bp < B && Bp < 16) Bp <<= 1;
+  if (Bp < B) Bp = (B + 7) / 8 * 8;
   bool far = false;
   auto put_ptr = [](int* q, const void* p) {
     const unsigned long long v = (unsigned long long)p;
@@ -3711,6 +3907,9 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
   S.Wctx = Wctx;
   S.rows = rows;
   cudaStreamCreateWithFlags(&S.s, cudaStreamNonBlocking);
+  cudaStreamCreateWithFlags(&S.s2, cudaStreamNonBlocking);
+  cudaEventCreateWithFlags(&S.ev_fork, cudaEventDisableTiming);
+  cudaEventCreateWithFlags(&S.ev_join, cudaEventDisableTiming);
   {  // KDA prefill takes its temporaries from the default pool (cudaMallocAsync): keep freed memory in the pool instead
      // of returning it to the driver at every sync (re-mapping ~0.5 GB per layer per chunk otherwise)
     cudaMemPool_t pool;
@@ -3771,11 +3970,11 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
   S.ik = dalloc<bf16>(T * IDXD), S.e = dalloc<bf16>(T * 2 * ENG_DIM), S.eg = dalloc<bf16>(T);
   S.lse = dalloc<float>(T * QH_FULL);
   S.pos = dalloc<long long>(T), S.reqs = dalloc<long long>(1), S.r2 = dalloc<long long>(T), S.r3 = dalloc<long long>(T);
-  S.rmax = (int)std::max<size_t>({T, (size_t)kMaxBatch, (size_t)kMaxBV * kSpecT, (size_t)kSpecT});
+  S.rmax = (int)std::max<size_t>({T, (size_t)kMaxBatch, (size_t)kMaxBVRows, (size_t)kSpecT});
   S.rpos = dalloc<long long>((size_t)3 * S.rmax);
   S.outloc = dalloc<long long>(T);
   S.loc = dalloc<int>(T), S.ids = dalloc<int>(T), S.qo_dev = dalloc<int>(2), S.kv_indptr = dalloc<int>(2);
-  S.kv_idx = dalloc<int>(Wctx), S.last1 = dalloc<int>(1), S.tok = dalloc<int>(kMaxBatch > kSpecT ? kMaxBatch : kSpecT);
+  S.kv_idx = dalloc<int>(Wctx), S.last1 = dalloc<int>(1), S.tok = dalloc<int>(std::max({kMaxBatch, kMaxBVRows, kSpecT}));  // greedy ids of a step's rows
   S.slots_b = dalloc<int>(kMaxBatch);
   S.bstep_d = dalloc<int>(kMaxBatch * kBRec), S.rng_b = dalloc<int>(kMaxBatch * 4);
   S.r2t_b = dalloc<int>((size_t)kMaxBatch * Wctx);
@@ -3788,9 +3987,9 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
   CK(cudaMallocHost(&S.bstep_h, kMaxBatch * kBRec * sizeof(int)));
   S.step_d = dalloc<int>(kStepInts), S.rng = dalloc<int>(4 * kSpecT);  // decode uses [0..3]; speculative verify the rest
   S.samp_scr = dalloc<int>(16 * kMaxBV);
-  if (samp_fast_on()) {  // kMaxBV sequences x 8 positions x 65536 keys (32 MB), zeroed once (samp_fast re-zeroes)
-    S.samp_hist = dalloc<unsigned>((size_t)kMaxBV * kSpecT * (kSampKeys + 1));  // + the per-position max keys
-    cudaMemset(S.samp_hist, 0, (size_t)kMaxBV * kSpecT * (kSampKeys + 1) * 4);
+  if (samp_fast_on()) {  // kMaxBVRows rows (B sequences x TV positions) x 65536 keys (32 MB), zeroed once (samp_fast re-zeroes)
+    S.samp_hist = dalloc<unsigned>((size_t)kMaxBVRows * (kSampKeys + 1));  // + the per-position max keys
+    cudaMemset(S.samp_hist, 0, (size_t)kMaxBVRows * (kSampKeys + 1) * 4);
   }
   for (int i = 0; i < NL; ++i)
     if (kMixer[i] == 'b' && dev_of(i) == my && !S.far_ws) S.far_ws = dalloc<char>(ak_far_decode_ws_bytes(Wctx));
@@ -4033,22 +4232,24 @@ int ak_m1_sample_decode(const int* sess, const int* use_row, int B, int* out) {
 int ak_m1_spec_batch_init(int max_b) {
   use(0);
   if (max_b < 1 || max_b > kMaxBV || S.kst.empty()) return (int)cudaErrorInvalidValue;
+  // tiered / INT8 KV verify every sequence at the full kSpecT: B x 8 rows <= kMaxBVRows -> at most 16 sequences per step
+  if (m1kv::on() || m1d8::on()) max_b = std::min(max_b, kMaxBVRows / kSpecT);
   if (S.bv_max >= max_b) return 0;
   // the verify's logits land in big0 ([rows][VOCAB]): B x 8 rows exceed a 1024-token chunk's scratch from B = 7
   // (1.0.0 wrote past it at the 48gb profile's B = 16 with tiered KV -- into other per-step scratch, by luck)
-  if ((size_t)max_b * kSpecT * VOCAB > S.big0_elems) {
+  const size_t MR = std::min((size_t)max_b * kSpecT, (size_t)kMaxBVRows);
+  if (MR * VOCAB > S.big0_elems) {
     cudaFree(S.big0);
-    S.big0_elems = (size_t)max_b * kSpecT * VOCAB;
+    S.big0_elems = MR * VOCAB;
     if (!(S.big0 = dalloc<bf16>(S.big0_elems))) return (int)cudaErrorMemoryAllocation;
   }
   for (bf16* p : S.kstb) cudaFree(p);
   S.kstb.assign(NL, nullptr);
-  const size_t MR = (size_t)max_b * kSpecT;
   for (int i = 0; i < NL; ++i)
     if (kMixer[i] == 'k' && !(S.kstb[i] = dalloc<bf16>(MR * (2 * KDIM + KHV * KK + KHV))))
       return (int)cudaErrorMemoryAllocation;
   if (!S.bv_d) {
-    S.bv_d = dalloc<int>((size_t)kMaxBV * kRI), S.bv_rng = dalloc<int>((size_t)kMaxBV * kSpecT * 4);
+    S.bv_d = dalloc<int>((size_t)kMaxBV * kRI), S.bv_rng = dalloc<int>((size_t)kMaxBVRows * 4);
     S.bv_slot = dalloc<int>(kMaxBV), S.bv_res = dalloc<int>((size_t)kMaxBV * kBVRes);
     CK(cudaMallocHost(&S.bv_h, (size_t)kMaxBV * kRI * sizeof(int)));
     CK(cudaMallocHost(&S.bv_res_h, (size_t)kMaxBV * kBVRes * sizeof(int)));

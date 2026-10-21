@@ -1,4 +1,5 @@
 #include <vector>
+#include "agens_pdl.cuh"
 // Tensor-parallel all-reduce for the engine's ranks (one process per GPU, kernels/m1 ak_m1_tp_config): a one-shot
 // sum over every rank's exchange region, in rank order, so all ranks hold bit-identical results (the replicated parts
 // of the model -- mHC, norms, Engram, lm_head, drafter -- then stay identical across ranks).
@@ -125,7 +126,8 @@ __global__ void bump_kernel(unsigned* epoch) { *epoch += 1; }
 
 // push all-reduce of x[n] in place (n % 8 == 0): 256 threads, uint4 units grid-strided (the same units in both phases)
 __global__ void __launch_bounds__(256) push_ar_kernel(bf16* __restrict__ x, long units, const __grid_constant__ tp_push::Desc d) {
-  const unsigned e = tp_push::begin(d);
+  const unsigned e = tp_push::begin(d);  // (its griddepcontrol.wait)
+  ak_pdl_launch();
   uint4* xv = reinterpret_cast<uint4*>(x);
   const long stride = (long)gridDim.x * blockDim.x;
   for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i < units; i += stride) tp_push::push(d, e, xv, i);
@@ -157,7 +159,8 @@ __global__ void __launch_bounds__(1024) push_ar_norm_kernel(const bf16* __restri
                                                             const __grid_constant__ tp_push::Desc d) {
   extern __shared__ uint4 srow[];  // the row's s, H / 8 units
   __shared__ float ws[2], rs;
-  const unsigned e = tp_push::begin(d);
+  const unsigned e = tp_push::begin(d);  // (its griddepcontrol.wait)
+  ak_pdl_launch();
   const int U = H / 8, k = threadIdx.x;
   const uint4* mv = reinterpret_cast<const uint4*>(mo);
   for (int r = blockIdx.x; r < rows; r += gridDim.x)
@@ -223,6 +226,7 @@ __global__ void push_arm(unsigned* p, size_t n) {
 }
 }  // namespace
 const tp_push::Desc* ak_tp_push_desc() { return g_push_ok ? &g_push : nullptr; }
+extern "C" int ak_tp_push_on(void) { return g_push_ok ? 1 : 0; }  // the push all-reduce (peer GPUs over CUDA IPC)
 
 // Exchange memory. Device region exported for CUDA IPC (handle: 64 bytes) ...
 extern "C" int ak_tp_region_alloc(size_t bytes, void** dev_ptr, void* ipc_handle) {

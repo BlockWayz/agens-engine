@@ -9,6 +9,7 @@
 //   * TPR > 32: warp sums combined by a second bfly over lanes holding w0..w(k-1) (zero padded)
 //   * mean = div.rn(sum, H); rstd = rsqrt.approx.ftz(mean + eps); y = (x * rstd) * (w + bias), bias 1 for Gemma
 #include "agens_kernels.h"
+#include "agens_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -22,14 +23,16 @@ __device__ __forceinline__ float rsqrt_approx_ftz(float x) {
 // One row per TPR threads; blockDim.x = max(TPR, 32) (TPR < 32 -> 32 / TPR rows per block).
 // ADD: x = bf16(x + xb) elementwise first (torch's bf16 add), written to xsum, then the norm of that (fused residual
 // add + RMSNorm: one launch instead of two, the same bits)
+// (the body takes the block index bx: rmsnorm_cute_kernel passes blockIdx.x, the pair kernel below 0 per row)
 template <int TPR, bool ADD = false>
-__global__ void rmsnorm_cute_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
-                                    __nv_bfloat16* __restrict__ y, int rows, int H, int stride_in, int stride_out,
-                                    float bias, float eps, const __nv_bfloat16* __restrict__ xb = nullptr,
-                                    __nv_bfloat16* __restrict__ xsum = nullptr) {
+__device__ __forceinline__ void rmsnorm_cute_body(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+                                                  __nv_bfloat16* __restrict__ y, int rows, int H, int stride_in,
+                                                  int stride_out, float bias, float eps,
+                                                  const __nv_bfloat16* __restrict__ xb, __nv_bfloat16* __restrict__ xsum,
+                                                  int bx) {
   constexpr int kRowsPerBlock = TPR < 32 ? 32 / TPR : 1;
   const int lane = threadIdx.x % TPR;
-  const int row = blockIdx.x * kRowsPerBlock + threadIdx.x / TPR;
+  const int row = bx * kRowsPerBlock + threadIdx.x / TPR;
   const bool valid = row < rows;
   const int nblk = (H / 8 + TPR - 1) / TPR;
   const __nv_bfloat16* xr = x + (size_t)(valid ? row : 0) * stride_in;
@@ -108,6 +111,30 @@ __global__ void rmsnorm_cute_kernel(const __nv_bfloat16* __restrict__ x, const _
   }
 }
 
+template <int TPR, bool ADD = false>
+__global__ void rmsnorm_cute_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+                                    __nv_bfloat16* __restrict__ y, int rows, int H, int stride_in, int stride_out,
+                                    float bias, float eps, const __nv_bfloat16* __restrict__ xb = nullptr,
+                                    __nv_bfloat16* __restrict__ xsum = nullptr) {
+  ak_pdl_entry();
+  rmsnorm_cute_body<TPR, ADD>(x, w, y, rows, H, stride_in, stride_out, bias, eps, xb, xsum, blockIdx.x);
+}
+// Two RMSNorms of B rows of H (TPR 64) in one launch, each row exactly rmsnorm_cute_kernel<64>'s: blockIdx.y = 0 the
+// embedding rows table[ids[b]] with w0 -> y0 + b * so (the embedding lookup folded in: the same values), 1 the rows
+// x1 + b * H with w1 -> y1 + b * so (the MTP chain's pre-fc norms of the token embedding and the hidden state)
+__global__ void rmsnorm_pair_embed_kernel(const int32_t* __restrict__ ids, const __nv_bfloat16* __restrict__ table,
+                                          const __nv_bfloat16* __restrict__ w0, __nv_bfloat16* __restrict__ y0,
+                                          const __nv_bfloat16* __restrict__ x1, const __nv_bfloat16* __restrict__ w1,
+                                          __nv_bfloat16* __restrict__ y1, int H, int so, float bias, float eps) {
+  ak_pdl_entry();
+  const int b = blockIdx.x;
+  if (blockIdx.y == 0)
+    rmsnorm_cute_body<64, false>(table + (size_t)ids[b] * H, w0, y0 + (size_t)b * so, 1, H, H, so, bias, eps, nullptr,
+                                 nullptr, 0);
+  else
+    rmsnorm_cute_body<64, false>(x1 + (size_t)b * H, w1, y1 + (size_t)b * so, 1, H, H, so, bias, eps, nullptr, nullptr, 0);
+}
+
 template <int TPR>
 void launch(const void* x, const void* w, void* y, int rows, int H, int si, int so, float bias, float eps, cudaStream_t s) {
   constexpr int kRowsPerBlock = TPR < 32 ? 32 / TPR : 1;
@@ -142,3 +169,15 @@ extern "C" int ak_add_rmsnorm(const void* a, const void* b, void* s_out, const v
   return (int)cudaGetLastError();
 }
 
+
+// y0 rows = RMSNorm(table[ids[b]]) * (w0 + bias), y1 rows = RMSNorm(x1 rows) * (w1 + bias), B rows each, row stride so
+// out; the same bits as ak_embed + two ak_rmsnorm launches (H in the TPR 64 range)
+extern "C" int ak_rmsnorm_pair_embed(const int32_t* ids, const void* table, const void* w0, void* y0, const void* x1,
+                                     const void* w1, void* y1, int B, int H, int so, float eps, int gemma, void* stream) {
+  if (H % 8 || H <= 3072 || H > 6144 || B < 1) return (int)cudaErrorInvalidValue;
+  rmsnorm_pair_embed_kernel<<<dim3(B, 2), 64, 0, static_cast<cudaStream_t>(stream)>>>(
+      ids, static_cast<const __nv_bfloat16*>(table), static_cast<const __nv_bfloat16*>(w0), static_cast<__nv_bfloat16*>(y0),
+      static_cast<const __nv_bfloat16*>(x1), static_cast<const __nv_bfloat16*>(w1), static_cast<__nv_bfloat16*>(y1), H, so,
+      gemma ? 1.f : 0.f, eps);
+  return (int)cudaGetLastError();
+}

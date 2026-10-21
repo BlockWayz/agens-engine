@@ -949,6 +949,11 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         eprintln!("m1: W4 k-tiled {:.2} GB + W3 k-tiled {:.2} GB on GPU, small-k W4 as bf16 {:.3} GB; weights placed in \
                    {t_weights:.0} s", w4_gpu as f64 / 1e9, w3_gpu as f64 / 1e9, w4_dense as f64 / 1e9);
     }
+    let dual = agens_cuda::m1::w4h_dual_bytes();
+    if dual > 0 {
+        eprintln!("m1: W4H dual layout: KT kept, W4H copies {:.2} GB for launches of <= {} tokens (AGENS_W4H_MMAX)",
+                  dual as f64 / 1e9, std::env::var("AGENS_W4H_MMAX").unwrap_or_default());
+    }
     w4_prefill_cache(o, budget_cache)?;
     if o.budget_gib > 0.0 && std::env::var("AGENS_M1_PREFILL_RESERVE").map(|v| v != "0").unwrap_or(true) {
         // the plan's prefill temporaries taken now, before any CUDA graph (AGENS_M1_PREFILL_RESERVE=0: 1.3.1's lazy way)

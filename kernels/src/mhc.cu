@@ -7,6 +7,7 @@
 // Not here (they stay library calls, issued like torch): the RMSNorm, the `dyn` GEMM and the res·H bmm.
 
 #include "agens_kernels.h"
+#include "agens_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -257,9 +258,10 @@ mhc_fused_kernel(const MhcFusedArgs a, const __grid_constant__ tp_push::Desc pd,
   namespace cg = cooperative_groups;
   cg::cluster_group cl = cg::this_cluster();
   const int c = (int)cl.block_rank(), t = blockIdx.x / kFC, tid = threadIdx.x;
-  const unsigned pe = ar ? tp_push::begin(pd) : 0u;
   const long punits = (long)T * (kFDim / 8);
   if (t >= T) {  // (ar only) a cluster past the rows: nothing to push or sum
+    const unsigned pe = ar ? tp_push::begin(pd) : (ak_pdl_wait(), 0u);
+    ak_pdl_launch();
     if (ar) tp_push::end(pd, pe, punits);
     return;
   }
@@ -271,21 +273,20 @@ mhc_fused_kernel(const MhcFusedArgs a, const __grid_constant__ tp_push::Desc pd,
   __shared__ __align__(16) float spart[24][32][4];      // GEMV chain results (chain = output block * 8 + w)
   __shared__ __align__(16) __nv_bfloat16 swn[kFDim];    // norm.weight (cp.async at the start)
   __shared__ float sres[16], sd[24], spost[4], sws[4];
+  // in_proj_b weights of this block's k-steps (dynamic, nb_out x kPer x 4 uint4: row q, step u, lane quarter t4)
+  extern __shared__ __align__(16) uint4 swb[];
   MHC_PROF(0, 0)
   for (int v = tid; v < kFDim / 8; v += kFThreads)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((uint32_t)__cvta_generic_to_shared(swn + v * 8)),
                  "l"(a.wn + v * 8) : "memory");
-  asm volatile("cp.async.commit_group;" ::: "memory");
   const int nbo = a.wb ? a.nb_out : 0, nrbb = (nbo + 15) / 16;  // the in_proj_b GEMV: outputs, 16-output blocks
-  if (warp >= 3 && warp - 3 < nrbb && t4 == 0) {  // its weight lines to L2 (read after the combine, norms and dyn)
-    const int q0 = (warp - 3) * 16 + g, q1 = q0 + 8;
-#pragma unroll 4
-    for (int u = 0; u < kFDim / 256; ++u) {
-      const int col = 32 * (c + 8 * u);
-      if (q0 < nbo) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.wb + (size_t)q0 * kFDim + col));
-      if (q1 < nbo) asm volatile("prefetch.global.L2 [%0];" ::"l"(a.wb + (size_t)q1 * kFDim + col));
-    }
+  // its weights to shared memory now (constant data, before the programmatic wait; read after the combine and norms)
+  for (int v = tid; v < nbo * (kFDim / 256) * 4; v += kFThreads) {
+    const int q = v / ((kFDim / 256) * 4), u = (v >> 2) % (kFDim / 256), tq = v & 3;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"((uint32_t)__cvta_generic_to_shared(swb + v)),
+                 "l"(a.wb + (size_t)q * kFDim + 32 * (c + 8 * u) + 8 * tq) : "memory");
   }
+  asm volatile("cp.async.commit_group;" ::: "memory");
   // GEMV chain warps: their weights to registers first (the loads' latency under the combine and the norm)
   constexpr int kSteps = kFDim / 32, kPer = kSteps / 8;  // 160 k-steps, 20 per chain
   uint4 w0[kPer], w1[kPer];
@@ -298,6 +299,9 @@ mhc_fused_kernel(const MhcFusedArgs a, const __grid_constant__ tp_push::Desc pd,
       w1[u] = r1 < 24 ? __ldg(reinterpret_cast<const uint4*>(a.wdyn + (size_t)r1 * kFDim + col)) : make_uint4(0, 0, 0, 0);
     }
   }
+  // programmatic dependent launch: everything above reads constant weights only (agens_pdl.cuh)
+  const unsigned pe = ar ? tp_push::begin(pd) : (ak_pdl_wait(), 0u);  // (begin: its griddepcontrol.wait)
+  ak_pdl_launch();
   const size_t ro = (size_t)t * kFDim + off;
   uint4 hv[4], yv4, yb4, xi4, wl4;
   if (ar && own) tp_push::push(pd, pe, reinterpret_cast<const uint4*>(a.Yb), (long)(ro / 8));  // to every peer's inbox
@@ -312,7 +316,8 @@ mhc_fused_kernel(const MhcFusedArgs a, const __grid_constant__ tp_push::Desc pd,
   if (tid < 4) spost[tid] = ld(a.post + t * 4 + tid);
   if (c == 0 && warp == 2 && lane >= 16) {  // layer i's res (Sinkhorn of its dyn row) -> every block
     const int e = lane - 16;
-    const float rv = sinkhorn16(a.res_s_cur, a.dcur + (size_t)t * 24, e, 16, a.iters);
+    // res_cur: written by the previous boundary (its write_res: the same sinkhorn16 of the same row, as bf16)
+    const float rv = a.res_cur ? ld(a.res_cur + (size_t)t * 16 + e) : sinkhorn16(a.res_s_cur, a.dcur + (size_t)t * 24, e, 16, a.iters);
 #pragma unroll
     for (int q = 0; q < kFC; ++q) *cl.map_shared_rank(&sres[e], q) = rv;
   }
@@ -454,10 +459,9 @@ mhc_fused_kernel(const MhcFusedArgs a, const __grid_constant__ tp_push::Desc pd,
     for (int u0 = 0; u0 < kPer; u0 += kU) {
       uint4 x0[kU], x1[kU];
 #pragma unroll
-      for (int u = 0; u < kU; ++u) {
-        const int col = 32 * (c + 8 * (u0 + u)) + 8 * t4;
-        x0[u] = q0 < nbo ? __ldg(reinterpret_cast<const uint4*>(a.wb + (size_t)q0 * kFDim + col)) : make_uint4(0, 0, 0, 0);
-        x1[u] = q1 < nbo ? __ldg(reinterpret_cast<const uint4*>(a.wb + (size_t)q1 * kFDim + col)) : make_uint4(0, 0, 0, 0);
+      for (int u = 0; u < kU; ++u) {  // (staged in swb at the start: the same values as the global rows)
+        x0[u] = q0 < nbo ? swb[(q0 * kPer + u0 + u) * 4 + t4] : make_uint4(0, 0, 0, 0);
+        x1[u] = q1 < nbo ? swb[(q1 * kPer + u0 + u) * 4 + t4] : make_uint4(0, 0, 0, 0);
       }
 #pragma unroll
       for (int u = 0; u < kU; ++u) {
@@ -540,10 +544,19 @@ extern "C" int ak_mhc_fused_ok() {
   }
   return ok;
 }
+// dynamic shared memory of a launch: the staged in_proj_b weights (nb_out <= 48 rows x 1280 B per block)
+int fused_smem(const MhcFusedArgs* args) {
+  static const bool attr = cudaFuncSetAttribute(mhc_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                48 * (kFDim / 256) * 64) == cudaSuccess;
+  const int nbo = args->wb ? args->nb_out : 0;
+  return attr || nbo * (kFDim / 256) * 64 <= 8192 ? nbo * (kFDim / 256) * 64 : -1;
+}
 extern "C" int ak_mhc_fused(const MhcFusedArgs* args, int T, void* stream) {
   if (T == 0) return 0;
   if (!ak_mhc_fused_ok()) return (int)cudaErrorNotSupported;
-  mhc_fused_kernel<<<T * kFC, kFThreads, 0, static_cast<cudaStream_t>(stream)>>>(*args, tp_push::Desc{}, 0, T);
+  const int sm = fused_smem(args);
+  if (sm < 0) return (int)cudaErrorInvalidValue;
+  mhc_fused_kernel<<<T * kFC, kFThreads, sm, static_cast<cudaStream_t>(stream)>>>(*args, tp_push::Desc{}, 0, T);
   return (int)cudaGetLastError();
 }
 // with layer i's MLP all-reduce folded in (args->Yb = this rank's partial MLP output): cudaErrorNotSupported when the push
@@ -556,6 +569,8 @@ extern "C" int ak_mhc_fused_ar_ok(int T) {
 extern "C" int ak_mhc_fused_ar(const MhcFusedArgs* args, int T, void* stream) {
   if (!ak_mhc_fused_ar_ok(T) || !args->Yb) return (int)cudaErrorNotSupported;
   const tp_push::Desc* d = ak_tp_push_desc();
-  mhc_fused_kernel<<<d->grid, kFThreads, 0, static_cast<cudaStream_t>(stream)>>>(*args, *d, 1, T);
+  const int sm = fused_smem(args);
+  if (sm < 0) return (int)cudaErrorInvalidValue;
+  mhc_fused_kernel<<<d->grid, kFThreads, sm, static_cast<cudaStream_t>(stream)>>>(*args, *d, 1, T);
   return (int)cudaGetLastError();
 }

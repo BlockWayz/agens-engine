@@ -401,7 +401,7 @@ pub(crate) fn finish_mtp(m: &Mtp, cap_rows: usize) -> Result<()> {
 /// sequence of a batched verify (AGENS_SPEC_BATCH_MAX; 1 without), the W4 dequant tile.
 pub(crate) fn mtp_reserve(cap_rows: usize, sessions: usize) -> (String, usize) {
     let ns = batch_max().max(1);
-    let rows = cap_rows.clamp(8, 256).max(8 * ns);  // m1_mtp.cu kMatRows
+    let rows = cap_rows.clamp(8, 256).max((8 * ns).min(128));  // m1_mtp.cu kMatRows; a batched verify's <= 128 rows
     let hid = 5120usize;
     let per_row = 7 * hid * 2 + 2 * 1024 * 2 + 8;
     let per_seq = 2 * hid * 2 + 2 * 6144 * 2 + 3 * 6144 * 2 + 7 * 2 * 1024 * 2 + 3 * 17408 * 2 + 248320 * 2
@@ -415,8 +415,10 @@ pub(crate) fn mtp_reserve(cap_rows: usize, sessions: usize) -> (String, usize) {
 /// drafter's own (KV ring, rope, context buffers).
 pub(crate) fn finish_drafter(d: &Drafter, cap_rows: usize) -> Result<()> {
     agens_cuda::m1::spec_init(true, Some(d.ids), cap_rows)?;
-    // AGENS_SPEC_BATCH_MAX=B: batched speculative decoding of up to B sequences per step (server mode)
-    let bmax = batch_max();
+    // AGENS_SPEC_BATCH_MAX=B: batched speculative decoding of up to B sequences per step (server mode); with the
+    // drafter at most 16 (its batched buffers were not re-gated past 16: a larger --max-batch verifies 16 rows per
+    // step and decodes the rest plainly)
+    let bmax = batch_max().min(DRAFTER_BATCH_MAX);
     if bmax > 0 {
         agens_cuda::m1::spec_batch_init(bmax)?;
     }
@@ -434,8 +436,12 @@ pub(crate) fn finish_drafter(d: &Drafter, cap_rows: usize) -> Result<()> {
     Ok(())
 }
 
+/// Sequences per batched verify step (AGENS_SPEC_BATCH_MAX; 0 = none). 1.3.4: up to 64 (was 16) with the MTP head
+/// alone; the verify's B x TV rows stay <= 128 (m1_model.cu kMaxBVRows: TV 2 from B = 2 on sm90).
+pub(crate) const BATCH_MAX: usize = 64;
+pub(crate) const DRAFTER_BATCH_MAX: usize = 16;
 pub(crate) fn batch_max() -> usize {
-    std::env::var("AGENS_SPEC_BATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(16)
+    std::env::var("AGENS_SPEC_BATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(BATCH_MAX)
 }
 /// Device bytes finish_drafter will allocate (for the memory plan): kernels/m1 spec_init + m1_draft.cu setup.
 /// `drafter` false (copy-only drafting, MTP alone): no drafter ring / buffers and no target capture.
@@ -448,6 +454,9 @@ pub(crate) fn spec_reserve(cap_rows: usize, kda_layers: usize, w4: bool, wctx: u
     let cap: usize = std::env::var("AGENS_SPEC_FAR_CACHE").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
     let means = std::env::var("AGENS_KV_TIER").map(|v| v == "2").unwrap_or(false);
     let cache = if union && means && cap > 0 { bcsa_layers * (cap * (8 + 2 * 2048) + nb * 4 + 4096) } else { 0 };
+    // batched verify: B sequences (the drafter: at most 16), stash / logits rows B x 8 up to 128 (kMaxBVRows)
+    let bm = if drafter { batch_max().min(DRAFTER_BATCH_MAX) } else { batch_max() };
+    let brows = (8 * bm).min(128);
     let mut v = vec![
         (format!("spec: far-branch union cache ({cap} blocks x {bcsa_layers} layers)"), cache),
         // ak_far_decode_multi_ws_bytes(wctx, 8): block keys + marks + union block means + one query's scratch
@@ -463,14 +472,14 @@ pub(crate) fn spec_reserve(cap_rows: usize, kda_layers: usize, w4: bool, wctx: u
         ("drafter: W4 dequant scratch".to_string(), if w4 { 16 << 20 } else { 0 }),
         // batched speculation (AGENS_SPEC_BATCH_MAX = B): KDA stash for 8 B rows; drafter rings, one per KDA slot (the
         // plan's sessions + 1 is approximated by 2 B + 1) and 8 B-row buffers; the two batched attention slots
-        ("spec: batched KDA stash".to_string(), kda_layers * 8 * batch_max() * (2 * kdim + 48 * 128 + 48) * 2),
-        ("drafter: batched rings + buffers".to_string(), if batch_max() > 0 {
-            2 * batch_max() * 2 * 5 * 4096 * 1024 * 2 + 8 * batch_max() * (248320 * 2 + 2 * 17408 * 2 + 32 * 9 * 128 * 4)
+        ("spec: batched KDA stash".to_string(), kda_layers * brows * (2 * kdim + 48 * 128 + 48) * 2),
+        ("drafter: batched rings + buffers".to_string(), if bm > 0 {
+            2 * bm * 2 * 5 * 4096 * 1024 * 2 + 8 * bm * (248320 * 2 + 2 * 17408 * 2 + 32 * 9 * 128 * 4)
         } else { 0 }),
         // the batched verify's logits ([8 B][VOCAB] bf16) beyond the prefill chunk's scratch (1024 x 24 x 512 bf16)
-        ("spec: batched verify logits".to_string(), (8 * batch_max() * 248320 * 2).saturating_sub(1024 * 24 * 512 * 2)),
-        ("attention: batched verify slots".to_string(), if batch_max() > 0 {
-            let r = 8 * batch_max().max(2);
+        ("spec: batched verify logits".to_string(), (brows * 248320 * 2).saturating_sub(1024 * 24 * 512 * 2)),
+        ("attention: batched verify slots".to_string(), if bm > 0 {
+            let r = (8 * bm.max(2)).min(128);
             r * (4104 + wctx) * 4 + 2 * r * 66 * (24 * 256 * 2 + 24 * 4)
         } else { 0 }),
     ];

@@ -31,6 +31,7 @@
 //          points with the linear's bit width; every (bits, group) is bit-identical to W4 KT of that group.
 
 #include "agens_kernels.h"
+#include "agens_pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -45,6 +46,7 @@ int agens_kf_dequant_rows(const void* wt, const void* st, void* w, int n, int k,
 // W4H layout (w4h.cu, sm90 / sm100; AGENS_W4H=1): repack (1 = not handled), membership, forget
 int agens_w4h_repack(const int32_t* packed, const void* scales, void* wt, void* st, int n, int k, cudaStream_t s);
 bool agens_w4h_is(const void* wt);
+bool agens_w4h_dual(const void* wt, int m, const void** w2, const void** s2);
 void agens_w4h_forget(const void* wt);
 #include <stdint.h>
 #include <stdio.h>
@@ -252,6 +254,25 @@ struct KtSegs {
 };
 // tensor-core path (end of file)
 bool mma_on(int group, int bf16w);
+// L2 prefetch of the KT weights + scales of global row block rb (16 rows, every k-tile: 16 x 512 B + 16 x 16 B per tile,
+// contiguous), threads tid < nthr of the block; issued before ak_pdl_wait (constant data), so the loads after it hit L2
+__device__ __forceinline__ void kt_prefetch_rb(const KtSegs& segs, int rb, int ntile, int tid, int nthr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  const int g0 = rb << 4;
+  if (g0 >= segs.end[segs.nseg - 1]) return;
+  int sg = 0;
+#pragma unroll
+  for (int j = 1; j < kMaxSegs; ++j) sg += j < segs.nseg && g0 >= segs.end[j - 1];
+  const int n = segs.n[sg], lr = g0 - (sg ? segs.end[sg - 1] : 0), rows = n - lr < 16 ? n - lr : 16;
+  if (rows <= 0) return;
+  for (int t = tid; t < ntile; t += nthr) {
+    const uint4* w = segs.wt[sg] + ((size_t)t * n + lr) * 32;
+    const __nv_bfloat16* sc = segs.st[sg] + ((size_t)t * n + lr) * 8;
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(w), "r"(rows * 512) : "memory");
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(sc), "r"(rows * 16) : "memory");
+  }
+#endif
+}
 int mma_segs(const void* x, int m, const KtSegs& g, int k, cudaStream_t s, int group, int bits);
 KtSegs make_segs(int nseg, const void* const* wt, const void* const* st, void* const* y, const int* n, int R);
 
@@ -656,6 +677,13 @@ namespace {
 // segment; none -> -1 (not handled here). W4H has only the tensor-core numerics (group 128, bf16w = 0).
 int w4h_route(const void* x, int m, int nseg, const void* const* wt, const void* const* st, void* const* y,
               const int* n, const int* ldy, int k, int group, int bf16w, void* stream) {
+  const void *w2[kMaxSegs], *s2[kMaxSegs];  // dual layout: the W4H copies for this m (w4h.cu)
+  int nd = 0;
+  for (int i = 0; i < nseg && i < kMaxSegs; ++i) {
+    if (agens_w4h_dual(wt[i], m, &w2[i], &s2[i])) ++nd;
+    else w2[i] = wt[i], s2[i] = st[i];
+  }
+  if (nd) wt = w2, st = s2;
   int nh = 0;
   for (int i = 0; i < nseg; ++i) nh += agens_w4h_is(wt[i]);
   if (!nh) return -1;
@@ -968,6 +996,7 @@ template <int WARPS, int U, int BITS = 4>
 __global__ void __launch_bounds__(WARPS * 32)
 w4_mma_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant__ KtSegs segs, int k) {
   __shared__ float red[WARPS][32][4];
+  ak_pdl_entry();
   const int kp = (k + 1023) & ~1023, steps = (kp >> 10) * 8, kc = k >> 5;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
   const int nblk = segs.end[segs.nseg - 1] >> 4;
@@ -1776,6 +1805,19 @@ int nt_segs(const void* x, int m, const KtSegs& g, int k, cudaStream_t s) {
     const int e = launch_gsnt_any(x, m, g, k, s, BITS, G64);
     if (e >= 0) return e;
   }
+  // 32 < m <= 48 (e.g. a batched verify of 24 sequences x 2): one 32-token launch, then the rest on the 16-token tiles
+  // (rows bit-identical for any launch shape) instead of a second, mostly empty 32-token tile per block (sm90 bench_w4h,
+  // m = 48: gate_up 94.9 -> 90.5 us, q_proj 39.0 -> 34.7, out_proj 28.9 -> 25.0; at m = 80 the split was slower for the
+  // n = 5120 shapes, so only below 64). AGENS_W4_GEMM_SPLIT=0: off
+  static const bool split = [] { const char* e = getenv("AGENS_W4_GEMM_SPLIT"); return !(e && e[0] == '0'); }();
+  if (split && m > 32 && m <= 48 && gemm_ntt(m) == 8442 && gemm_ntt(m - 32) == 8222) {
+    const int m1 = m / 32 * 32;
+    KtSegs gg = g;
+    for (int i = 0; i < g.nseg; ++i) gg.y[i] = g.y[i] + (size_t)m1 * g.ldy[i];
+    const int e1 = nt_segs<G64, BITS>(x, m1, g, k, s);
+    if (e1) return e1;
+    return nt_segs<G64, BITS>(static_cast<const __nv_bfloat16*>(x) + (size_t)m1 * k, m - m1, gg, k, s);
+  }
   // AGENS_W4_GEMM = RB * 100 + NTT * 10 + STAGES (0: off); -1 from a launch = shared memory too small -> fall back
   int e = -1;
   switch (gemm_ntt(m)) {
@@ -1831,6 +1873,9 @@ template <int RB>
 __global__ void __launch_bounds__(256)
 w4_lean_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_constant__ KtSegs segs, int k) {
   __shared__ float red[8][32][4 * RB];
+#pragma unroll
+  for (int r = 0; r < RB; ++r) kt_prefetch_rb(segs, blockIdx.x * RB + r, k >> 10, threadIdx.x, 256);
+  ak_pdl_entry();
   const int ntile = k >> 10;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3, i = warp;
   const int c = 4 * i + t4;
@@ -1944,9 +1989,11 @@ w4_gsplit_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_consta
                  float* __restrict__ part, unsigned* __restrict__ cnt) {
   __shared__ uint4 xs[2][4][8][4];  // [buf][q4][token g][t4]: lane (g, t4)'s B words 4 q4 .. 4 q4 + 3 of the tile
   __shared__ int last_s;
-  const int ntile = k >> 10;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
   const int item = blockIdx.x >> 3, i = blockIdx.x & 7, c = 4 * i + t4;
+  // the k-tiles where group 8 t + i exists (k % 1024 = 512: the last, half tile has groups 0..3 only; the KT kernel adds
+  // an exact 0 for the padding groups, which leaves every sum unchanged)
+  const int ntile = ((k >> 7) - i + 7) >> 3;
   const int nblk = segs.end[segs.nseg - 1] >> 4;
   const int rb = item * 8 + warp;
   const bool live = rb < nblk;
@@ -1970,7 +2017,6 @@ w4_gsplit_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_consta
     xs[buf][st_wd][st_tok][st_t4] = o;
   };
   uint4 xn = make_uint4(0, 0, 0, 0);
-  if (threadIdx.x < 128) xn = __ldg(xsrc);
   int sg = 0, n = 0, r0 = 0;
   {
     const int g0 = (live ? rb : nblk - 1) << 4;
@@ -1980,21 +2026,31 @@ w4_gsplit_kernel(const __nv_bfloat16* __restrict__ x, int m, const __grid_consta
   }
   const uint4* wp = segs.wt[sg] + (size_t)r0 * 32 + c;
   const __nv_bfloat16* sp = segs.st[sg] + (size_t)r0 * 8 + i;
+  // the weights two k-tiles ahead (tiles 0 and 1 before the programmatic wait: constant data)
   uint4 w0 = ld_stream(wp), w1 = ld_stream(wp + 8 * 32);
   float s0 = __bfloat162float(sp[0]), s1 = __bfloat162float(sp[64]);
+  uint4 v0 = w0, v1 = w1;
+  float vs0 = s0, vs1 = s1;
+  if (ntile > 1) {
+    const size_t o = (size_t)n;
+    v0 = ld_stream(wp + o * 32), v1 = ld_stream(wp + o * 32 + 8 * 32);
+    vs0 = __bfloat162float(sp[o * 8]), vs1 = __bfloat162float(sp[o * 8 + 64]);
+  }
+  ak_pdl_entry();  // the weight loads above are constant data; x, part and cnt after the wait
+  if (threadIdx.x < 128) xn = __ldg(xsrc);
   if (threadIdx.x < 128) stage(0, 0, xn);
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
   for (int t = 0; t < ntile; ++t) {
     const int buf = t & 1;
     __syncthreads();  // tile t staged; the other buffer's readers (tile t - 1) are done
-    uint4 nw0 = w0, nw1 = w1;
-    float ns0 = s0, ns1 = s1;
-    if (t + 1 < ntile) {
-      const size_t o = (size_t)(t + 1) * n;
-      nw0 = ld_stream(wp + o * 32), nw1 = ld_stream(wp + o * 32 + 8 * 32);
-      ns0 = __bfloat162float(sp[o * 8]), ns1 = __bfloat162float(sp[o * 8 + 64]);
-      if (threadIdx.x < 128) xn = __ldg(xsrc + (size_t)(t + 1) * 128);
+    uint4 nw0 = v0, nw1 = v1;
+    float ns0 = vs0, ns1 = vs1;
+    if (t + 2 < ntile) {
+      const size_t o = (size_t)(t + 2) * n;
+      v0 = ld_stream(wp + o * 32), v1 = ld_stream(wp + o * 32 + 8 * 32);
+      vs0 = __bfloat162float(sp[o * 8]), vs1 = __bfloat162float(sp[o * 8 + 64]);
     }
+    if (t + 1 < ntile && threadIdx.x < 128) xn = __ldg(xsrc + (size_t)(t + 1) * 128);
     uint32_t xb[16];
 #pragma unroll
     for (int q4 = 0; q4 < 4; ++q4) {
@@ -2079,6 +2135,12 @@ bool lean_ok(const KtSegs& g, int k) {
     if (g.n[i] & 15) return false;
   return true;
 }
+bool gsplit_ok(const KtSegs& g, int k) {  // the group split also takes a half last k-tile
+  if (k & 511) return false;
+  for (int i = 0; i < g.nseg; ++i)
+    if (g.n[i] & 15) return false;
+  return true;
+}
 // AGENS_W4_LEAN=RB (1 / 2 / 4, 8 = group split; 0 = off); default on sm90: group split for k >= 12288, RB 2 for
 // >= 5 x SMs row blocks (gate_up, attention q), else 1 (sm90 m = 8: gate_up 40.8 -> 37.3 us, down 26.1 -> 23.5, KDA qkv 17.2 -> 13.2); ak_w4_set_lean overrides
 int g_lean = -1;
@@ -2093,7 +2155,8 @@ int lean_rb(int nblk, int k) {
     v = e ? atoi(e) : major == 9 ? -1 : 0;
   }
   // auto: the group split for long k (MLP down, k = 17408: 23.5 -> 21.1 us), else RB 2 / 1 by row blocks
-  return v == -1 ? (k >= 12288 ? 8 : nblk >= 5 * num_sms() ? 2 : 1) : v;
+  // (k % 1024 = 512, e.g. the MLP down at tp2, k = 8704: only the group split takes it -- 15.5 -> ~11 us at 8 tokens)
+  return v == -1 ? (k >= 12288 || (k & 1023) ? 8 : nblk >= 5 * num_sms() ? 2 : 1) : v;
 }
 // sm90 g128 W4 path: the same MMA chain and accumulation order as w4_mma_kernel<8, 1> -- warp w takes group
 // i = w of every k-tile in increasing tile order, then the 8 warps' sums in warp order -- so every output is bit-identical
@@ -2504,7 +2567,7 @@ template <int BITS>
 int mma_launch(const void* x, int m, const KtSegs& g, int k, cudaStream_t s) {
   if (BITS == 4) {
     // (fewer row blocks than SMs: the register path below, with its loads batched, is the faster one there)
-    if (const int rb = lean_rb(g.end[g.nseg - 1] >> 4, k); rb && lean_ok(g, k) && (g.end[g.nseg - 1] >> 4) >= num_sms()) {
+    if (const int rb = lean_rb(g.end[g.nseg - 1] >> 4, k); rb && gsplit_ok(g, k) && (g.end[g.nseg - 1] >> 4) >= num_sms()) {
       if (rb == 8) {
         const int e = launch_gsplit(x, m, g, k, s);
         if (e >= 0) return e;

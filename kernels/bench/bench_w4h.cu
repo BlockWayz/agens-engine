@@ -6,7 +6,8 @@
 //   * correctness vs an fp64 GPU reference of the dequantized weights (q - 8) * s: max |err| / max |ref| per launch.
 //   * batch invariance: rows of an m-row launch == the same rows of the 128-row launch, and == m = 1 launches of those
 //     rows, bitwise.
-// Usage: bench_w4h [impl: kt | w4h | both] [shape filter substring] [m list, e.g. 1,8,16]
+// Usage: bench_w4h [impl: kt | w4h | both] [shape filter substring] [m list, e.g. 1,8,16]; BENCH_PDL=1: programmatic
+// edges between the timed launches (ak_graph_pdl)
 #include "agens_kernels.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -74,6 +75,8 @@ static const Shape kShapes[] = {
     {"kda.out_proj", 5120, 3072, 54},    {"attn.q_proj", 6144, 5120, 18},   {"attn.k_proj", 512, 5120, 18},
     {"attn.v_proj", 512, 5120, 18},      {"attn.o_proj", 5120, 3072, 18},   {"mlp.gate_up", 17408, 5120, 72},
     {"mlp.down_proj", 5120, 8704, 72},
+    // the fused launches (one multi-segment launch: rows are row blocks either way): not in the per-step totals
+    {"kda.qkv|z|f_down", 8320, 5120, 0}, {"attn.q|k|v", 7168, 5120, 0},
 };
 
 struct Impl {
@@ -181,7 +184,8 @@ int main(int argc, char** argv) {
       Impl* im = impls[ii];
       // weight copies: >= 8 x L2 of weights in the cycle
       const size_t one = ak_w4_kt_weight_bytes(n, k);
-      const int copies = std::max(2, (int)((8.0 * l2) / one) + 1);
+      // BENCH_L2=1: one copy (weights L2-resident after the first launch: the compute floor)
+      const int copies = getenv("BENCH_L2") ? 1 : std::max(2, (int)((8.0 * l2) / one) + 1);
       std::vector<void*> W(copies), S(copies);
       for (int c = 0; c < copies; ++c) im->prepare(dp, ds, n, k, &W[c], &S[c]);
       const int iters = std::max(iters0, std::min(copies, 4000));
@@ -217,6 +221,7 @@ int main(int argc, char** argv) {
         CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
         for (int i = 0; i < iters; ++i) CK(im->run(dx, W[i % copies], S[i % copies], dy, m, n, k, st));
         CK(cudaStreamEndCapture(st, &g));
+        if (getenv("BENCH_PDL")) ak_graph_pdl(g);  // programmatic edges between the launches (agens_pdl.cuh)
         CK(cudaGraphInstantiate(&ge, g, 0));
         cudaEvent_t e0, e1;
         CK(cudaEventCreate(&e0));
