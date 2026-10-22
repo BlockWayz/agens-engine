@@ -7,5 +7,9 @@ fn main() {
     }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/build");
     let dir = std::env::var("AGENS_KERNELS_BUILD").unwrap_or_else(|_| root.to_string_lossy().into_owned());
-    println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{dir}");
+    // MSVC's linker has no rpath concept (DLLs resolve from PATH/side-by-side); `-Wl` link args do not apply to it, so only
+    // pass the GNU-style rpath when linking on a non-Windows target.
+    if !std::env::var("TARGET").unwrap_or_default().contains("-windows-") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{dir}");
+    }
 }

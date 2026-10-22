@@ -15,7 +15,21 @@ find_package(CUDAToolkit 12.4 REQUIRED)
 # --fmad=false is NOT global: bit-exact kernels opt out of contraction per expression (__fmul_rn/__fadd_rn),
 # quantised-path kernels keep FMA.
 set(AGENS_CUDA_FLAGS --expt-relaxed-constexpr -lineinfo -Xptxas=-v)
+# Two MSVC-only project-wide mechanisms, applied to every CUDA TU in this tree; a no-op on other platforms.
+# CCCL (libcudacxx) rejects cl.exe's traditional preprocessor, so /Zc:preprocessor is routed to cl via -Xcompiler;
+# and the shim force-include covers what CUDA 13.x's MSVC host path cannot parse in FlashInfer headers
+# (bare `ushort` / GCC function-scope attributes) — a no-op for conforming code.
+if(MSVC)
+  add_compile_options(-Xcompiler=/Zc:preprocessor -include ${CMAKE_CURRENT_SOURCE_DIR}/oracle/fi_msvc_shim.h)
+endif()
 
+# MSVC emits an import library only when the DLL exports symbols, and nvcc ignores __declspec in .cu host code
+# (warning #1865), so each shared target's extern "C" entrypoints are exported explicitly via /DEF.
+function(agens_msvc_exports target def)
+  if(MSVC)
+    target_link_options(${target} PRIVATE "/DEF:${def}")
+  endif()
+endfunction()
 set(AGENS_SOURCES
   src/runtime.cu
   src/w4_gemv.cu
@@ -48,6 +62,7 @@ add_library(agens_kernels_py SHARED ${AGENS_SOURCES})
 target_include_directories(agens_kernels_py PUBLIC include)
 target_compile_options(agens_kernels_py PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${AGENS_CUDA_FLAGS}>)
 target_link_libraries(agens_kernels_py PUBLIC CUDA::cudart CUDA::cublas CUDA::cuda_driver)
+agens_msvc_exports(agens_kernels_py ${CMAKE_CURRENT_SOURCE_DIR}/py_exports.def)
 
 if(AGENS_BUILD_BENCH)
   add_executable(bench_gemv bench/bench_gemv.cu)
@@ -81,6 +96,7 @@ if(AGENS_BUILD_ORACLE)
     target_compile_options(agens_oracle_${variant} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr
       -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_F16 $<$<STREQUAL:${variant},fastmath>:--use_fast_math>>)
     target_link_libraries(agens_oracle_${variant} PUBLIC CUDA::cudart)
+    agens_msvc_exports(agens_oracle_${variant} ${CMAKE_CURRENT_SOURCE_DIR}/oracle/norm_exports.def)
   endforeach()
   # BCSA local decode: flashinfer's AOT batch_prefill module flags (-use_fast_math -O3 -DNDEBUG, c++17)
   add_library(agens_oracle_attn SHARED oracle/bcsa_local_oracle.cu)
@@ -91,6 +107,7 @@ if(AGENS_BUILD_ORACLE)
   target_compile_options(agens_oracle_attn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -use_fast_math
     -DNDEBUG -DFLASHINFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2>)
   target_link_libraries(agens_oracle_attn PUBLIC CUDA::cudart)
+  agens_msvc_exports(agens_oracle_attn ${CMAKE_CURRENT_SOURCE_DIR}/oracle/attn_exports.def)
   # separate .so: the windowed-prefill module defines the same generated types with a different config
   add_library(agens_oracle_prefill SHARED oracle/bcsa_prefill_oracle.cu)
   target_include_directories(agens_oracle_prefill BEFORE PRIVATE ${FI}/cccl/libcudacxx/include ${FI}/cccl/cub
@@ -98,22 +115,35 @@ if(AGENS_BUILD_ORACLE)
   target_compile_options(agens_oracle_prefill PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -use_fast_math
     -DNDEBUG -DFLASHINFER_ENABLE_F16 -DFLASHINFER_ENABLE_BF16 -DFLASHINFER_ENABLE_FP8_E4M3 -DFLASHINFER_ENABLE_FP8_E5M2>)
   target_link_libraries(agens_oracle_prefill PUBLIC CUDA::cudart)
+  agens_msvc_exports(agens_oracle_prefill ${CMAKE_CURRENT_SOURCE_DIR}/oracle/prefill_exports.def)
 endif()
 
 # ---- M1 PARITY BRIDGE (oracle tree): BCSA far branch through libtorch's own ops, built as a separate CMake project
 # (find_package(Torch) would rewrite this project's CUDA flags). Pass -DAGENS_TORCH_PREFIX=<torch cmake prefix>.
 if(AGENS_BUILD_ORACLE AND AGENS_TORCH_PREFIX)
   set(BRIDGE_DIR ${CMAKE_BINARY_DIR}/bridge)
-  add_custom_command(OUTPUT ${BRIDGE_DIR}/libagens_oracle_bridge.so
-    COMMAND ${CMAKE_COMMAND} -S ${CMAKE_CURRENT_SOURCE_DIR}/oracle/bridge -B ${BRIDGE_DIR}
+  # The MSVC link step emits both the DLL and its import library, so the command must list both.
+  if(MSVC)
+    set(BRIDGE_OUTPUTS ${BRIDGE_DIR}/agens_oracle_bridge.dll ${BRIDGE_DIR}/agens_oracle_bridge.lib)
+  else()
+    set(BRIDGE_OUTPUTS ${BRIDGE_DIR}/libagens_oracle_bridge.so)
+  endif()
+  list(GET BRIDGE_OUTPUTS 0 BRIDGE_ARTIFACT)
+  add_custom_command(OUTPUT ${BRIDGE_OUTPUTS}
+    COMMAND ${CMAKE_COMMAND} -G ${CMAKE_GENERATOR} -S ${CMAKE_CURRENT_SOURCE_DIR}/oracle/bridge -B ${BRIDGE_DIR}
             -DCMAKE_PREFIX_PATH=${AGENS_TORCH_PREFIX} -DCMAKE_BUILD_TYPE=Release
     COMMAND ${CMAKE_COMMAND} --build ${BRIDGE_DIR} -j
     DEPENDS oracle/bridge/far_bridge.cpp oracle/bridge/vision.cpp oracle/bridge/CMakeLists.txt)
-  add_custom_target(agens_oracle_bridge_build DEPENDS ${BRIDGE_DIR}/libagens_oracle_bridge.so)
+  add_custom_target(agens_oracle_bridge_build DEPENDS ${BRIDGE_ARTIFACT})
   add_library(agens_oracle_bridge SHARED IMPORTED)
-  set_target_properties(agens_oracle_bridge PROPERTIES IMPORTED_LOCATION ${BRIDGE_DIR}/libagens_oracle_bridge.so)
+  set_target_properties(agens_oracle_bridge PROPERTIES IMPORTED_LOCATION ${BRIDGE_ARTIFACT})
+  if(MSVC)
+    list(GET BRIDGE_OUTPUTS 1 BRIDGE_IMPLIB)
+    set_property(TARGET agens_oracle_bridge APPEND PROPERTY IMPORTED_IMPLIB ${BRIDGE_IMPLIB})
+  endif()
   add_dependencies(agens_oracle_bridge agens_oracle_bridge_build)
   # ---- M1 model (bf16 tp1 standalone forward over the parity bridges)
   add_library(agens_m1 SHARED m1/m1_model.cu m1/m1_kv.cu m1/m1_draft.cu m1/m1_mtp.cu m1/m1_dense8.cu)
   target_link_libraries(agens_m1 PUBLIC agens_kernels agens_oracle_attn agens_oracle_prefill agens_oracle_bridge)
+  agens_msvc_exports(agens_m1 ${CMAKE_CURRENT_SOURCE_DIR}/m1/m1_exports.def)
 endif()
