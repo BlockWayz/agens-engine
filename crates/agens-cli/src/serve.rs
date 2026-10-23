@@ -10,16 +10,18 @@
 //! Sessions: a request with a session hint (`session_id` / `X-Session-Id`) is a conversation. Its main engine session
 //! holds the prompt minus its last token; generation runs on a fork (KV rows shared, KDA state copied). The next turn
 //! reuses the main session when its tokens are a prefix of the new prompt and prefills only the new part. Idle
-//! conversations are parked (KDA state + GPU window rings to pinned host RAM) when slots run short, and freed (LRU)
-//! when KV pool rows run short or past --max-convs.
+//! conversations are parked (KDA state + GPU window rings to pinned host RAM) when slots run short, and freed when KV
+//! pool rows run short (KvPolicy's order) or past --max-convs (LRU).
 //!
 //! Prefix cache (1.3.2, prefix.rs; --prefix-cache-gib, default 16 per rank outside budget mode): every
 //! request that starts a session from scratch -- no session id, or a conversation's first / mismatched turn -- restores
 //! the longest snapshotted boundary (a multiple of the prefill chunk) of its prompt and prefills only the rest; a request
 //! without a session id whose whole prompt was seen before restores that prompt's end and decodes at once. Greedy output
 //! is token-identical to the cold run (the chunks are the same). KV rows grow lazily (admission takes the prompt's rows,
-//! each prefill chunk / decode step tops up); idle conversations and prefix snapshots are evicted in one LRU order when
-//! rows run short, each eviction logged.
+//! each prefill chunk / decode step tops up); idle conversations and prefix snapshots are evicted when rows run short,
+//! each eviction logged. 1.3.5: admission and every step pass a banker's check over the pool (KvPolicy), so a running
+//! request never ends for lack of rows; snapshots go before conversations, and conversations whose next turn is queued
+//! or likely imminent go last.
 //!
 //! Speculative decoding (personal mode, --spec-drafter DIR): a DFlash2 drafter proposes 7 tokens per step and the
 //! target verifies the 8-token block (`agens m1-spec`); the engine then runs batch-invariant, so greedy output is
@@ -66,8 +68,6 @@ fn chunk() -> usize {
     static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *C.get_or_init(crate::plan::chunk)
 }
-/// KV rows taken at admission beyond the prompt (rows grow lazily from there: Engine::ensure_rows)
-const DECODE_HEADROOM: usize = 64;
 const MAX_BATCH: usize = 64; // --max-batch in server mode (kernels/m1/m1_model.cu kMaxBatch)
 static PROF_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PROF_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -197,6 +197,7 @@ struct Job {
     sp: SamplingParams,
     conv: Option<String>,
     tx: mpsc::Sender<Result<Vec<u32>, BackendError>>,
+    t_sub: Instant, // when it was submitted (admission: how long it has waited)
 }
 
 pub struct EngineBackend {
@@ -221,6 +222,7 @@ impl EngineBackend {
             sp: sampling,
             conv: session.map(|s| s.session_id),
             tx: tx.clone(),
+            t_sub: Instant::now(),
         };
         if self.tx.lock().unwrap().send(job).is_err() {
             let _ = tx.try_send(Err(BackendError("engine thread is gone".into())));
@@ -295,6 +297,9 @@ struct Act {
     pset: bool,                         // its session's device penalty state is set (sync_penalty)
     dsamp: Option<SpecSampling>,        // plain decode steps sampled on the device (AGENS_DEV_SAMPLE != 0; t > 0)
     pen_new: Vec<u32>,                  // emitted tokens not yet in the device penalty counts (penalised requests)
+    paused: u64,                        // steps it sat out (KV rows reserved for the requests ahead of it)
+    prefilled: usize,                   // prompt tokens it prefilled (the rest came from its conversation / a snapshot)
+    first_at: Option<Instant>,          // when it emitted its first token
 }
 
 /// The request's lookup index (prompt + the bonus token), built on first use.
@@ -330,6 +335,93 @@ struct Engine {
     pen_ok: bool,           // penalties / logit bias in the speculative accept (one device per rank, AGENS_SPEC_PEN != 0)
     dev_sample: bool,       // sampled plain decode rows on the device (one device per rank, AGENS_DEV_SAMPLE != 0)
     pc: Option<crate::prefix::PrefixCache>, // prefix cache (--prefix-cache-gib; None: off)
+    kv: KvPolicy,
+}
+
+/// KV pool admission and eviction (1.3.5). Rows grow lazily, so the pool is over-committed: every request may still
+/// take up to its prompt rest + max_new_tokens rows. A step is granted only when, after it, some order exists in which
+/// every running request can take all the rows it may still need from the free rows plus what idle conversations and
+/// prefix snapshots would give back, plus what the requests before it in that order return when they finish (a
+/// banker's check over one resource). A request whose step is not granted sits it out (its state is untouched, so its
+/// output is the same as an uninterrupted run's, bit for bit); one is always granted while the state is safe, so no
+/// running request ends for lack of rows (1.3.4 ended the newest with "KV pool full").
+/// Eviction (when rows are actually short): prefix snapshots whose pages no one else holds (LRU), then idle
+/// conversations that have no turn queued and have been idle past the hold window (LRU), then those idle within it,
+/// then those whose next turn is queued (both most recently used first: Engine::victim).
+/// Admission of a request that does not continue a resident conversation counts only what the first two classes give
+/// back (so it waits rather than evict a conversation whose next turn is queued or likely imminent); a request that
+/// starts a conversation also waits while the conversations' working set -- the rows of every busy or protected
+/// conversation plus AGENS_SERVE_CONV_GROWTH each, and every running request's remaining rows -- would not fit in the
+/// pool with it: more long conversations than the pool holds would evict each other's state every turn (each turn a
+/// full re-prefill), so they take turns instead. Both until the request has waited
+/// AGENS_SERVE_ADMIT_WAIT_S (only while other requests run: they free rows; not in budget mode); continuations of
+/// resident conversations may pass a head request that waits.
+struct KvPolicy {
+    protect: bool,          // AGENS_SERVE_CONV_PROTECT (default 1 outside budget mode)
+    hold: f64,              // AGENS_SERVE_CONV_HOLD_S: a conversation idle for less is "imminent" (default 10)
+    admit_wait: f64,        // AGENS_SERVE_ADMIT_WAIT_S: after this long a waiting request may evict those too (default 600)
+    bypass: usize,          // AGENS_SERVE_BYPASS_TOKENS: sessionless prompts this short pass a waiting request (16384)
+    growth: usize,          // AGENS_SERVE_CONV_GROWTH: rows a resident conversation is assumed to grow by (default 2048)
+    pool: usize,            // KV pool rows (all of them free at start)
+    queued: std::collections::HashSet<String>, // conversations with a request waiting for admission
+    st: Option<(usize, Vec<usize>)>, // cached kv_groups of the running requests: (reclaimable rows, rows each holds)
+    epoch: u64,             // bumped when the pool's state changes (admission retries only then) or once a second
+    tick: Instant,
+    tried: HashMap<u64, u64>, // waiting request -> epoch of its last failed admission
+    stall: u32,             // engine iterations in a row in which no running request could proceed
+    unacc: usize,           // (AGENS_SERVE_KV_TRACE) the most rows in use seen in no accounting group
+    stats: (u64, u64),      // paused request-steps, admissions deferred
+    acct: (f64, u64, u64),  // since the last report: seconds in the checks, checks on the slow path (page query), all checks
+    srpt: bool,             // AGENS_SERVE_PREFILL_ORDER=srpt (default) | fifo: which prefilling request takes the chunk
+    fair: u64,              // AGENS_SERVE_PREFILL_FAIR=k: every k-th chunk goes to the oldest prefill (default 4)
+    chunks: u64,            // prefill chunks so far
+    dpc: u64,               // AGENS_SERVE_DECODE_PER_CHUNK=k: decode steps between prefill chunks while requests decode (1)
+    dsince: u64,            // decode steps since the last prefill chunk
+}
+
+impl KvPolicy {
+    fn from_env(budget: bool) -> KvPolicy {
+        let f = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+        KvPolicy {
+            protect: std::env::var("AGENS_SERVE_CONV_PROTECT").map_or(!budget, |v| v != "0"),
+            hold: f("AGENS_SERVE_CONV_HOLD_S", 10.0),
+            admit_wait: f("AGENS_SERVE_ADMIT_WAIT_S", 600.0),
+            growth: f("AGENS_SERVE_CONV_GROWTH", 2048.0) as usize,
+            bypass: f("AGENS_SERVE_BYPASS_TOKENS", 16384.0) as usize,
+            pool: agens_cuda::m1::pool_free_rows(),
+            queued: Default::default(),
+            st: None,
+            epoch: 0,
+            tick: Instant::now(),
+            tried: HashMap::new(),
+            stall: 0,
+            unacc: 0,
+            stats: (0, 0),
+            acct: (0.0, 0, 0),
+            srpt: std::env::var("AGENS_SERVE_PREFILL_ORDER").map_or(true, |v| v != "fifo"),
+            fair: f("AGENS_SERVE_PREFILL_FAIR", 4.0).max(1.0) as u64,
+            chunks: 0,
+            dpc: f("AGENS_SERVE_DECODE_PER_CHUNK", 1.0).max(1.0) as u64,
+            dsince: u64::MAX / 2,
+        }
+    }
+}
+
+/// The banker's check: `a` rows available; items (rows a request may still take, rows it gives back when it ends).
+fn kv_safe(mut a: usize, items: &mut [(usize, usize)]) -> bool {
+    items.sort_unstable();
+    for &(r, h) in items.iter() {
+        if r > a {
+            return false;
+        }
+        a += h;
+    }
+    true
+}
+
+enum Victim {
+    Snap(u64),
+    Conv(String),
 }
 
 enum Admit {
@@ -363,44 +455,246 @@ impl Engine {
         Ok(true)
     }
 
-    /// Free idle conversations and prefix snapshots, least recently used first (one order for both), until `rows` KV
-    /// pool rows are free. false if impossible. Every eviction is logged.
+    /// The pool's sharing changed (sessions freed / taken / snapshotted): cached reclaim counts are stale.
+    fn kv_dirty(&mut self) {
+        self.kv.st = None;
+        self.kv.epoch += 1;
+    }
+    /// A conversation whose next turn is queued or likely imminent (idle for less than the hold window).
+    fn protected(&self, k: &str, c: &Conv) -> bool {
+        self.kv.queued.contains(k) || c.last.elapsed().as_secs_f64() < self.kv.hold
+    }
+    /// The pool as the banker's check sees it: (free rows + what evicting the idle conversations and prefix snapshots
+    /// would give back, the rows each running request gives back or leaves evictable when it ends) (kv_groups).
+    /// `protect`: protected conversations are not evictable; `extra`: the main session of a conversation being
+    /// admitted (its rows go with the new request, one more entry at the end).
+    fn kv_state(&mut self, acts: &[Act], protect: bool, extra: Option<i32>) -> (usize, Vec<usize>) {
+        let plain = !protect && extra.is_none();
+        if plain {
+            if let Some((r, h)) = &self.kv.st {
+                if h.len() == acts.len() {
+                    return (agens_cuda::m1::pool_free_rows() + r, h.clone());
+                }
+            }
+        }
+        let (mut ids, mut grp) = (Vec::new(), Vec::new());
+        for (k, c) in &self.convs {
+            if !c.busy && Some(c.main) != extra && !(protect && self.protected(k, c)) {
+                ids.push(c.main);
+                grp.push(0);
+            }
+        }
+        if let Some(pc) = &self.pc {
+            for s in pc.sessions() {
+                ids.push(s);
+                grp.push(0);
+            }
+        }
+        for (g, a) in acts.iter().enumerate() {
+            for s in self.sessions_of(a) {
+                ids.push(s);
+                grp.push(g as i32 + 1);
+            }
+        }
+        if let Some(m) = extra {
+            ids.push(m);
+            grp.push(acts.len() as i32 + 1);
+        }
+        let out = agens_cuda::m1::kv_groups(&ids, &grp, acts.len() + 1 + extra.is_some() as usize);
+        let held = out[1..].to_vec();
+        if plain {
+            self.kv.st = Some((out[0], held.clone()));
+        }
+        (agens_cuda::m1::pool_free_rows() + out[0], held)
+    }
+    /// Rows a request may take beyond its rows: a verify block (or a decode row), the fork's copy of a partial page and
+    /// page rounding.
+    fn kv_slack(&self) -> usize {
+        (if self.spec { SPEC_T } else { 1 }) + 12
+    }
+    fn sessions_of(&self, a: &Act) -> Vec<i32> {
+        let s = match a.phase {
+            Phase::Decode { sess, .. } | Phase::Prefill { sess, .. } => sess,
+            Phase::Last { fork } => fork,
+        };
+        let mut v = vec![s];
+        if let Some(m) = a.job.conv.as_ref().and_then(|k| self.convs.get(k)).map(|c| c.main) {
+            if m != s {
+                v.push(m);
+            }
+        }
+        v
+    }
+    /// Rows the request may still take: its prompt rest (+ the last token on the fork), every token up to
+    /// max_new_tokens, and the slack.
+    fn kv_rem(&self, a: &Act) -> usize {
+        let gen = a.job.sp.max_new_tokens.saturating_sub(a.produced);
+        let pre = match &a.phase {
+            Phase::Prefill { feed, done, .. } => feed.len() - *done + (a.job.conv.is_some() && self.fork) as usize,
+            Phase::Last { .. } => 1,
+            Phase::Decode { .. } => 0,
+        };
+        pre + gen + self.kv_slack()
+    }
+    /// Which of `cand` (act index, rows it takes this step; in priority order) may take their rows now with the state
+    /// staying safe (kv_safe).
+    fn kv_grant(&mut self, acts: &[Act], cand: &[(usize, usize)]) -> Vec<usize> {
+        let t = Instant::now();
+        let out = self.kv_grant_(acts, cand);
+        self.kv.acct.0 += t.elapsed().as_secs_f64();
+        self.kv.acct.2 += 1;
+        out
+    }
+    fn kv_grant_(&mut self, acts: &[Act], cand: &[(usize, usize)]) -> Vec<usize> {
+        let rem: Vec<usize> = acts.iter().map(|a| self.kv_rem(a)).collect();
+        let want: usize = cand.iter().map(|c| c.1).sum();
+        if agens_cuda::m1::pool_free_rows() >= want + rem.iter().sum::<usize>() {
+            return cand.iter().map(|c| c.0).collect(); // every request's remaining rows are free already
+        }
+        self.kv.acct.1 += 1;
+        let (a0, held) = self.kv_state(acts, false, None);
+        let mut items: Vec<(usize, usize)> = rem.into_iter().zip(held).collect();
+        let (mut used, mut out) = (0usize, Vec::new());
+        for &(i, d) in cand {
+            if used + d > a0 {
+                continue;
+            }
+            let mut t = items.clone();
+            t[i] = (t[i].0.saturating_sub(d), t[i].1 + d);
+            if kv_safe(a0 - used - d, &mut t) {
+                items[i] = (items[i].0.saturating_sub(d), items[i].1 + d);
+                used += d;
+                out.push(i);
+            }
+        }
+        if out.is_empty() {
+            // (an unsafe state: not expected) the candidate needing the fewest rows goes on if they all fit, so it ends
+            // and gives its rows back
+            if let Some(&(i, _)) = cand.iter().filter(|&&(i, d)| d <= a0 && items[i].0 <= a0).min_by_key(|&&(i, _)| items[i].0) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    /// AGENS_SERVE_KV_TRACE=1: log when the pool's state stops being safe (kv_safe over every running request), and why.
+    fn kv_trace(&mut self, acts: &[Act], at: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if (!*ON.get_or_init(|| std::env::var("AGENS_SERVE_KV_TRACE").map_or(false, |v| v == "1")) && at != "stall")
+            || acts.is_empty() {
+            return;
+        }
+        self.kv.st = None;
+        let (a, held) = self.kv_state(acts, false, None);
+        let mut items: Vec<(usize, usize)> = acts.iter().map(|x| self.kv_rem(x)).zip(held.iter().copied()).collect();
+        let ok = kv_safe(a, &mut items);
+        // leak check: live sessions vs the ones the engine knows (acts, conversations, snapshots, the anchor), and rows
+        // in use that no group accounts for
+        let (live, used) = agens_cuda::m1::live_sessions();
+        let known = 1 + self.convs.len() + self.pc.as_ref().map_or(0, |p| p.len())
+            + acts.iter().map(|x| self.sessions_of(x).len()).sum::<usize>()
+            - acts.iter().filter(|x| x.job.conv.as_ref().map_or(false, |k| self.convs.contains_key(k))).count();
+        let unacc = used.saturating_sub(a - agens_cuda::m1::pool_free_rows() + held.iter().sum::<usize>());
+        if live != known || unacc > self.kv.unacc + 4096 {
+            eprintln!("serve: KV TRACE at {at}: {live} live sessions, {known} known; {used} rows used, {unacc} in no group");
+            self.kv.unacc = self.kv.unacc.max(unacc);
+        }
+        if !ok {
+            let desc: Vec<String> = acts.iter().enumerate().map(|(i, x)| {
+                let (r, h) = (self.kv_rem(x), held[i]);
+                format!("{}:{}:R{r}:H{h}:p{}", x.job.id, match x.phase { Phase::Prefill { .. } => "pre", Phase::Last { .. } => "last",
+                        Phase::Decode { .. } => "dec" }, x.produced)
+            }).collect();
+            eprintln!("serve: KV TRACE unsafe after {at}: free {} avail {a}: {}", agens_cuda::m1::pool_free_rows(), desc.join(" "));
+        }
+    }
+
+    /// The next eviction: prefix snapshots whose pages no one else holds (LRU); idle conversations with no turn queued
+    /// and idle past the hold window (LRU); the other idle conversations (MRU); then any snapshot.
+    fn victim(&self, keep: Option<&str>) -> Option<Victim> {
+        let snaps = self.pc.as_ref().map(|p| p.entries()).unwrap_or_default();
+        if let Some(&(_, tag, ..)) = snaps.iter().find(|&&(_, _, sess, _)| agens_cuda::m1::rows_freed(&[sess]) > 0) {
+            return Some(Victim::Snap(tag));
+        }
+        // (class, order key, name): 0 = no turn queued and idle past the hold window, least recently used first;
+        // 1 = idle within the hold window, 2 = next turn queued: most recently used first in both -- when the
+        // conversations' working set exceeds the pool their turns come round in the order they went idle, and LRU would
+        // evict exactly the next one needed (every turn a miss); MRU keeps the older ones resident
+        let mut cv: Vec<(u8, i128, &String)> = self.convs.iter().filter(|(k, c)| !c.busy && Some(k.as_str()) != keep)
+            .map(|(k, c)| {
+                let age = c.last.elapsed().as_micros() as i128;
+                match (self.kv.protect, self.kv.queued.contains(k.as_str()), self.protected(k, c)) {
+                    (false, ..) | (true, false, false) => (0, -age, k),
+                    (true, false, true) => (1, age, k),
+                    (true, true, _) => (2, age, k),
+                }
+            }).collect();
+        cv.sort_unstable();
+        if let Some(&(_, _, k)) = cv.first() {
+            return Some(Victim::Conv(k.clone()));
+        }
+        snaps.first().map(|&(_, tag, ..)| Victim::Snap(tag))
+    }
+    /// Free idle conversations and prefix snapshots (Engine::victim's order) until `rows` KV pool rows are free. false
+    /// if impossible. Every eviction is logged.
     fn make_rows(&mut self, rows: usize, keep: Option<&str>) -> Result<bool> {
-        while agens_cuda::m1::pool_free_rows() < rows {
-            let victim = self
-                .convs
-                .iter()
-                .filter(|(k, c)| !c.busy && Some(k.as_str()) != keep)
-                .min_by_key(|(_, c)| c.last)
-                .map(|(k, c)| (k.clone(), c.last));
-            let snap = self.pc.as_ref().and_then(|p| p.oldest());
-            let free0 = agens_cuda::m1::pool_free_rows();
-            match (victim, snap) {
-                (Some((_, tc)), Some(ts)) if ts < tc => self.evict_snap(rows, free0)?,
-                (None, Some(_)) => self.evict_snap(rows, free0)?,
-                (Some((k, _)), _) => {
+        use agens_cuda::m1;
+        while m1::pool_free_rows() < rows {
+            let free0 = m1::pool_free_rows();
+            match self.victim(keep) {
+                None => return Ok(false),
+                Some(Victim::Snap(tag)) => {
+                    m1::session_use(self.anchor)?;
+                    if let Some((n, idle)) = self.pc.as_mut().unwrap().evict(tag)? {
+                        eprintln!("serve: evicted prefix snapshot ({n} tokens, idle {idle:.0} s) for {rows} KV rows: {free0} -> {} free",
+                                  m1::pool_free_rows());
+                    }
+                }
+                Some(Victim::Conv(k)) => {
+                    let queued = self.kv.queued.contains(&k);
                     let c = self.convs.remove(&k).unwrap();
                     self.free_session(c.main)?;
-                    eprintln!("serve: evicted idle conversation {k:?} ({} tokens, idle {:.0} s) for {rows} KV rows: {free0} -> {} \
-                               free", c.held.len(), c.last.elapsed().as_secs_f64(), agens_cuda::m1::pool_free_rows());
+                    eprintln!("serve: evicted idle conversation {k:?} ({} tokens, idle {:.0} s{}) for {rows} KV rows: {free0} -> {} \
+                               free", c.held.len(), c.last.elapsed().as_secs_f64(), if queued { ", next turn queued" } else { "" },
+                              m1::pool_free_rows());
                 }
-                (None, None) => return Ok(false),
             }
+            self.kv_dirty();
         }
         Ok(true)
     }
-    fn evict_snap(&mut self, rows: usize, free0: usize) -> Result<()> {
-        agens_cuda::m1::session_use(self.anchor)?;
-        if let Some((n, idle)) = self.pc.as_mut().unwrap().evict_lru()? {
-            eprintln!("serve: evicted prefix snapshot ({n} tokens, idle {idle:.0} s) for {rows} KV rows: {free0} -> {} free",
-                      agens_cuda::m1::pool_free_rows());
-        }
-        Ok(())
-    }
 
     /// `forks_due`: admitted conversations still prefilling, each of which takes one more slot (its fork) later
-    fn admit(&mut self, job: &Job, others_active: bool, forks_due: usize) -> Result<Admit> {
+    /// Whether a request that may take `need` rows can be admitted with every running request still able to finish
+    /// (kv_safe); `main`: its conversation's main session (its rows go with it); `pin`: rows counted as reclaimable that
+    /// it takes over (a restored snapshot's).
+    fn kv_admit_ok(&mut self, acts: &[Act], need: usize, main: Option<i32>, pin: usize, protect: bool) -> bool {
+        let rem: Vec<usize> = acts.iter().map(|a| self.kv_rem(a)).collect();
+        if agens_cuda::m1::pool_free_rows() >= rem.iter().sum::<usize>() + need + pin {
+            return true;
+        }
+        let t = Instant::now();
+        let (a, held) = self.kv_state(acts, protect, main);
+        let mut items: Vec<(usize, usize)> = rem.into_iter().chain([need]).zip(held.into_iter().chain([0])).collect();
+        let ok = kv_safe(a.saturating_sub(pin), &mut items);
+        self.kv.acct.0 += t.elapsed().as_secs_f64();
+        self.kv.acct.1 += 1;
+        self.kv.acct.2 += 1;
+        ok
+    }
+
+    /// Rows the resident conversations' working set takes (KvPolicy): every busy or protected conversation's rows plus
+    /// the growth allowance, every running request's remaining rows, and the prompts of running requests without a
+    /// conversation.
+    fn conv_commit(&self, acts: &[Act]) -> usize {
+        let convs: usize = self.convs.iter().filter(|(k, c)| c.busy || self.protected(k, c))
+            .map(|(_, c)| c.held.len() + self.kv.growth).sum();
+        convs + acts.iter().map(|a| self.kv_rem(a) + if a.job.conv.is_none() { a.job.prompt.len() } else { 0 }).sum::<usize>()
+    }
+
+    fn admit(&mut self, job: &Job, acts: &[Act], forks_due: usize) -> Result<Admit> {
         use agens_cuda::m1;
+        let others_active = !acts.is_empty();
         let n = job.prompt.len();
         if n == 0 {
             return Ok(Admit::Fail("empty prompt".into()));
@@ -424,9 +718,19 @@ impl Engine {
         let held = if end_hit.is_some() { n } else { held };
         let held = hit.map_or(held, |h| h.1);
         // 1.3.1 reserved prompt + max_new_tokens rows here, so a long max_tokens (32K by default) freed idle
-        // conversations for rows the request may never use; rows now grow as the request goes (ensure_rows before each
-        // prefill chunk and decode step), and admission takes the prompt's rows plus a little decode headroom
-        let need_rows = n - held + DECODE_HEADROOM + if self.spec { SPEC_T } else { 0 };
+        // conversations for rows the request may never use; rows grow as the request goes (before each prefill chunk
+        // and decode step). 1.3.4 took only the prompt's rows, so running requests could run the pool dry.
+        // (1.3.5) the banker's check (KvPolicy): the request may take its prompt rest and max_new_tokens rows; rows
+        // are still taken lazily (prefill chunk / decode step), and evictions happen only then
+        let need_rows = n - held + job.sp.max_new_tokens + self.kv_slack() + (conv.is_some() && self.fork) as usize;
+        let main = match (&conv, reuse) {
+            (Some(k), Some(true)) => Some(self.convs[k].main),
+            _ => None,
+        };
+        let pin = 4 + if end_hit.is_some() { n } else { hit.map_or(0, |h| h.1) };
+        // (with nothing running there is nothing to wait for: no protection)
+        let protect = self.kv.protect && others_active && reuse != Some(true)
+            && job.t_sub.elapsed().as_secs_f64() < self.kv.admit_wait;
         let need_slots = match (&conv, reuse) {
             (None, _) => 1,
             (Some(k), Some(true)) => self.fork as usize + self.convs[k].parked.is_some() as usize,
@@ -437,8 +741,20 @@ impl Engine {
             }
         };
         let keep = conv.as_deref();
-        if !self.make_rows(need_rows, keep)? || !self.make_slots(need_slots + forks_due, keep)? {
-            return Ok(if others_active { Admit::Wait } else { Admit::Fail("not enough KV pool rows / state slots".into()) });
+        if protect && conv.is_some() && self.conv_commit(acts) + need_rows + self.kv.growth > self.kv.pool {
+            self.kv.stats.1 += 1;
+            return Ok(Admit::Wait); // a new conversation waits for room in the working set
+        }
+        if !self.kv_admit_ok(acts, need_rows, main, pin, protect) {
+            self.kv.stats.1 += 1;
+            if others_active {
+                return Ok(Admit::Wait); // rows free up as running requests end (or protected conversations age)
+            }
+            return Ok(Admit::Fail(format!("prompt {n} + max_new_tokens {} do not fit in the KV pool ({} rows free or \
+                                           reclaimable)", job.sp.max_new_tokens, self.kv_state(acts, false, None).0)));
+        }
+        if !self.make_slots(need_slots + forks_due, keep)? {
+            return Ok(if others_active { Admit::Wait } else { Admit::Fail("not enough KDA state slots".into()) });
         }
         let mut sampler = Sampler::new(&job.sp, job.id);
         if let Some(n) = job.sp.reasoning_budget {
@@ -451,9 +767,14 @@ impl Engine {
         let dsamp = if self.dev_sample { spec_sampling(&job.sp, self.pen_ok).filter(|s| s.t > 0.0) } else { None };
         let guard = self.think_guard.map(|(n, k, w)| ThinkGuard::new(n, k, w, &job.prompt, self.think.0, self.think.1));
         let t0 = Instant::now();
-        let mk = |phase| Act {
+        let last_on_fork = conv.is_some() && self.fork;
+        let mk = |phase: Phase| Act {
+            prefilled: match &phase {
+                Phase::Prefill { feed, .. } => feed.len() + last_on_fork as usize,
+                _ => 0,
+            },
             job: Job { id: job.id, prompt: job.prompt.clone(), key: job.key.clone(), mm: job.mm.clone(), sp: job.sp.clone(),
-                       conv: conv.clone(), tx: job.tx.clone() },
+                       conv: conv.clone(), tx: job.tx.clone(), t_sub: job.t_sub },
             phase,
             produced: 0,
             sampler,
@@ -467,6 +788,8 @@ impl Engine {
             pset: false,
             pen_new: Vec::new(),
             dsamp,
+            paused: 0,
+            first_at: None,
         };
         let l0 = hit.map_or(0, |h| h.1);
         if let Some((_, l)) = hit {
@@ -520,6 +843,12 @@ impl Engine {
         c.held = job.key[..end].to_vec();
         let canon = reuse != Some(true);  // a continued conversation's held prefix ends anywhere: not canonical
         Ok(Admit::Ok(mk(Phase::Prefill { sess: c.main, feed, done: 0, mm, pos0: from, canon, first: None })))
+    }
+
+    /// A turn of a resident, idle conversation that continues its held tokens (it reuses their KV rows).
+    fn resident_turn(&self, j: &Job) -> bool {
+        j.conv.as_ref().and_then(|k| self.convs.get(k))
+            .map_or(false, |c| !c.busy && c.held.len() < j.prompt.len() && j.key.starts_with(&c.held))
     }
 
     /// The image inputs of prompt[from..to): the images whose spans overlap it are encoded now.
@@ -581,12 +910,19 @@ impl Engine {
             act.pen_new.push(tok as u32); // the device counts follow the host sampler's (sync_penalty)
         }
         act.produced += 1;
+        if act.first_at.is_none() {
+            act.first_at = Some(Instant::now());
+        }
         let cancelled = act.job.tx.blocking_send(Ok(vec![tok as u32])).is_err();
         let stop = !act.job.sp.ignore_eos && act.job.sp.stop_token_ids.contains(&(tok as u32));
         cancelled || stop || act.produced >= act.job.sp.max_new_tokens
     }
 
     fn finish(&mut self, act: Act) -> Result<()> {
+        self.kv_dirty();
+        if act.paused > 0 {
+            eprintln!("serve: request {} sat out {} steps (KV rows reserved for the requests ahead of it)", act.job.id, act.paused);
+        }
         let sess = match act.phase {
             Phase::Decode { sess, .. } => Some(sess),
             Phase::Last { fork } => Some(fork),
@@ -649,6 +985,7 @@ impl Engine {
         if let Err(e) = agens_cuda::m1::recover() {
             return Err(err.context(format!("{e:#}")));
         }
+        self.kv_dirty();
         let msg = format!("engine error: {err:#}");
         for i in (0..acts.len()).rev() {
             let id = acts[i].job.id;
@@ -683,14 +1020,38 @@ impl Engine {
                     Ok(j) => waiting.push_back(j),
                     Err(_) => return Ok(()),
                 }
+            } else if acts.is_empty() {
+                // requests wait for protected conversations to age (KvPolicy): no busy loop
+                match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Ok(j) => waiting.push_back(j),
+                    Err(smpsc::RecvTimeoutError::Timeout) => {}
+                    Err(smpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                }
             }
             while let Ok(j) = rx.try_recv() {
                 waiting.push_back(j);
             }
-            // admission (requests whose client already went away are dropped here)
-            while acts.len() < self.max_batch {
-                let Some(j) = waiting.pop_front() else { break };
-                if j.tx.is_closed() {
+            // admission (requests whose client already went away are dropped here), in arrival order; once a request
+            // has to wait for KV rows, only turns of resident conversations (which reuse their rows) and requests without
+            // a session of at most AGENS_SERVE_BYPASS_TOKENS prompt tokens (short chats) go past it. A
+            // request that failed is tried again only after the pool's state changed (or a second went by).
+            self.kv.queued = waiting.iter().filter_map(|j| j.conv.clone()).collect();
+            self.kv.st = None; // the last step took rows
+            if self.kv.tick.elapsed().as_secs_f64() >= 1.0 {
+                self.kv.tick = Instant::now();
+                self.kv.epoch += 1;
+            }
+            let (mut w, mut blocked) = (0usize, false);
+            while acts.len() < self.max_batch && w < waiting.len() {
+                if waiting[w].tx.is_closed() {
+                    let j = waiting.remove(w).unwrap();
+                    self.kv.tried.remove(&j.id);
+                    continue;
+                }
+                let small = waiting[w].conv.is_none() && waiting[w].prompt.len() <= self.kv.bypass;
+                if (blocked && !small && !self.resident_turn(&waiting[w])) || self.kv.tried.get(&waiting[w].id) == Some(&self.kv.epoch) {
+                    blocked = true;
+                    w += 1;
                     continue;
                 }
                 let forks_due = if self.fork {
@@ -698,37 +1059,69 @@ impl Engine {
                 } else {
                     0
                 };
-                match self.admit(&j, !acts.is_empty(), forks_due)? {
-                    Admit::Ok(a) => acts.push(a),
+                match self.admit(&waiting[w], &acts[..], forks_due)? {
+                    Admit::Ok(a) => {
+                        let j = waiting.remove(w).unwrap();
+                        self.kv.tried.remove(&j.id);
+                        acts.push(a);
+                        self.kv_dirty();
+                    }
                     Admit::Wait => {
-                        waiting.push_front(j);
-                        break;
+                        self.kv.tried.insert(waiting[w].id, self.kv.epoch);
+                        blocked = true;
+                        w += 1;
                     }
                     Admit::Fail(e) => {
+                        let j = waiting.remove(w).unwrap();
+                        self.kv.tried.remove(&j.id);
                         let _ = j.tx.blocking_send(Err(BackendError(e)));
+                        self.kv_dirty();
                     }
                 }
             }
-            // one prefill chunk (oldest first), once its KV rows are free (idle conversations / prefix snapshots evicted
-            // as needed); none free while others decode: they go first and the chunk waits; else the request fails
+            if !waiting.is_empty() {
+                self.kv.queued = waiting.iter().filter_map(|j| j.conv.clone()).collect();
+            }
+            self.kv_trace(&acts[..], "admission");
+            // one prefill chunk (the oldest request still prefilling whose chunk the banker's check grants), its KV rows
+            // freed first if need be (Engine::victim's order); none granted: the decoding requests go on and it waits
             done_ids.clear();
-            let mut pre = acts.iter().position(|a| !matches!(a.phase, Phase::Decode { .. }));
-            if let Some(i) = pre {
+            let mut progress = false;
+            // (1.3.5) shortest remaining prefill first (a conversation's next turn -- one chunk -- does not wait behind
+            // every long first turn admitted before it), every AGENS_SERVE_PREFILL_FAIR-th chunk to the oldest; while
+            // requests decode, a chunk runs only every AGENS_SERVE_DECODE_PER_CHUNK decode steps. Each request's chunks
+            // stay the same, so outputs do not change.
+            let mut order: Vec<usize> = (0..acts.len()).filter(|&i| !matches!(acts[i].phase, Phase::Decode { .. })).collect();
+            let rest = |a: &Act| match &a.phase {
+                Phase::Prefill { feed, done, .. } => feed.len() - *done,
+                _ => 0,
+            };
+            if self.kv.srpt && (self.kv.chunks + 1) % self.kv.fair != 0 {
+                order.sort_by_key(|&i| (rest(&acts[i]).div_ceil(chunk()), acts[i].t0));
+            } else {
+                order.sort_by_key(|&i| acts[i].t0);
+            }
+            let decoding = acts.iter().any(|a| matches!(a.phase, Phase::Decode { .. }));
+            if decoding && self.kv.dsince < self.kv.dpc && order.iter().all(|&i| rest(&acts[i]) > 0) {
+                order.clear(); // decode steps first (a request's last-token step on its fork is never held back)
+            }
+            let mut pre = None;
+            for &i in &order {
                 let need = match &acts[i].phase {
                     Phase::Prefill { feed, done, .. } => (feed.len() - *done).min(chunk()) + 8,
                     _ => 8,
                 };
-                let keep = acts[i].job.conv.clone();
-                if !self.make_rows(need, keep.as_deref())? {
-                    pre = None;
-                    if !acts.iter().any(|a| matches!(a.phase, Phase::Decode { .. })) {
-                        let a = acts.swap_remove(i);
-                        eprintln!("serve: request {} failed: {need} KV pool rows needed, {} free", a.job.id,
-                                  m1::pool_free_rows());
-                        let _ = a.job.tx.blocking_send(Err(BackendError("not enough KV pool rows".into())));
-                        self.finish(a)?;
-                    }
+                if self.kv_grant(&acts[..], &[(i, need)]).is_empty() {
+                    continue;
                 }
+                let keep = acts[i].job.conv.clone();
+                if self.make_rows(need, keep.as_deref())? {
+                    pre = Some(i);
+                    progress = true;
+                    self.kv.chunks += 1;
+                    self.kv.dsince = 0;
+                }
+                break;
             }
             if let Some(i) = pre {
                 let a = &mut acts[i];
@@ -828,36 +1221,85 @@ impl Engine {
                     }
                     Phase::Decode { .. } => unreachable!(),
                 }
-            }
-            // rows for this step's new positions (lazy growth): evict idle conversations / snapshots; when the active
-            // requests alone fill the pool, the newest decoding request ends with an error
-            loop {
-                let dec: Vec<usize> = (0..acts.len())
-                    .filter(|&i| matches!(acts[i].phase, Phase::Decode { .. }) && !done_ids.contains(&acts[i].job.id))
-                    .collect();
-                let need = dec.len() * if self.spec { SPEC_T + 4 } else { 4 };
-                if dec.is_empty() || self.make_rows(need, None)? {
-                    break;
+                if self.pc.is_some() {
+                    self.kv_dirty(); // snapshots may share the chunk's pages now
                 }
-                let j = *dec.iter().max_by_key(|&&i| acts[i].t0).unwrap();
-                let a = acts.swap_remove(j);
-                eprintln!("serve: request {} ended after {} tokens: the KV pool is full ({need} rows needed, {} free)",
-                          a.job.id, a.produced, m1::pool_free_rows());
-                let _ = a.job.tx.blocking_send(Err(BackendError("KV pool full".into())));
-                self.finish(a)?;
+                self.kv_trace(&acts[..], "prefill chunk");
             }
-            // one decode step for every decoding row
-            let rows: Vec<usize> =
-                (0..acts.len()).filter(|&i| matches!(acts[i].phase, Phase::Decode { .. }) && !done_ids.contains(&acts[i].job.id)).collect();
+            // rows for this step's new positions (lazy growth): the banker's check grants the step to the decoding
+            // requests oldest first while every running request can still finish; the others sit this step out (no
+            // request ends for lack of rows). Then idle conversations / snapshots are evicted if the rows are not free.
+            let mut dec: Vec<usize> = (0..acts.len())
+                .filter(|&i| matches!(acts[i].phase, Phase::Decode { .. }) && !done_ids.contains(&acts[i].job.id))
+                .collect();
+            dec.sort_by_key(|&i| acts[i].t0);
+            let per = if self.spec { SPEC_T + 4 } else { 4 };
+            let mut go = if dec.is_empty() { Vec::new() } else {
+                let cand: Vec<(usize, usize)> = dec.iter().map(|&i| (i, per)).collect();
+                self.kv_grant(&acts[..], &cand)
+            };
+            while !go.is_empty() && !self.make_rows(go.len() * per, None)? {
+                go.pop(); // (not expected: the check counted only reclaimable rows) the youngest waits
+            }
+            for &i in &dec {
+                if !go.contains(&i) {
+                    acts[i].paused += 1;
+                    self.kv.stats.0 += 1;
+                }
+            }
+            if !go.is_empty() || !done_ids.is_empty() {
+                progress = true;
+            }
+            if pre.is_none() {
+                self.kv.dsince += 1;
+            }
+            if !progress && !acts.is_empty() {
+                // no running request can take a step: an accounting fault (the check keeps one always able to);
+                // after a retry the newest request ends instead of the engine stalling
+                self.kv.stall += 1;
+                if self.kv.stall > 2 {
+                    // the newest request that has not emitted a token goes back to the queue (its sessions freed; run
+                    // again from its prompt it computes the same chunks, so its output is the same); only when every
+                    // request has emitted tokens does the newest end with an error
+                    self.kv_trace(&acts[..], "stall");
+                    let fresh = (0..acts.len()).filter(|&i| acts[i].produced == 0).max_by_key(|&i| acts[i].t0);
+                    let j = fresh.unwrap_or_else(|| (0..acts.len()).max_by_key(|&i| acts[i].t0).unwrap());
+                    let a = acts.swap_remove(j);
+                    let (free, recl) = (m1::pool_free_rows(), self.kv_state(&acts[..], false, None).0 - m1::pool_free_rows());
+                    if a.produced == 0 {
+                        eprintln!("serve: request {} requeued before its first token: no request could take KV rows ({free} free, \
+                                   {recl} reclaimable)", a.job.id);
+                        let j = &a.job;
+                        let job = Job { id: j.id, prompt: j.prompt.clone(), key: j.key.clone(), mm: j.mm.clone(), sp: j.sp.clone(),
+                                        conv: j.conv.clone(), tx: j.tx.clone(), t_sub: j.t_sub };
+                        self.finish(a)?;
+                        waiting.push_front(job);
+                    } else {
+                        eprintln!("serve: request {} ended after {} tokens: no request could take KV rows ({free} free, {recl} \
+                                   reclaimable)", a.job.id, a.produced);
+                        let _ = a.job.tx.blocking_send(Err(BackendError("KV pool full".into())));
+                        self.finish(a)?;
+                    }
+                    self.kv.stall = 0;
+                }
+            } else {
+                self.kv.stall = 0;
+            }
+            // one decode step for every granted decoding row
+            let rows: Vec<usize> = dec.iter().copied().filter(|i| go.contains(i)).collect();
             // server mode with the drafter (batched speculation): greedy rows verify together, one step for all
             let bspec = agens_cuda::m1::spec_batch_max();
             // (1.0.1) sampled rows too, each on its own filtered distribution and Philox stream; a sampled row verifies
             // batched even alone (its sample stream lives in its session), a lone greedy row takes the bs = 1 step
-            let spec_rows: Vec<usize> = if bspec > 0 {
+            let mut spec_rows: Vec<usize> = if bspec > 0 {
                 rows.iter().copied().filter(|&i| acts[i].spec.is_some()).take(bspec).collect()
             } else {
                 Vec::new()
             };
+            // (1.3.5) rows in position order: the engine keys a batched verify graph by the rows' attention regimes
+            // (window only / far) in row order, so sorted rows key one graph per count instead of one per pattern
+            // (rows are batch-invariant: the order changes no output)
+            spec_rows.sort_by_key(|&i| (acts[i].job.prompt.len() + acts[i].fed.len(), acts[i].job.id));
             let batched = spec_rows.len() > 1 || spec_rows.iter().any(|&i| acts[i].spec.map_or(false, |s| s.t > 0.0));
             if batched {
                 *inflight = spec_rows.iter().map(|&i| acts[i].job.id).collect();
@@ -930,6 +1372,12 @@ impl Engine {
                     }
                 }
                 if self.bstats.0 == 128 {
+                    let k = self.kv.acct;
+                    if k.2 > 0 {
+                        eprintln!("serve: KV accounting over the last 128 batched steps: {:.3} ms/step, {} of {} checks on the page \
+                                   query, {} pool rows free", 1e3 * k.0 / 128.0, k.1, k.2, m1::pool_free_rows());
+                    }
+                    self.kv.acct = (0.0, 0, 0);
                     let b = self.bstats;
                     let wall = self.pstats.2.map(|t| t.elapsed().as_secs_f64()).unwrap_or(b.2);
                     eprintln!(
@@ -1068,6 +1516,7 @@ impl Engine {
                     );
                 }
             }
+            self.kv_trace(&acts[..], "decode step");
             // retire finished and cancelled requests
             inflight.clear();
             for i in (0..acts.len()).rev() {
@@ -1077,8 +1526,11 @@ impl Engine {
                     if (a.vsteps > 0 && rs == "1") || rs == "2" {
                         // per-request acceptance (benchmarks): tokens generated, verify steps (2: every request, also
                         // the ones that decoded without speculation)
-                        eprintln!("serve: request {} done: prompt {} tokens, {} new tokens, {} verify steps",
-                                  a.job.id, a.job.prompt.len(), a.produced, a.vsteps);
+                        let ft = a.first_at.map_or(-1.0, |t| t.duration_since(a.t0).as_secs_f64());
+                        eprintln!("serve: request {} done: prompt {} tokens, {} new tokens, {} verify steps, {} prompt tokens \
+                                   prefilled; queued {:.2} s, first token {:.2} s after admission{}", a.job.id, a.job.prompt.len(),
+                                  a.produced, a.vsteps, a.prefilled, a.t0.duration_since(a.job.t_sub).as_secs_f64(), ft,
+                                  if a.job.conv.is_some() { ", session" } else { "" });
                     }
                     self.finish(a)?;
                 }
@@ -1218,6 +1670,11 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("host") => false,
         Some(m) => bail!("--prefix-cache-mem {m}: gpu or host"),
     };
+    // (1.3.5) server mode with --gpu-gib and no --pool: the KV pool takes what the load leaves (m1.rs auto_pool) instead
+    // of one --wctx context shared by every session (AGENS_SERVE_AUTO_POOL=0: the 1.3.4 default)
+    o.auto_pool = mode == "server" && o.pool == 0 && o.budget_gib <= 0.0 && o.gpu_gib > 0.0
+        && std::env::var("AGENS_SERVE_AUTO_POOL").map_or(true, |v| v != "0");
+    o.pc_bytes = if pc_dev && pc_gib > 0.0 { (pc_gib * (1u64 << 30) as f64) as usize } else { 0 };
     o.drafter = drafter.clone();
     let copy = o.copy;
     let one_dev = o.devices.len() <= 1;
@@ -1258,7 +1715,7 @@ pub fn run(args: &[String]) -> Result<()> {
             };
             Ok(Engine { pc, think, max_batch, max_convs, wctx: wctx - CHUNK, anchor, convs: HashMap::new(), stats: (0, 0, 0.0),
                         spec: drafting || copy, copy: copy && !drafting, fork, bstats: (0, 0, 0.0, 0), pstats: (0, 0.0, None),
-                        hstats: (0.0, 0.0), think_guard, pen_ok, dev_sample })
+                        hstats: (0.0, 0.0), think_guard, pen_ok, dev_sample, kv: KvPolicy::from_env(budget) })
         })();
         match r {
             Ok(mut e) => {

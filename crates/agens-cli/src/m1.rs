@@ -119,10 +119,14 @@ pub(crate) struct Opts {
     pub(crate) copy: bool,              // copy-only speculative decoding (no drafter model): verify buffers only
     pub(crate) vision: Option<bool>,    // --vision 0|1: load the vision tower (default: when the checkpoint has one)
     pub(crate) w4_cache: Option<String>, // --w4-prefill-cache auto|0|1 (AGENS_M1_W4_PREFILL_CACHE; default auto)
+    // (1.3.5, agens serve server mode with --gpu-gib and no --pool): size the KV pool from the memory left after the
+    // load; `pc_bytes`: the prefix cache's GPU snapshot pool, allocated after the load
+    pub(crate) auto_pool: bool,
+    pub(crate) pc_bytes: usize,
 }
 
 pub(crate) fn parse_opts(args: &[String], usage: &str) -> Result<Opts> {
-    let mut o = Opts { gpu_gib: 0.0, device: 0, devices: vec![], new_tokens: 64, wctx: 36868, cuts: 50, tier: "host".into(), seed: 1, pool: 0, sessions: 1, budget_gib: 0.0, drafter: None, tp: 1, mtp: None, copy: false, vision: None, w4_cache: None };
+    let mut o = Opts { gpu_gib: 0.0, device: 0, devices: vec![], new_tokens: 64, wctx: 36868, cuts: 50, tier: "host".into(), seed: 1, pool: 0, sessions: 1, budget_gib: 0.0, drafter: None, tp: 1, mtp: None, copy: false, vision: None, w4_cache: None, auto_pool: false, pc_bytes: 0 };
     let mut i = 0;
     while i < args.len() {
         let v = args.get(i + 1).context(usage.to_string())?;
@@ -841,6 +845,18 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         reserve.push((format!("W4 prefill weight cache (dequantized bf16 W4 linears, {:.2} GB)", b as f64 / 1e9), b));
     }
     let mut pool = o.pool;
+    let (mut auto_w4, mut auto_wctx) = (false, None);
+    if o.auto_pool && o.budget_gib <= 0.0 && pool == 0 {
+        (pool, auto_w4) = auto_pool(o, &ck.config, wctx, w4_max_nk, &reserve, tp, rank)?;
+        if pool < wctx {
+            let w = (pool.saturating_sub(4) / 4096) * 4096 + 4;
+            if w < 2 * crate::plan::chunk().max(4096) {
+                bail!("the KV pool ({pool} rows) cannot hold a useful context (--wctx {wctx}): lower --gpu-gib or pass --pool");
+            }
+            eprintln!("m1: --wctx {wctx} clamped to {w}: the auto-sized KV pool holds {pool} rows");
+            auto_wctx = Some(w);
+        }
+    }
     if o.budget_gib > 0.0 {  // size the KV pool from the budget left after weights + context (one device)
         agens_cuda::synchronize()?;
         let (free, total) = agens_cuda::mem_info()?;
@@ -893,6 +909,9 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
             eprintln!("m1: --wctx {wctx} clamped to {w}: the KV pool holds {pool} rows at the {} GiB cap", o.budget_gib);
             wctx = w;
         }
+    }
+    if let Some(w) = auto_wctx {
+        wctx = w;
     }
     WCTX.store(wctx, std::sync::atomic::Ordering::Relaxed);
     if tp > 1 {
@@ -954,7 +973,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         eprintln!("m1: W4H dual layout: KT kept, W4H copies {:.2} GB for launches of <= {} tokens (AGENS_W4H_MMAX)",
                   dual as f64 / 1e9, std::env::var("AGENS_W4H_MMAX").unwrap_or_default());
     }
-    w4_prefill_cache(o, budget_cache)?;
+    w4_prefill_cache(o, budget_cache || auto_w4)?;
     if o.budget_gib > 0.0 && std::env::var("AGENS_M1_PREFILL_RESERVE").map(|v| v != "0").unwrap_or(true) {
         // the plan's prefill temporaries taken now, before any CUDA graph (AGENS_M1_PREFILL_RESERVE=0: 1.3.1's lazy way)
         let (kb, tb) = (crate::plan::kda_temp_bytes(tp), crate::plan::torch_temp_bytes(tp));
@@ -972,6 +991,77 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     pl.on(0)?;
     Ok(())
 }
+
+/// (1.3.5) The KV pool of `agens serve` server mode with --gpu-gib and no --pool: what the --gpu-gib budget (per GPU,
+/// everything this process allocates; capped at the device) has left after the load (weights, W4H copies, drafter /
+/// MTP head, all-reduce buffers, CUDA context: measured now) less the init scratch, the KDA state
+/// slots, the speculative / vision reserves (`reserve`), the W4 prefill weight cache when it would be built, the prefix
+/// cache's snapshot pool and a headroom (AGENS_SERVE_POOL_HEADROOM_GIB, default 8: batched-step CUDA graphs, prefill
+/// temporaries, allocator slack; the prefix cache keeps 8 GiB free past itself too). The prefix cache gives way to at
+/// least one --wctx context. The ranks agree on the smallest. -> (rows, the W4 prefill cache was planned)
+fn auto_pool(o: &Opts, cfg: &agens_core::VolundrConfig, wctx: usize, w4_max_nk: usize, reserve: &[(String, usize)],
+             tp: usize, rank: usize) -> Result<(usize, bool)> {
+    agens_cuda::synchronize()?;
+    let (free, total) = agens_cuda::mem_info()?;
+    // the operator's --gpu-gib is the whole process's budget here, not the device (other processes may share the GPU;
+    // memory they hold now counts against it too: total - free is measured)
+    let budget = ((o.gpu_gib * (1u64 << 30) as f64) as usize).min(total);
+    let gib = |k: &str, d: f64| ((std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d)) * (1u64 << 30) as f64) as usize;
+    let w4c = agens_cuda::m1::w4_cache_bytes();
+    let w4_ok = w4c > 0 && matches!(w4_cache_mode(o).as_str(), "auto" | "1") && total >= 80_000_000_000;
+    let plan = |w4: bool, pc: bool| {
+        let mut res: Vec<(String, usize)> = reserve.to_vec();
+        if w4 {
+            res.push((format!("W4 prefill weight cache ({:.2} GB; --w4-prefill-cache 0: KV rows instead)", w4c as f64 / 1e9), w4c));
+        }
+        res.push(("headroom (graphs, prefill temporaries; AGENS_SERVE_POOL_HEADROOM_GIB)".to_string(),
+                  gib("AGENS_SERVE_POOL_HEADROOM_GIB", 8.0)));
+        if pc {
+            res.push((format!("prefix cache snapshots (--prefix-cache-gib, {:.2} GB)", o.pc_bytes as f64 / 1e9), o.pc_bytes));
+        }
+        crate::plan::plan(cfg, budget, total - free, o.sessions, wctx, w4_max_nk, &res, tp)
+    };
+    // at least one full --wctx context: the prefix cache gives way first (it sizes itself to what is left), then the
+    // W4 prefill weight cache; past that the budget is too small and the pool is one context anyway
+    let mut p = plan(w4_ok, true);
+    let mut w4 = w4_ok;
+    let mut note = "";
+    if p.pool_rows < wctx {
+        p = plan(w4_ok, false);
+        note = "; the prefix cache gives way to one full context";
+        if p.pool_rows < wctx && w4_ok {
+            p = plan(false, false);
+            w4 = false;
+            note = "; the prefix cache and the W4 prefill weight cache give way to one full context";
+        }
+        if p.pool_rows < wctx {
+            note = "; WARNING: --gpu-gib leaves less than one --wctx context: the pool holds one anyway (over the budget)";
+        }
+    }
+    let mut rows = p.pool_rows.max(wctx);
+    // row offsets of the K/V pools stay below 2^31 elements (rank's K/V heads x head dim per row)
+    let kvh = 4 / tp.max(1);
+    rows = rows.min((1usize << 31) / (kvh * 256) - 4) & !3;
+    if rank == 0 {
+        for l in &p.lines {
+            eprintln!("{l}");
+        }
+    }
+    let agreed = crate::tp::agree_min("pool", rows)?;
+    let per = |t: usize| agreed / (t + 1024);
+    eprintln!("m1: KV pool auto-sized to {agreed} rows{} within --gpu-gib {} (server mode; --pool N overrides): {} sessions of \
+               30K tokens or {} of 45K resident at once (prompt + 1K of reply each){note}",
+              if agreed < rows { " (the ranks' smallest)" } else { "" }, o.gpu_gib, per(30_000), per(45_000));
+    AUTO_BUDGET.store(budget, std::sync::atomic::Ordering::Relaxed);
+    if w4_ok && !w4 {
+        AUTO_W4_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok((agreed, w4))
+}
+/// auto_pool's --gpu-gib budget in bytes (0: not auto-sized): the prefix cache's GPU pool stays inside it (prefix.rs)
+pub(crate) static AUTO_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// auto_pool left no room for the W4 prefill weight cache: its own auto rule must not build it after the load
+static AUTO_W4_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn w4_cache_mode(o: &Opts) -> String {
     o.w4_cache.clone().or_else(|| std::env::var("AGENS_M1_W4_PREFILL_CACHE").ok()).unwrap_or_else(|| "auto".into())
@@ -994,8 +1084,13 @@ fn w4_prefill_cache(o: &Opts, planned: bool) -> Result<()> {
     let (free, total) = agens_cuda::mem_info()?;
     let reserve = (std::env::var("AGENS_M1_W4_PREFILL_CACHE_RESERVE_GIB").ok().and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(24.0) * (1u64 << 30) as f64) as usize;
-    let why = if mode == "1" {
+    let why = if AUTO_W4_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        Some("no room in the --gpu-gib budget next to one --wctx context of KV pool")
+    } else if mode == "1" {
         if o.budget_gib > 0.0 && !planned { Some("not planned (one device only)") } else { None }
+    } else if planned && o.budget_gib <= 0.0 {
+        // the auto-sized KV pool left its room (auto_pool)
+        if free < bytes + (1 << 30) { Some("not enough free memory") } else { None }
     } else if o.budget_gib > 0.0 {
         Some("budget mode")
     } else if total < 80_000_000_000 {

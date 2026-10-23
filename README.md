@@ -52,7 +52,7 @@ The same flags work on the image directly:
 ```bash
 docker run --gpus device=0 --ipc=host -p 30000:30000 \
   -v /path/to/model:/model:ro -v /path/to/drafter:/drafter:ro \
-  ghcr.io/blockwayz/agens-engine:1.3.4 --profile 16gb --model /model --drafter /drafter
+  ghcr.io/blockwayz/agens-engine:1.3.5 --profile 16gb --model /model --drafter /drafter
 ```
 
 ## Profiles

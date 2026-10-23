@@ -398,6 +398,9 @@ pub mod m1 {
         fn ak_m1_session_fork(src: c_int) -> c_int;
         fn ak_m1_session_free(id: c_int) -> c_int;
         fn ak_m1_pool_free_rows() -> c_int;
+        fn ak_m1_rows_freed(ids: *const c_int, n: c_int) -> c_int;
+        fn ak_m1_live_sessions(rows_used: *mut c_int) -> c_int;
+        fn ak_m1_kv_groups(ids: *const c_int, grp: *const c_int, n: c_int, ng: c_int, out: *mut c_int) -> c_int;
         fn ak_m1_logits(dst: *mut c_void) -> c_int;
         fn ak_m1_logits_row(r: c_int, dst: *mut c_void) -> c_int;
         fn ak_m1_logits_i8_row(r: c_int, dst: *mut c_void) -> c_int;
@@ -558,6 +561,27 @@ pub mod m1 {
     }
     pub fn pool_free_rows() -> usize {
         unsafe { ak_m1_pool_free_rows() as usize }
+    }
+    /// (live sessions, KV pool pages in use x 4 incl. the padding page) -- leak checks
+    pub fn live_sessions() -> (usize, usize) {
+        let mut r: c_int = 0;
+        let n = unsafe { ak_m1_live_sessions(&mut r) };
+        (n.max(0) as usize, r.max(0) as usize)
+    }
+    /// KV accounting (kernels/m1 ak_m1_kv_groups): sessions `ids` in groups `grp` (0 = idle, 1.. = running requests)
+    /// -> [rows evicting group 0 frees, rows each request gives back or leaves evictable when it ends]. Leader-side query.
+    pub fn kv_groups(ids: &[i32], grp: &[i32], ng: usize) -> Vec<usize> {
+        let mut out = vec![0 as c_int; ng.max(1)];
+        unsafe { ak_m1_kv_groups(ids.as_ptr(), grp.as_ptr(), ids.len() as c_int, ng.max(1) as c_int, out.as_mut_ptr()) };
+        out.into_iter().map(|x| x.max(0) as usize).collect()
+    }
+    /// KV pool rows that freeing all of `ids` (distinct sessions) would give back: pages no other session holds.
+    /// A leader-side query (the ranks' pools are identical), not forwarded.
+    pub fn rows_freed(ids: &[i32]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+        unsafe { ak_m1_rows_freed(ids.as_ptr(), ids.len() as c_int).max(0) as usize }
     }
     pub fn state_bytes() -> usize {
         unsafe { ak_m1_state_bytes() }
