@@ -20,9 +20,13 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
+#if defined(_MSC_VER)
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -244,9 +248,21 @@ extern "C" int ak_tp_region_open(const void* ipc_handle, void** dev_ptr) {
   memcpy(&h, ipc_handle, sizeof(h));
   return (int)cudaIpcOpenMemHandle(dev_ptr, h, cudaIpcMemLazyEnablePeerAccess);
 }
-// ... or a POSIX shared-memory segment (/dev/shm/<name>) mapped into this process and registered with CUDA (GPUs without
-// peer access: the exchange crosses host memory). create = 1 by the first rank (zeroed).
+// ... or a shared-memory segment (/dev/shm/<name> on POSIX; a named Windows mapping) mapped into this process and
+// registered with CUDA (GPUs without peer access: the exchange crosses host memory). create = 1 by the first rank (zeroed).
 extern "C" int ak_tp_region_shm(const char* name, size_t bytes, int create, void** dev_ptr) {
+#if defined(_MSC_VER)
+  // Windows: the unnamed namespace is session-local, so all ranks must run in one logon session (cross-session would
+  // need a "Global\\" prefix, which requires SeCreateGlobalPrivilege — unavailable to standard users).
+  const char* n = name[0] == '/' ? name + 1 : name;
+  HANDLE m = create ? CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, (DWORD)(bytes >> 32),
+                                         (DWORD)(bytes & 0xFFFFFFFF), n)
+                    : OpenFileMappingA(FILE_MAP_WRITE, FALSE, n);
+  if (!m) return (int)cudaErrorInvalidValue;
+  void* h = MapViewOfFile(m, FILE_MAP_WRITE, 0, 0, (SIZE_T)bytes);
+  CloseHandle(m);
+  if (!h) return (int)cudaErrorMemoryAllocation;
+#else
   const int fd = shm_open(name, create ? (O_CREAT | O_RDWR) : O_RDWR, 0600);
   if (fd < 0) return (int)cudaErrorInvalidValue;
   if (create && ftruncate(fd, (off_t)bytes) != 0) return close(fd), (int)cudaErrorInvalidValue;
@@ -254,6 +270,7 @@ extern "C" int ak_tp_region_shm(const char* name, size_t bytes, int create, void
   close(fd);
   if (h == MAP_FAILED) return (int)cudaErrorMemoryAllocation;
   if (create) memset(h, 0, bytes);
+#endif
   cudaError_t e = cudaHostRegister(h, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable);
   if (e != cudaSuccess) return (int)e;
   e = cudaHostGetDevicePointer(dev_ptr, h, 0);
