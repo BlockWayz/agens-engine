@@ -229,8 +229,35 @@ single, and server mode the same replies at every concurrency level; sampled rep
 with and without the drafter (summed TV 4.4 vs a 5.1 noise baseline at `--tp 2`, 4.8 vs 5.5 at `--tp 4`). The
 greedy text at `--tp 2` is not identical to one GPU's: the sums run in a different order, so near-ties can flip.
 
+### Server mode on 141 GB GPUs (compute capability 9.0), 1.3.5
+
+Recommended `agens serve` flags for long agent sessions on two 141 GB GPUs of compute capability 9.0 (on the image, use
+`--entrypoint /opt/agens/bin/agens` to call `agens serve` directly):
+
+```bash
+agens serve /path/to/model --tp 2 --gpu-gib 128 --wctx 262148 --mode server --max-batch 48 --max-convs 48 \
+  --vision 1 --mtp /path/to/mtp
+```
+
+Leave `--pool` unset: in server mode the KV pool takes what the `--gpu-gib` budget leaves (here 1,050,040 tokens per
+GPU, 33 resident sessions of 30K tokens or 22 of 45K) and prints the breakdown at startup. Measured with Volundr
+INT4 and `--mtp` (1.3.4 / 1.3.5), decode tok/s:
+
+| Load | tok/s |
+|---|---|
+| one request, short prompt, greedy | 315 |
+| one request, 6K / 22K-token prompt, greedy | 293 / 312 |
+| 16 / 32 / 48 concurrent requests, default sampling, aggregate | 1,329 / 1,620 / 1,857 |
+| 48 concurrent multi-turn agent sessions of ~30K tokens, aggregate | 144 (0 failed requests, median time to first token 1.1 s) |
+| 48 concurrent multi-turn agent sessions of ~45K tokens, aggregate | 101 (0 failed requests, median time to first token 1.4 s) |
+
+Greedy output is identical with and without `--mtp`, alone and batched up to 48 requests. See the 1.3.2 to 1.3.5
+entries in [CHANGELOG.md](CHANGELOG.md) for the conditions of each number.
+
+### Earlier comparison (1.2.0)
+
 Speed. Single stream, decode tok/s, with the drafter, same prompts and weights on both sides, on NVLink-class GPUs
-(compute capability 9.0):
+(compute capability 9.0), measured on 1.2.0; later releases are faster on these GPUs (see above):
 
 | Prompt class | 4-bit: SGLang 1 GPU | Engine 1 GPU | Engine `--tp 2` | Engine `--tp 4` | bf16: SGLang `--tp 2` | Engine `--tp 2` | SGLang `--tp 4` | Engine `--tp 4` |
 |---|---|---|---|---|---|---|---|---|
