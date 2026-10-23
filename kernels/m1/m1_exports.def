@@ -70,3 +70,6 @@ ak_m1_session_snap
 ak_m1_session_from_snap
 ak_m1_free_slots
 ak_m1_recover
+ak_m1_live_sessions
+ak_m1_kv_groups
+ak_m1_rows_freed
