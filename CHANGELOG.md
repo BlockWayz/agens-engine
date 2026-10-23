@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.3.5
+
+### New
+
+- **Running requests are no longer ended for lack of KV cache.** In 1.3.4 a server under heavy long-context load
+  could end a request mid-reply with an HTTP 500 ("KV pool full"). The server now checks, before admitting a request
+  and before every prefill chunk and decode step, that every running request can still finish. A request that does
+  not fit waits instead of failing, and if the server stalls, the newest request that has not produced a token yet
+  goes back to the queue. Output is unchanged: greedy replies are token-identical to 1.3.4.
+- **The KV pool sizes itself in server mode.** With `--gpu-gib` and no `--pool`, `agens serve --mode server` now
+  gives the KV pool what the `--gpu-gib` budget leaves after the weights, the prefill cache, the prefix cache and
+  8 GiB of headroom, instead of one `--wctx` context shared by all sessions. The breakdown is printed at startup.
+  On 141 GB compute capability 9.0 GPUs, 2-way tensor parallel, Volundr INT4, `--gpu-gib 128 --max-batch 48
+  --max-convs 48 --vision 1` with speculative decoding, the pool holds 1,050,040 tokens per GPU: 33 resident
+  sessions of 30K tokens or 22 of 45K, where 1.3.4 held 8 and 5.
+- **Long agent sessions under load.** Same setup, 48 concurrent multi-turn agent sessions (session IDs, tool
+  schemas):
+  - about 30K tokens each: 14 failed requests -> 0, aggregate decode 66 -> 144 tokens/s, median time to first token
+    25.5 -> 1.1 s;
+  - about 45K tokens each: 5 failed requests -> 0, 45 -> 101 tokens/s, 27.8 -> 1.4 s.
+
+  In mixed-traffic runs (chat, image, 8K-document and agent requests, up to 48 concurrent clients) of 2 hours and
+  1 hour, about 7,000 requests in all, no request failed and GPU memory stayed flat. Short-chat median time to first
+  token was 0.49 s.
+- **Conversation-aware eviction.** When rows run short the server frees, in order: prefix-cache snapshots that
+  actually return rows, then conversations idle for more than 10 s with no turn queued (oldest first), then recently
+  idle ones. A new long conversation waits (up to 600 s) while the active conversations would not fit. Short
+  requests without a session ID skip that wait.
+- **Fairer prefill.** The shortest remaining prompt is prefilled first, and every 4th chunk goes to the oldest
+  waiting request, so short requests are not stuck behind long documents and long ones still progress.
+- **Request log.** Each request's done line now shows its queue time and its time to first token after admission.
+
+### Changed
+
+- **`--gpu-gib` now counts memory used by other processes on the GPU** in server mode when the pool is auto-sized:
+  everything in use on the GPU when the engine starts counts against the budget (capped at the device's memory). If
+  another process holds GPU memory, the pool is that much smaller than on an empty GPU.
+- **Batched-verify CUDA graphs are capped at 64** (least recently used dropped). Without a cap, long runs with many
+  different batch shapes kept adding graphs until the GPU ran out of memory.
+
+### Options
+
+- `--pool N`: a fixed KV pool of N tokens per GPU (no auto-sizing).
+- `AGENS_SERVE_AUTO_POOL=0`: the 1.3.4 behaviour (a pool of one `--wctx` context).
+- `AGENS_SERVE_POOL_HEADROOM_GIB` (default 8): memory the auto-sized pool leaves free.
+- `AGENS_SERVE_ADMIT_WAIT_S` (default 600): how long a new conversation waits for room before it may evict recently
+  used ones.
+- `AGENS_M1_BV_GRAPHS` (default 64): the batched-verify CUDA graph cap.
+
+### Recommended server flags (compute capability 9.0, long agent sessions)
+
+`--tp 2 --gpu-gib 128 --wctx 262148 --mode server --max-batch 48 --max-convs 48 --vision 1`, plus your drafting
+flags. Leave `--pool` unset so the pool sizes itself.
+
+### Unchanged
+
+- Greedy output on our test prompts is identical to 1.3.4, alone and batched. Single-stream and 48-request decode
+  speed are unchanged.
+- Budget mode (`--budget-gib`, all `--profile` settings) is not affected: every profile keeps its 1.3.4 context.
+
 ## 1.3.4
 
 ### New

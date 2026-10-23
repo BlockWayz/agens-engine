@@ -3569,6 +3569,22 @@ int verify_body_b(int B) {
 std::map<std::vector<long long>, std::vector<cudaGraphExec_t>> g_bvgraphs;
 std::map<std::vector<long long>, int> g_bvwarm;
 std::deque<std::vector<long long>> g_bvtier_order;
+// (1.3.5) all-GPU KV: at most AGENS_M1_BV_GRAPHS (default 64) batched verify graphs, the least recently replayed dropped
+// (a mixed load -- short and long sequences in one batch -- keys a graph per row-regime pattern: unbounded, they took
+// 22 GB in a 10-minute soak and the next prefill ran out of memory)
+std::map<std::vector<long long>, unsigned long long> g_bvuse;
+unsigned long long g_bvtick = 0;
+void bv_graphs_trim() {
+  static const size_t cap = getenv("AGENS_M1_BV_GRAPHS") ? std::max(1, atoi(getenv("AGENS_M1_BV_GRAPHS"))) : 64;
+  while (g_bvgraphs.size() > cap) {
+    auto lru = g_bvgraphs.begin();
+    for (auto it = g_bvgraphs.begin(); it != g_bvgraphs.end(); ++it)
+      if (g_bvuse[it->first] < g_bvuse[lru->first]) lru = it;
+    for (auto ex : lru->second) cudaGraphExecDestroy(ex);
+    g_bvuse.erase(lru->first);
+    g_bvgraphs.erase(lru);
+  }
+}
 int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_out, const int* hint = nullptr,
                const int* nh = nullptr) {
   const auto t_start = std::chrono::steady_clock::now();
@@ -3638,6 +3654,7 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
   auto it = g_bvgraphs.find(key);
   int e = 0;
   if (it != g_bvgraphs.end()) {
+    g_bvuse[key] = ++g_bvtick;
     for (auto ex : it->second) CK(cudaGraphLaunch(ex, S.s));
   } else if (graphs_on() && !mixed && g_bvwarm[key] > 0) {
     std::vector<cudaGraph_t> segs;
@@ -3655,6 +3672,8 @@ int spec_batch(const int* sess, int B, const int* bonus, int* emitted, int* n_ou
     std::vector<cudaGraphExec_t> exs;
     if (instantiate(segs, exs, "batched verify")) {
       g_bvgraphs[key] = exs;
+      g_bvuse[key] = ++g_bvtick;
+      if (!tiered) bv_graphs_trim();
       if (tiered) {
         static const size_t keep = getenv("AGENS_M1_BV_TIER_GRAPHS") ? std::max(1, atoi(getenv("AGENS_M1_BV_TIER_GRAPHS"))) : 8;
         g_bvtier_order.push_back(key);
@@ -3721,7 +3740,7 @@ void drop_all_graphs() {  // warm counts are kept: the next step of a key captur
   for (auto& g : g_vgraphs) destroy_execs(g.second);
   for (auto& g : g_bvgraphs) destroy_execs(g.second);
   for (auto& g : g_bgraphs) cudaGraphExecDestroy(g.second);
-  g_graphs.clear(), g_vgraphs.clear(), g_bvgraphs.clear(), g_bgraphs.clear(), g_bvtier_order.clear();
+  g_graphs.clear(), g_vgraphs.clear(), g_bvgraphs.clear(), g_bgraphs.clear(), g_bvtier_order.clear(), g_bvuse.clear();
 }
 int batch_body(int Bp, bool far) {
   CK(cudaMemcpyAsync(S.bstep_d, S.bstep_h, (size_t)Bp * kBRec * sizeof(int), cudaMemcpyHostToDevice, S.s));
@@ -3889,6 +3908,10 @@ int ak_m1_init(int Wctx, const char* mixers, int engram_a, int engram_b, void* e
   g_ref.assign(rows / 4, 0);
   g_pad_row = 4 * g_free.front();  // the highest page: padding rows of batch buckets write here, never read by sessions
   g_free.erase(g_free.begin());
+  // AGENS_M1_POOL_SKIP_ROWS=n (correctness runs): the lowest n rows are held for good, so sessions take rows from n up
+  // (a large pool's high row numbers, which a lone session never reaches otherwise)
+  if (const char* e = getenv("AGENS_M1_POOL_SKIP_ROWS"))
+    for (int k = atoi(e) / 4; k > 0 && g_free.size() > 1; --k) g_ref[g_free.back()] = 1, g_free.pop_back();
   g_slot_used.assign(g_nslots + 1, 0);
   g_sess.clear();
   g_cur = new_session();
@@ -4544,6 +4567,64 @@ int ak_m1_session_free(int id) {  // not the active one
   return 0;
 }
 int ak_m1_pool_free_rows() { return 4 * (int)g_free.size(); }  // whole free pages
+// Live sessions and the KV rows they hold in all (pages counted once) -- leak checks (serve.rs AGENS_SERVE_KV_TRACE)
+int ak_m1_live_sessions(int* rows_used) {
+  int n = 0;
+  for (const Session& ss : g_sess) n += ss.live;
+  if (rows_used) *rows_used = 4 * (int)(g_ref.size() - g_free.size());
+  return n;
+}
+// KV accounting of agens serve (serve.rs KvPolicy), one pass over the pages of sessions ids[0, n), each in group grp[j]
+// (0: idle -- evictable; 1 .. ng-1: one running request's sessions). out[0] = rows that evicting every group-0 session
+// would give back (pages no session outside group 0 holds); out[g] = rows given back or made evictable when request g
+// ends (pages held by its sessions and otherwise only by group 0). Pages shared by two requests, or held by a session
+// not listed, count nowhere. A query: nothing changes.
+int ak_m1_kv_groups(const int* ids, const int* grp, int n, int ng, int* out) {
+  static std::vector<int> cnt, own, touched;
+  if (cnt.size() != g_ref.size()) cnt.assign(g_ref.size(), 0), own.assign(g_ref.size(), -1);
+  touched.clear();
+  for (int j = 0; j < n; ++j) {
+    const int id = ids[j], g = grp[j];
+    if (id < 0 || id >= (int)g_sess.size() || !g_sess[id].live) continue;
+    const std::vector<int>& r = g_sess[id].rows;
+    for (int k = ((int)r.size() - 1) & ~3; k >= 0; k -= 4) {
+      const int pg = r[k] >> 2;
+      if (cnt[pg]++ == 0) touched.push_back(pg);
+      if (g > 0) own[pg] = own[pg] == -1 || own[pg] == g ? g : -2;
+    }
+  }
+  for (int g = 0; g < ng; ++g) out[g] = 0;
+  for (int pg : touched) {
+    if (cnt[pg] == g_ref[pg]) {
+      if (own[pg] == -1) out[0] += 4;
+      else if (own[pg] > 0 && own[pg] < ng) out[own[pg]] += 4;
+    }
+    cnt[pg] = 0, own[pg] = -1;
+  }
+  return 0;
+}
+// Rows that freeing every session of ids[0, n) (distinct ids) would give back to the pool: the pages whose every
+// reference is one of theirs (a page also held by a session outside the set stays). A query: nothing changes.
+int ak_m1_rows_freed(const int* ids, int n) {
+  static std::vector<int> cnt, touched;
+  if (cnt.size() != g_ref.size()) cnt.assign(g_ref.size(), 0);
+  touched.clear();
+  for (int j = 0; j < n; ++j) {
+    const int id = ids[j];
+    if (id < 0 || id >= (int)g_sess.size() || !g_sess[id].live) continue;
+    const std::vector<int>& r = g_sess[id].rows;
+    for (int k = ((int)r.size() - 1) & ~3; k >= 0; k -= 4) {
+      const int pg = r[k] >> 2;
+      if (cnt[pg]++ == 0) touched.push_back(pg);
+    }
+  }
+  int freed = 0;
+  for (int pg : touched) {
+    freed += cnt[pg] == g_ref[pg];
+    cnt[pg] = 0;
+  }
+  return 4 * freed;
+}
 // Logits of the last forward (bf16 [vocab_valid], last token) into host memory; returns vocab_valid or < 0.
 int ak_m1_logits(void* host_dst) {
   use(dev_of(NL - 1));

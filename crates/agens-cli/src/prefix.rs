@@ -16,8 +16,8 @@
 //!
 //! Memory: snapshot buffers come from one pool allocated at startup (GPU memory, or pinned host RAM with
 //! --prefix-cache-mem host), sized by --prefix-cache-gib per rank; when it is used up the least recently used snapshot
-//! goes. KV pages held only by snapshots are freed by the engine's row eviction (serve.rs make_rows), which takes idle
-//! conversations and snapshots in one LRU order.
+//! goes. KV pages held only by snapshots are freed by the engine's row eviction (serve.rs make_rows), which takes such
+//! snapshots before idle conversations (serve.rs KvPolicy).
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -65,11 +65,16 @@ impl PrefixCache {
             // GPU pool: what is left after the load (weights, KV pool, W4 prefill cache, drafter) less 8 GiB of headroom
             // for prefill temporaries; the ranks are symmetric, so the leader's size holds for every rank
             agens_cuda::synchronize()?;
-            let free = agens_cuda::mem_info()?.0;
-            let fit = free.saturating_sub(8 << 30) / bytes.max(1);
+            let (free, total) = agens_cuda::mem_info()?;
+            let mut fit = free.saturating_sub(8 << 30) / bytes.max(1);
+            // (1.3.5) an auto-sized KV pool's --gpu-gib budget (m1.rs auto_pool): the snapshots stay inside it too
+            let budget = crate::m1::AUTO_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+            if budget > 0 {
+                fit = fit.min(budget.saturating_sub(total - free + (8 << 30)) / bytes.max(1));
+            }
             if fit < n {
-                eprintln!("serve: prefix cache: {n} snapshots asked, {fit} fit in the {:.1} GB free (8 GiB headroom)",
-                          free as f64 / 1e9);
+                eprintln!("serve: prefix cache: {n} snapshots asked, {fit} fit in the {:.1} GB free{} (8 GiB headroom)",
+                          free as f64 / 1e9, if budget > 0 { " / the --gpu-gib budget" } else { "" });
                 n = fit;
             }
         }
@@ -181,15 +186,25 @@ impl PrefixCache {
         }
     }
 
-    /// The least recently used snapshot's time (row eviction orders conversations and snapshots together).
-    pub fn oldest(&self) -> Option<Instant> {
-        self.snaps.values().map(|s| s.last).min()
-    }
     /// Drop the least recently used snapshot -> (its length, idle seconds); its KV pages go back to the pool unless a
     /// session still shares them.
     pub fn evict_lru(&mut self) -> Result<Option<(usize, f64)>> {
         let Some((&tag, _)) = self.snaps.iter().min_by_key(|(_, s)| s.last) else { return Ok(None) };
-        let s = self.snaps.remove(&tag).unwrap();
+        self.evict(tag)
+    }
+    /// The snapshots as (last use, tag, session, length), least recently used first (serve.rs row eviction).
+    pub fn entries(&self) -> Vec<(Instant, u64, i32, usize)> {
+        let mut v: Vec<_> = self.snaps.iter().map(|(&t, s)| (s.last, t, s.sess, s.key.len())).collect();
+        v.sort_unstable();
+        v
+    }
+    /// The snapshots' sessions (they hold KV pages).
+    pub fn sessions(&self) -> impl Iterator<Item = i32> + '_ {
+        self.snaps.values().map(|s| s.sess)
+    }
+    /// Drop snapshot `tag` -> (its length, idle seconds).
+    pub fn evict(&mut self, tag: u64) -> Result<Option<(usize, f64)>> {
+        let Some(s) = self.snaps.remove(&tag) else { return Ok(None) };
         if s.end.is_some() {
             self.ends.remove(&(s.key.len(), chain(0, &s.key)));
         } else {
