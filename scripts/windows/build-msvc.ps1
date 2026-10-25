@@ -1,5 +1,5 @@
 # Activate MSVC environment
-$vsPath = "C:\Program Files\Microsoft Visual Studio\18\Community"
+$vsPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
 Import-Module (Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
 Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -Arch x64
 
