@@ -7,7 +7,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Checkpoint,
     [Parameter(Mandatory = $true)][string]$OutDir,
-    [string]$Exe = "$PSScriptRoot\target\release\agens.exe",
+    [string]$Exe = "$PSScriptRoot\..\..\target\release\agens.exe",
     [int]$NewTokens = 64,
     [double]$BudgetGiB = 16,
     [int]$Wctx = 262148,
