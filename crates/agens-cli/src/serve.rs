@@ -82,10 +82,8 @@ fn mem_trace(id: u64) {
               free as f64 / (1u64 << 20) as f64, mb(agens_cuda::m1::kda_pool_bytes(false)),
               mb(agens_cuda::m1::kda_pool_bytes(true)), mb(agens_cuda::m1::torch_reserved(false)));
 }
-fn req_stats(bit: u32) -> bool {
-    // AGENS_SERVE_REQ_STATS bitmask: bit0 = per-request prefill line (+ done line for spec requests),
-    // bit1 = done line for every request; 3 = both.
-    std::env::var("AGENS_SERVE_REQ_STATS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) & bit == bit
+fn req_stats() -> bool {
+    std::env::var("AGENS_SERVE_REQ_STATS").map_or(false, |v| v == "1")
 }
 fn prof_min() -> Option<usize> {
     std::env::var("AGENS_SERVE_PROFILE_MIN").ok().and_then(|v| v.parse().ok())
@@ -1200,7 +1198,7 @@ impl Engine {
                                 if Self::emit(a, t) {
                                     done_ids.push(a.job.id);
                                 }
-                                if a.job.conv.is_some() || req_stats(1) {
+                                if a.job.conv.is_some() || req_stats() {
                                     eprintln!("serve: request {} prefilled {} tokens in {:.2} s", a.job.id, nfeed,
                                               a.t0.elapsed().as_secs_f64());
                                 }
@@ -1524,7 +1522,8 @@ impl Engine {
             for i in (0..acts.len()).rev() {
                 if done_ids.contains(&acts[i].job.id) || acts[i].job.tx.is_closed() {
                     let a = acts.swap_remove(i);
-                    if (a.vsteps > 0 && req_stats(1)) || req_stats(2) {
+                    let rs = std::env::var("AGENS_SERVE_REQ_STATS").unwrap_or_default();
+                    if (a.vsteps > 0 && rs == "1") || rs == "2" {
                         // per-request acceptance (benchmarks): tokens generated, verify steps (2: every request, also
                         // the ones that decoded without speculation)
                         let ft = a.first_at.map_or(-1.0, |t| t.duration_since(a.t0).as_secs_f64());
