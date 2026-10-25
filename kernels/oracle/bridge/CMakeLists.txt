@@ -15,7 +15,7 @@ else()
   set_property(TARGET agens_oracle_bridge PROPERTY CXX_STANDARD 17)
 endif()
 # MSVC: the DLL's import library lists only decorated (dllexport) symbols; the m1 C ABI entry points are plain
-# extern "C" definitions, so give them an explicit export file (consumed by the /DEF link option below).
+# extern "C" definitions, so explicitly export them with WINDOWS_EXPORT_ALL_SYMBOLS.
 if(MSVC)
-  target_link_options(agens_oracle_bridge PRIVATE "LINKER:/DEF:${CMAKE_CURRENT_SOURCE_DIR}/oracle_bridge_exports.def")
+  set_target_properties(agens_oracle_bridge PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
