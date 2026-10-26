@@ -446,6 +446,29 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         bail!("--tp: one device per rank (no --devices)");
     }
     agens_cuda::set_device(devs[0] as usize)?;
+    // 1.3.6: on a device that also drives a display (or any device under Windows) keep AGENS_M1_HEADROOM_GIB (default
+    // 0.75) of it out of --budget-gib. The plan fills the budget to the last few hundred MB, and a 16 GiB budget is the
+    // whole of a 16 GB card: there the desktop's allocations either fail ours (Linux) or make the Windows driver move
+    // device memory to system RAM, read over PCIe (issue #3: 8K-token prefill 22 tok/s instead of ~600 with 0.00 GB
+    // free after init). Headless Linux devices keep 0 (the plans measured since 1.1 unchanged).
+    let budget_gib = if o.budget_gib > 0.0 {
+        let display = cfg!(windows) || agens_cuda::display_attached(devs[0] as usize).unwrap_or(false);
+        let head = std::env::var("AGENS_M1_HEADROOM_GIB").ok().and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(if display { 0.75 } else { 0.0 });
+        let (_, total) = agens_cuda::mem_info()?;
+        let room = ((total as f64 / (1u64 << 30) as f64 - head) * 100.0).floor() / 100.0;
+        if head > 0.0 && o.budget_gib > room {
+            eprintln!("m1: --budget-gib {} lowered to {room:.2}: {head} GiB of the {:.2} GiB device kept free ({})",
+                      o.budget_gib, total as f64 / (1u64 << 30) as f64,
+                      if std::env::var_os("AGENS_M1_HEADROOM_GIB").is_some() { "AGENS_M1_HEADROOM_GIB" }
+                      else { "it drives a display or runs under Windows; AGENS_M1_HEADROOM_GIB sets the amount" });
+            room
+        } else {
+            o.budget_gib
+        }
+    } else {
+        0.0
+    };
     // --budget-gib B is also a hard cap (unless AGENS_M1_NO_CAP=1): everything but B GiB of the device (the CUDA
     // context included) is taken by a ballast allocation, so any overshoot -- weights, pool, scratch, a lazily
     // allocated workspace -- fails with cudaErrorMemoryAllocation instead of silently using memory a 16 GB card lacks.
@@ -456,9 +479,9 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     if std::env::var("AGENS_FAR_ATTEND").is_err() {
         std::env::set_var("AGENS_FAR_ATTEND", "fused");
     }
-    let kv_auto = o.budget_gib > 0.0 && tp == 1 && std::env::var("AGENS_KV_TIER").is_err()
+    let kv_auto = budget_gib > 0.0 && tp == 1 && std::env::var("AGENS_KV_TIER").is_err()
         && std::env::var("AGENS_KV_IDX_HOST").is_err() && std::env::var("AGENS_KV_AUTO").map(|v| v != "0").unwrap_or(true);
-    if o.budget_gib > 0.0 {
+    if budget_gib > 0.0 {
         // budget mode: torch's allocator (ATen far branch) in expandable segments, the far extend in 1.25e7-element steps
         // of >= 8 query rows (A1d: 5e7 -> torch cache 0.28 GB after a 33K prefill instead of 2.9 GB; A1e: 1.25e7 / 8 rows
         // -> peak 17.20 instead of 17.35 GB with 8K prompts, 0.24 GB of torch cache after a 240K prefill instead of 1.47),
@@ -484,15 +507,15 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
             }
         }
     }
-    if o.budget_gib > 0.0 && std::env::var("AGENS_M1_NO_CAP").map(|v| v != "1").unwrap_or(true) {
+    if budget_gib > 0.0 && std::env::var("AGENS_M1_NO_CAP").map(|v| v != "1").unwrap_or(true) {
         agens_cuda::synchronize()?;
         let (free, total) = agens_cuda::mem_info()?;
-        let cap = (o.budget_gib * (1u64 << 30) as f64) as usize;
+        let cap = (budget_gib * (1u64 << 30) as f64) as usize;
         if total - free + (64 << 20) < cap && cap < total {
             ballast = free - (cap - (total - free));
             agens_cuda::leak(agens_cuda::device_alloc(ballast)?);
             eprintln!("m1: hard cap {:.2} GiB: {:.2} GiB of the device held by a ballast (context etc. {:.2} GiB)",
-                      o.budget_gib, ballast as f64 / (1u64 << 30) as f64, (total - free) as f64 / (1u64 << 30) as f64);
+                      budget_gib, ballast as f64 / (1u64 << 30) as f64, (total - free) as f64 / (1u64 << 30) as f64);
         }
         CAP.store(ballast, std::sync::atomic::Ordering::Relaxed);
     }
@@ -533,10 +556,10 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     // --budget-gib 90 host-mapped ~13 GB of compute linears while the plan gave the room to a 505K-row KV pool).
     let weight_budget = if gpu_gib > 0.0 {
         (gpu_gib * (1u64 << 30) as f64) as usize
-    } else if o.budget_gib > 0.0 {
+    } else if budget_gib > 0.0 {
         agens_cuda::synchronize()?;
         let (free, total) = agens_cuda::mem_info()?;
-        let cap = ((o.budget_gib * (1u64 << 30) as f64) as usize).min(total);
+        let cap = ((budget_gib * (1u64 << 30) as f64) as usize).min(total);
         // with the ballast in place the free memory is the cap's room (total - free counts the ballast); without it
         // (AGENS_M1_NO_CAP=1) the room is the cap less what is in use
         let room = if ballast > 0 { free } else { cap.saturating_sub(total - free).min(free) };
@@ -555,11 +578,11 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     // the embedding and Engram tables (row lookups: ~8 us per lookup over PCIe when host-mapped) on the GPU in native
     // mode (--gpu-gib, no --budget-gib), as far as the weight budget allows; host-mapped in budget mode (consumer
     // cards: 2.5 + 4.3 GB). AGENS_M1_LOOKUP_GPU=0|1 overrides.
-    let lookups_gpu = std::env::var("AGENS_M1_LOOKUP_GPU").map(|v| v == "1").unwrap_or(gpu_gib > 0.0 && o.budget_gib <= 0.0);
+    let lookups_gpu = std::env::var("AGENS_M1_LOOKUP_GPU").map(|v| v == "1").unwrap_or(gpu_gib > 0.0 && budget_gib <= 0.0);
     // native mode: the W4H layout (kernels/src/w4h.cu) in its "auto" shape classes (MLP gate_up, attention k / v, KDA
     // f_down: faster than KT at m = 1 / 8 on compute capability 9.0; bit-identical); devices without the 200 KB shared-memory opt-in
     // keep KT by themselves. AGENS_W4H set: as given (0 = off).
-    if gpu_gib > 0.0 && o.budget_gib <= 0.0 && std::env::var_os("AGENS_W4H").is_none() {
+    if gpu_gib > 0.0 && budget_gib <= 0.0 && std::env::var_os("AGENS_W4H").is_none() {
         std::env::set_var("AGENS_W4H", "2");
     }
     // =draft: the INT8 head (1.27 GB more) for the drafter's candidate logits while the target decodes with the bf16
@@ -839,14 +862,14 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     }
     let t_weights = t0.elapsed().as_secs_f64();
     // the W4 prefill weight cache in budget mode only when forced on (--w4-prefill-cache 1): the plan counts it
-    let budget_cache = o.budget_gib > 0.0 && w4_cache_mode(o) == "1" && devs.len() == 1;
+    let budget_cache = budget_gib > 0.0 && w4_cache_mode(o) == "1" && devs.len() == 1;
     if budget_cache {
         let b = agens_cuda::m1::w4_cache_bytes();
         reserve.push((format!("W4 prefill weight cache (dequantized bf16 W4 linears, {:.2} GB)", b as f64 / 1e9), b));
     }
     let mut pool = o.pool;
     let (mut auto_w4, mut auto_wctx) = (false, None);
-    if o.auto_pool && o.budget_gib <= 0.0 && pool == 0 {
+    if o.auto_pool && budget_gib <= 0.0 && pool == 0 {
         (pool, auto_w4) = auto_pool(o, &ck.config, wctx, w4_max_nk, &reserve, tp, rank)?;
         if pool < wctx {
             let w = (pool.saturating_sub(4) / 4096) * 4096 + 4;
@@ -857,10 +880,10 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
             auto_wctx = Some(w);
         }
     }
-    if o.budget_gib > 0.0 {  // size the KV pool from the budget left after weights + context (one device)
+    if budget_gib > 0.0 {  // size the KV pool from the budget left after weights + context (one device)
         agens_cuda::synchronize()?;
         let (free, total) = agens_cuda::mem_info()?;
-        let budget = ((o.budget_gib * (1u64 << 30) as f64) as usize).min(total);
+        let budget = ((budget_gib * (1u64 << 30) as f64) as usize).min(total);
         let mut p = crate::plan::plan(&ck.config, budget, total - free - ballast, o.sessions, wctx, w4_max_nk, &reserve, tp);
         if kv_auto {
             if p.pool_rows >= wctx {
@@ -879,7 +902,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
             eprintln!("{l}");
         }
         if p.pool_rows < 4096 {
-            bail!("budget {} GiB leaves no room for a KV pool", o.budget_gib);
+            bail!("budget {} GiB leaves no room for a KV pool", budget_gib);
         }
         // at most one full-length context of rows by default (the sessions share the pool): with tiered KV every pool
         // row also pins ~87-91 KB of host RAM (24 GB at 262K), so a budget-sized pool on a big card would pin far more
@@ -904,9 +927,9 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         if pool < wctx {
             let w = (pool.saturating_sub(4) / 4096) * 4096 + 4; // the profiles' form: 4096 k + 4
             if w < 2 * crate::plan::chunk().max(4096) {
-                bail!("budget {} GiB: the KV pool ({pool} rows) cannot hold a useful context (--wctx {wctx})", o.budget_gib);
+                bail!("budget {} GiB: the KV pool ({pool} rows) cannot hold a useful context (--wctx {wctx})", budget_gib);
             }
-            eprintln!("m1: --wctx {wctx} clamped to {w}: the KV pool holds {pool} rows at the {} GiB cap", o.budget_gib);
+            eprintln!("m1: --wctx {wctx} clamped to {w}: the KV pool holds {pool} rows at the {} GiB cap", budget_gib);
             wctx = w;
         }
     }
@@ -951,7 +974,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         pl.on_host as f64 / 1e9,
         t0.elapsed().as_secs_f64()
     );
-    if o.budget_gib > 0.0 {
+    if budget_gib > 0.0 {
         if !by_type.is_empty() {
             let (tb, tp) = by_type.values().fold((0, 0), |a, v| (a.0 + v.0, a.1 + v.1));
             eprintln!("m1: mixed-precision KT weights {:.3} GB, {:.4} bits/weight with scales over {:.3} B params: {}",
@@ -974,7 +997,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
                   dual as f64 / 1e9, std::env::var("AGENS_W4H_MMAX").unwrap_or_default());
     }
     w4_prefill_cache(o, budget_cache || auto_w4)?;
-    if o.budget_gib > 0.0 && std::env::var("AGENS_M1_PREFILL_RESERVE").map(|v| v != "0").unwrap_or(true) {
+    if budget_gib > 0.0 && std::env::var("AGENS_M1_PREFILL_RESERVE").map(|v| v != "0").unwrap_or(true) {
         // the plan's prefill temporaries taken now, before any CUDA graph (AGENS_M1_PREFILL_RESERVE=0: 1.3.1's lazy way)
         let (kb, tb) = (crate::plan::kda_temp_bytes(tp), crate::plan::torch_temp_bytes(tp));
         agens_cuda::m1::prefill_reserve(kb, tb)?;
@@ -987,6 +1010,13 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         eprintln!("m1: device {d}: {:.2} GB used of {:.2} GB after init (weights + caches + scratch + CUDA context){}",
                   (total - free - b) as f64 / 1e9, total as f64 / 1e9,
                   if b > 0 { format!(", {:.2} GB free under the cap", free as f64 / 1e9) } else { String::new() });
+        // the plan keeps its runtime reserves free at this point; (next to) nothing free means the budget is the whole
+        // device and something outside the plan (a display, another process) took the rest
+        if free < (256 << 20) {
+            eprintln!("m1: WARNING: device {d} has {:.2} GB free after init. Allocations past the device's memory fail \
+                       (Linux) or move to system RAM and run several times slower (Windows driver). Lower --budget-gib \
+                       or set AGENS_M1_HEADROOM_GIB (README, Memory and context)", free as f64 / 1e9);
+        }
     }
     pl.on(0)?;
     Ok(())

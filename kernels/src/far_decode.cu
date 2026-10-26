@@ -403,6 +403,35 @@ __global__ void pool_means_kernel(const long long* top, const long long* pos, co
     reinterpret_cast<uint4*>(vb + (size_t)j * KV * D)[r] = vs[r];
   }
 }
+// (3) AGENS_KV_MEANS_INT8: block means stored per page as int8 + fp32 scale per (page, kv head); read as bf16(q * s)
+// (what ak_kv_dequant_rows gives the non-graph paths)
+__global__ void pool_means_i8_kernel(const long long* top, const long long* pos, const int* r2t, int Wctx,
+                                     const int8_t* km, const int8_t* vm, const float* ksc, const float* vsc, bf16* kb,
+                                     bf16* vb, int8_t* ok, int hi, const int* nvalid) {
+  const int j = blockIdx.x;
+  if (nvalid && j >= *nvalid) return;
+  const long long t = top[j];
+  if (ok && threadIdx.x == 0) ok[j] = t <= nmax_of(pos[0]);
+  long long col = t * C + C - 1;
+  col = col < 0 ? 0 : (col > Wctx - 1 ? Wctx - 1 : col);
+  const int sr = r2t[col], page = (sr < 0 ? 0 : (sr > hi ? hi : sr)) / C;
+  for (int r8 = threadIdx.x; r8 < KV * D / 8; r8 += blockDim.x) {
+    const int h = r8 * 8 / D;
+    const uint2 ku = reinterpret_cast<const uint2*>(km + (size_t)page * KV * D)[r8];
+    const uint2 vu = reinterpret_cast<const uint2*>(vm + (size_t)page * KV * D)[r8];
+    const int8_t* ke = reinterpret_cast<const int8_t*>(&ku);
+    const int8_t* ve = reinterpret_cast<const int8_t*>(&vu);
+    const float ks = ksc[(size_t)page * KV + h], vs = vsc[(size_t)page * KV + h];
+    alignas(16) bf16 ko[8], vo[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      ko[e] = __float2bfloat16_rn(__fmul_rn((float)ke[e], ks));
+      vo[e] = __float2bfloat16_rn(__fmul_rn((float)ve[e], vs));
+    }
+    reinterpret_cast<uint4*>(kb + (size_t)j * KV * D)[r8] = *reinterpret_cast<const uint4*>(ko);
+    reinterpret_cast<uint4*>(vb + (size_t)j * KV * D)[r8] = *reinterpret_cast<const uint4*>(vo);
+  }
+}
 __global__ void pool_int8_kernel(const long long* top, const long long* pos, const int* r2t, int Wctx, const int8_t* kq,
                                  const int8_t* vq, const float* ksc, const float* vsc, bf16* kb, bf16* vb, int8_t* ok,
                                  int hi,
@@ -781,7 +810,8 @@ extern "C" int ak_far_decode(const void* qi, const void* qh, const void* o_loc, 
   return ak_far_decode_src(qi, qh, o_loc, lse, pos, r2t, Wctx, 0, kc, vc, nullptr, nullptr, blk, rows, ws, out, stream);
 }
 
-// src 0: kc/vc = bf16 K/V rows; 1: kc/vc = bf16 block means per 4-row page; 2: kc/vc = int8 rows, ksc/vsc = scales.
+// src 0: kc/vc = bf16 K/V rows; 1: kc/vc = bf16 block means per 4-row page; 2: kc/vc = int8 rows, ksc/vsc = scales;
+// 3: kc/vc = int8 block means per 4-row page, ksc/vsc = scales per (page, kv head) (AGENS_KV_MEANS_INT8).
 extern "C" int ak_far_decode_src(const void* qi, const void* qh, const void* o_loc, const float* lse,
                                  const long long* pos, const int* r2t, int Wctx, int src, const void* kc, const void* vc,
                                  const float* ksc, const float* vsc, const void* blk, int rows, void* ws, void* out,
@@ -797,6 +827,9 @@ extern "C" int ak_far_decode_src(const void* qi, const void* qh, const void* o_l
     if (src == 1)
       pool_means_kernel<<<KSEL, 128, 0, st>>>(w.top, pos, r2t, Wctx, static_cast<const bf16*>(kc),
                                               static_cast<const bf16*>(vc), w.kb, w.vb, w.ok, hi, nullptr);
+    else if (src == 3)
+      pool_means_i8_kernel<<<KSEL, 128, 0, st>>>(w.top, pos, r2t, Wctx, static_cast<const int8_t*>(kc),
+                                                 static_cast<const int8_t*>(vc), ksc, vsc, w.kb, w.vb, w.ok, hi, nullptr);
     else if (src == 2)
       pool_int8_kernel<<<KSEL, 128, 0, st>>>(w.top, pos, r2t, Wctx, static_cast<const int8_t*>(kc),
                                              static_cast<const int8_t*>(vc), ksc, vsc, w.kb, w.vb, w.ok, hi, nullptr);
@@ -818,6 +851,9 @@ extern "C" int ak_far_decode_src(const void* qi, const void* qh, const void* o_l
   if (src == 1)
     pool_means_kernel<<<KSEL, 128, 0, st>>>(w.top, pos, r2t, Wctx, static_cast<const bf16*>(kc),
                                             static_cast<const bf16*>(vc), w.kb, w.vb, w.ok, hi, nullptr);
+  else if (src == 3)
+    pool_means_i8_kernel<<<KSEL, 128, 0, st>>>(w.top, pos, r2t, Wctx, static_cast<const int8_t*>(kc),
+                                               static_cast<const int8_t*>(vc), ksc, vsc, w.kb, w.vb, w.ok, hi, nullptr);
   else if (src == 2)
     pool_int8_kernel<<<KSEL, 128, 0, st>>>(w.top, pos, r2t, Wctx, static_cast<const int8_t*>(kc),
                                            static_cast<const int8_t*>(vc), ksc, vsc, w.kb, w.vb, w.ok, hi, nullptr);
@@ -1003,6 +1039,9 @@ extern "C" int ak_far_decode_multi_fetch(int T, const long long* pos, const int*
   if (src == 1)
     pool_means_kernel<<<n, 128, 0, st>>>(w.uniq, pos, r2t, Wctx, static_cast<const bf16*>(kc), static_cast<const bf16*>(vc),
                                          w.ukb, w.uvb, nullptr, hi, w.cnt);
+  else if (src == 3)
+    pool_means_i8_kernel<<<n, 128, 0, st>>>(w.uniq, pos, r2t, Wctx, static_cast<const int8_t*>(kc),
+                                            static_cast<const int8_t*>(vc), ksc, vsc, w.ukb, w.uvb, nullptr, hi, w.cnt);
   else if (src == 2)
     pool_int8_kernel<<<n, 128, 0, st>>>(w.uniq, pos, r2t, Wctx, static_cast<const int8_t*>(kc),
                                         static_cast<const int8_t*>(vc), ksc, vsc, w.ukb, w.uvb, nullptr, hi, w.cnt);

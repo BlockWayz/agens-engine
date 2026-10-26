@@ -30,6 +30,7 @@ int ak_memcpy_d2h(void* dst, const void* src, size_t bytes) {
 }
 int ak_synchronize(void) { return (int)cudaDeviceSynchronize(); }
 int ak_mem_info(size_t* f, size_t* t) { return (int)cudaMemGetInfo(f, t); }
+int ak_device_display(int dev, int* on) { return (int)cudaDeviceGetAttribute(on, cudaDevAttrKernelExecTimeout, dev); }
 const char* ak_error_string(int code) { return cudaGetErrorString((cudaError_t)code); }
 // Pinned, mapped host memory: the returned pointer is valid on host AND device (UVA), for weights that do not fit.
 int ak_host_alloc(void** ptr, size_t bytes) { return (int)cudaHostAlloc(ptr, bytes, cudaHostAllocMapped | cudaHostAllocPortable); }

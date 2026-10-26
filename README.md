@@ -52,7 +52,7 @@ The same flags work on the image directly:
 ```bash
 docker run --gpus device=0 --ipc=host -p 30000:30000 \
   -v /path/to/model:/model:ro -v /path/to/drafter:/drafter:ro \
-  ghcr.io/blockwayz/agens-engine:1.3.5 --profile 16gb --model /model --drafter /drafter
+  ghcr.io/blockwayz/agens-engine:1.3.6 --profile 16gb --model /model --drafter /drafter
 ```
 
 ## Profiles
@@ -76,8 +76,27 @@ on), and the `24gb` profile 258,052 with images on and `--mtp`.
 Extra `agens serve` flags go after `--`, for example `-- --served-model-name agens`. The `AGENS_*` environment
 variables override the profile's tuning defaults.
 
+Outside the container (a build from source), the same profiles are `agens serve /path/to/model --profile 16gb`
+(1.3.6), with `--spec-drafter DIR`, `--mtp DIR` and `--vision 1` for the drafter, the MTP head and image input. The
+profile sets the same flags and `AGENS_*` defaults as the container; flags given on the command line win.
+
 In 1.0.0 the `24gb` profile did not start with the 4-bit weights and the drafter. 1.1.0 fixes this (see the
 changelog).
+
+### Memory and context
+
+The `16gb` numbers were measured on Linux, on a GPU that drives no display, held to 16 GiB. On a physical 16 GB
+card the budget is the whole card, so memory that something else on the GPU uses (a desktop, another process)
+comes out of the KV pool:
+
+- From 1.3.6, when the GPU drives a display or the engine runs under Windows, the engine keeps 0.75 GiB of the GPU
+  out of the budget and logs `--budget-gib 16 lowered to ...`. The context is then clamped to what the pool holds
+  (`--wctx N clamped to M`). `AGENS_M1_HEADROOM_GIB=N` sets the amount; `0` turns it off.
+- If less than 256 MB of the GPU is free after loading, the engine logs a `WARNING`. On Linux an allocation past
+  the GPU's memory fails. The Windows driver can instead move GPU memory to system RAM, and every step then reads it
+  over PCIe, many times slower. Setting "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" in the NVIDIA
+  Control Panel makes that case fail instead.
+- For the full context on a 16 GB card, drive the display from another GPU (an integrated GPU, for example).
 
 ### Request limits
 
@@ -158,6 +177,9 @@ plus the drafter's candidates for that slot.
   4.77 with MTP and the drafter vs 5.02 between two runs without drafting; server mode, 4 concurrent requests, 4.33
   vs 4.37.
 - Server-mode steps of more than 8 sequences skip the MTP chain (`AGENS_MTP_BATCH_MAX`); the drafter still runs.
+- MTP head v1.1 (the repository's `main` since 2026-10-23; the first head is tag `v1.0`): 1 to 12% more accepted
+  tokens per verify step than v1.0 in the `16gb` and `24gb` profiles with the drafter, Engine 1.3.5 (for example
+  code in `16gb` 3.47 -> 3.67, agent sessions in `24gb` 3.99 -> 4.45).
 
 Speed with and without `--mtp`, both with the drafter, one stream, on one 48 GB GPU of compute capability 8.9 held to
 the profile's budget; tok/s (accepted tokens per verify step):

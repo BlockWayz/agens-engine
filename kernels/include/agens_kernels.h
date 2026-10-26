@@ -23,6 +23,7 @@ int ak_memcpy_h2d(void* dst, const void* src, size_t bytes);
 int ak_memcpy_d2h(void* dst, const void* src, size_t bytes);
 int ak_synchronize(void);
 int ak_mem_info(size_t* free_bytes, size_t* total_bytes);
+int ak_device_display(int dev, int* on);  // cudaDevAttrKernelExecTimeout: the device drives a display
 const char* ak_error_string(int code);
 int ak_host_alloc(void** ptr, size_t bytes);  // pinned + mapped (device-accessible via UVA)
 int ak_host_free(void* ptr);

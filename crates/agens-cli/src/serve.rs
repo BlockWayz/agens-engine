@@ -1540,11 +1540,17 @@ impl Engine {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
-    let usage = "agens serve <ckpt_dir> [--model-dir DIR] [--host 0.0.0.0] [--port 30000] [--served-model-name NAME] \
+    let usage = "agens serve <ckpt_dir> [--profile 12gb|16gb|24gb|48gb] [--model-dir DIR] [--host 0.0.0.0] [--port 30000] [--served-model-name NAME] \
                  [--mode personal|server] [--max-batch 8] [--max-convs 64] [--budget-gib N] [--spec-drafter DIR] [--mtp DIR] \
                  [--spec-copy 1] [--no-fork 1] [--max-tokens-default 32768] [--think-guard 32,20,8192|off] \
                  [--prefix-cache-gib 16] [--prefix-cache-mem gpu|host] \
                  [m1 flags: --wctx --pool --sessions --gpu-gib --device]";
+    // 1.3.6: --profile (profile.rs): the container profiles' flags and AGENS_* defaults, ahead of the flags given
+    let (args, env) = crate::profile::expand(args, &|k| std::env::var(k).ok())?;
+    for (k, v) in &env {
+        std::env::set_var(k, v);
+    }
+    let args = &args[..];
     let ckpt = args.first().context(usage)?.clone();
     let (mut model_dir, mut host, mut port, mut name) = (ckpt.clone(), "0.0.0.0".to_string(), 30000u16, None);
     let (mut mode, mut max_batch, mut max_convs, mut drafter) = ("server".to_string(), 8usize, 64usize, None);

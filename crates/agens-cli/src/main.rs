@@ -25,6 +25,8 @@ mod m1;
 mod spec;
 #[cfg(feature = "m1")]
 mod mm;
+#[cfg(any(feature = "m1", test))]
+mod profile;
 
 const USAGE: &str = "usage:
   agens --version                       the engine version

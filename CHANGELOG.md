@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.6
+
+### New
+
+- **Headroom on GPUs that drive a display, and under Windows.** In budget mode the engine plans the whole budget,
+  and on a physical 16 GB card a 16 GiB budget is the whole card. When the GPU also drives a display or the engine
+  runs under Windows, the engine now keeps 0.75 GiB of it out of the budget and logs
+  `--budget-gib N lowered to M`; the context is clamped to the pool that fits. `AGENS_M1_HEADROOM_GIB` sets the
+  amount (`0`: off). GPUs that drive no display on Linux plan exactly as in 1.3.5. If less than 256 MB is free after
+  loading, the engine logs a warning: on Linux an allocation past the GPU's memory fails, while the Windows driver can
+  move GPU memory to system RAM and run every step many times slower (community report, issue #3).
+- **`agens serve --profile 12gb|16gb|24gb|48gb`.** The profiles are now built into the binary, so `agens serve` run
+  outside the container gets the same flags and `AGENS_*` defaults. The container's entry point passes `--profile`
+  through; its options are unchanged.
+- **INT8 far-field block means (opt-in, `AGENS_KV_MEANS_INT8=1`).** With the KV cache tiered to host RAM, the
+  far-field block means are stored as int8 with a scale per block and KV head, about 2.2 GB less host memory at 262K
+  tokens. Against bf16 means: needle-in-a-haystack 32K to 131K equal; GPQA Diamond at a 16K budget 76.0 vs 75.4
+  (paired, p 0.89); HumanEval equal. Off by default: decode at 30K tokens of context was 6 to 13% slower in the `16gb`
+  profile (compute capability 8.9, 48 GB card held to 16 GiB). Greedy output with it on is not identical to 1.3.5.
+
 ## 1.3.5
 
 ### New

@@ -130,7 +130,9 @@ pub fn plan(cfg: &VolundrConfig, budget: usize, used_now: usize, slots: usize, w
     let dense8 = std::env::var("AGENS_KV_INT8_DENSE").map(|v| v == "1").unwrap_or(false);
     let dense_tok = if dense8 { kvh * 256 * 2 + kvh * 4 * 2 } else { kv_tok };
     let row_gpu = nd * dense_tok + nb * 64 + if idx_host { 0 } else { nb * idx_row } + if tier { 0 } else { nb * bcsa_tok };
-    let row_host = if tier { nb * bcsa_tok + if means { nb * kv_tok / 4 } else { 0 } + if idx_host { nb * idx_row } else { 0 } }
+    // AGENS_KV_MEANS_INT8=1 (1.3.6): the block means int8 + an fp32 scale per kv head (K and V) instead of bf16
+    let mean_tok = if means && env_on("AGENS_KV_MEANS_INT8") { kvh * 256 * 2 + kvh * 4 * 2 } else { kv_tok };
+    let row_host = if tier { nb * bcsa_tok + if means { nb * mean_tok / 4 } else { 0 } + if idx_host { nb * idx_row } else { 0 } }
                    else { 0 }; // means: one row per page
     let (scratch, mut parts) = scratch_bytes(w4_max_nk, wctx, tier, tp);
     let scratch = scratch + reserve.iter().map(|p| p.1).sum::<usize>();

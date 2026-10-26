@@ -15,6 +15,9 @@ bool means();  // AGENS_KV_TIER=2 (bf16 only): the host far pool also keeps 4-ro
                // one mean row per selected block instead of 4 raw rows (4x less PCIe), bit-identical.
                // + AGENS_KV_CACHE=1: per (layer, session) GPU cache of last step's 512 staged means; only blocks
                // that were not selected last step cross PCIe (delta fetch), bit-identical
+bool means_i8();  // AGENS_KV_MEANS_INT8=1 (with AGENS_KV_TIER=2): the block-mean far pool stores int8 + an fp32 scale per
+                  // (block, kv head) instead of bf16 (half the far pool and its PCIe fetch; not bit-identical: the far
+                  // branch reads bf16(q * scale) means). Off by default; docs/session_persistence.md
 inline bool on() { return tier() || int8(); }
 
 // Allocation (init_device): every BCSA layer of device `dev` first, then init_device once.
@@ -42,7 +45,9 @@ int far_extend(const Ctx& c, void* qi, void* qh, void* o_loc, float* lse, void* 
 int commit_chunk(const Ctx& c);  // prefill: the chunk's last <= 4096 positions into the session's ring
 // Session hooks (per device): fork copies the ring slot; rebuild refills a ring from the pool after a restore.
 int fork(int dev, int src_kslot, int dst_kslot, cudaStream_t s);
-int rebuild(int dev, int kslot, const int* r2t, int seq, cudaStream_t s);
+// with_means = false: the block means are restored as they were (session persistence with AGENS_KV_MEANS_INT8)
+int rebuild(int dev, int kslot, const int* r2t, int seq, cudaStream_t s, bool with_means = true);
+int mean_pools(int layer, void** kq, void** vq, float** ks, float** vs);
 // Parking: bytes of one session's rings on `dev` (0 without tiering) and their copy to / from `buf` (bumps the slot's
 // block-cache generation either way).
 // Graph-safe decode path (tiering without the block cache): every value comes from device memory (positions, pool

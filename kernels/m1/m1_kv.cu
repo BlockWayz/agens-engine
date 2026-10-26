@@ -61,6 +61,7 @@ constexpr int QH = 24, KVH = 4, HD = 256, WIN = 4096, CHUNK = 4096, C = 4, KSEL_
 constexpr int RING = WIN + 8;
 constexpr int STAGE = WIN + CHUNK;           // local staging rows (int8): window + chunk, then one zero row
 constexpr int BF_ROW = KVH * HD * 2, I8_ROW = KVH * HD, SC_ROW = KVH * 4;
+constexpr int MT = 1024;  // block means quantized per launch (AGENS_KV_MEANS_INT8)
 
 #define CK(x)                                                                         \
   do {                                                                                \
@@ -93,6 +94,8 @@ struct Cache {  // AGENS_KV_CACHE=1: last step's staged block means per (layer, 
 };
 struct Dev {
   int nb = 0, nslots = 1, wrows = 0, ksel = 0, wctx = 0;
+  __nv_bfloat16* mtmp = nullptr;  // AGENS_KV_MEANS_INT8: block means (bf16) before they are quantized [MT][KVH][HD]
+  int* mloc = nullptr;            // ... and their pages [MT]
   std::map<long, Cache> cache;
   int *slot_of = nullptr, *misses = nullptr;  // pool row -> cache slot (-1), miss counter
   __nv_bfloat16 *att_k = nullptr, *att_v = nullptr;  // what far_attend reads (staging or a cache buffer)
@@ -135,16 +138,17 @@ void* hzero(size_t bytes, Dev& d) {  // pinned + mapped + portable: the pointer 
   d.host_bytes += bytes;
   return p;
 }
-int alloc_pool(Pool& p, size_t nrows, bool host, Dev& d) {
-  const size_t rb = int8() ? I8_ROW : BF_ROW;
+int alloc_pool(Pool& p, size_t nrows, bool host, Dev& d, bool q8) {
+  const size_t rb = q8 ? I8_ROW : BF_ROW;
   p.rows = host ? hzero(nrows * rb, d) : (void*)dzero<char>(nrows * rb, d);
   if (!p.rows) return (int)cudaErrorMemoryAllocation;
-  if (int8()) {
+  if (q8) {
     p.scale = host ? (float*)hzero(nrows * SC_ROW, d) : dzero<float>(nrows * KVH, d);
     if (!p.scale) return (int)cudaErrorMemoryAllocation;
   }
   return 0;
 }
+int alloc_pool(Pool& p, size_t nrows, bool host, Dev& d) { return alloc_pool(p, nrows, host, d, int8()); }
 // rows of `src` (list or identity) -> rows of `dst` (list or identity), bf16 or int8 (+ scales): data movement
 int move_rows(const Pool& src, const int* srows, const Pool& dst, const int* drows, int n, cudaStream_t s) {
   if (!int8()) return ak_kv_copy_rows(src.rows, srows, dst.rows, drows, n, BF_ROW, s);
@@ -159,6 +163,31 @@ int fetch_rows(const Pool& src, const int* srows, int n, __nv_bfloat16* dst, cud
 int write_rows(const void* x, int T, const int* drows, const Pool& dst, cudaStream_t s) {  // new tokens -> pool rows
   if (!int8()) return ak_kv_copy_rows(x, nullptr, dst.rows, drows, T, BF_ROW, s);
   return ak_kv_quant_store(x, T, KVH, HD, drows, (int8_t*)dst.rows, dst.scale, s);
+}
+// Block means of n blocks (block b = rows[4b..4b+3] of src) into the layer's mean pools at page drows[b * dstride] >>
+// dshift. bf16 (AGENS_KV_TIER=2): ak_kv_block_mean straight into the pool. AGENS_KV_MEANS_INT8: the same bf16 mean,
+// then quantized with the INT8 KV quantizer (ak_kv_quant_store: int8 + fp32 scale per (block, kv head), scale = amax /
+// 127) -- in pieces of MT blocks through fixed device buffers (graph-capture safe).
+int put_means(Dev& d, const Layer& L, const void* srck, const void* srcv, const int* rows, int n, const int* drows,
+              int dstride, int dshift, cudaStream_t s) {
+  if (!means_i8()) {
+    CK(ak_kv_block_mean(srck, rows, n, KVH * HD, L.km.rows, drows, dstride, dshift, s));
+    return ak_kv_block_mean(srcv, rows, n, KVH * HD, L.vm.rows, drows, dstride, dshift, s);
+  }
+  for (int i = 0; i < n; i += MT) {
+    const int m = std::min(MT, n - i);
+    CK(ak_kv_pick_rows(drows, i * dstride, dstride, m, dshift, d.mloc, s));
+    CK(ak_kv_block_mean(srck, rows + (size_t)C * i, m, KVH * HD, d.mtmp, nullptr, 0, 0, s));
+    CK(ak_kv_quant_store(d.mtmp, m, KVH, HD, d.mloc, (int8_t*)L.km.rows, L.km.scale, s));
+    CK(ak_kv_block_mean(srcv, rows + (size_t)C * i, m, KVH * HD, d.mtmp, nullptr, 0, 0, s));
+    CK(ak_kv_quant_store(d.mtmp, m, KVH, HD, d.mloc, (int8_t*)L.vm.rows, L.vm.scale, s));
+  }
+  return 0;
+}
+// mean rows of the layer's pool (pages `pages`) -> bf16 staging (identity order): a gather, or a gather + dequant
+int fetch_means(const Pool& src, const int* pages, int n, __nv_bfloat16* dst, cudaStream_t s) {
+  if (!means_i8()) return ak_kv_copy_rows(src.rows, pages, dst, nullptr, n, BF_ROW, s);
+  return ak_kv_dequant_rows((const int8_t*)src.rows, src.scale, pages, n, KVH, HD, dst, s);
 }
 int ring_base(const Dev& d, int li, int kslot) { return (li * d.nslots + (kslot - 1)) * RING; }
 int chunk_base(const Dev& d) { return d.nb * d.nslots * RING; }
@@ -196,9 +225,13 @@ bool means() {
   static int v = tier() && !int8() && getenv("AGENS_KV_TIER")[0] == '2';
   return v;
 }
+bool means_i8() {
+  static int v = means() && env_on("AGENS_KV_MEANS_INT8");
+  return v;
+}
 
 bool cache_on() {
-  static int v = means() && env_on("AGENS_KV_CACHE");
+  static int v = means() && !means_i8() && env_on("AGENS_KV_CACHE");
   return v;
 }
 
@@ -208,9 +241,9 @@ int alloc_layer(int dev, int layer, int rows, void** kc, void** vc) {
   L.dev = dev, L.li = d.nb++;
   CK(alloc_pool(L.k, (size_t)rows + 1, tier(), d));
   CK(alloc_pool(L.v, (size_t)rows + 1, tier(), d));
-  if (means()) {
-    CK(alloc_pool(L.km, (size_t)rows / C + 1, true, d));  // one mean row per 4-row page (+ trash page)
-    CK(alloc_pool(L.vm, (size_t)rows / C + 1, true, d));
+  if (means()) {  // one mean row per 4-row page (+ trash page); AGENS_KV_MEANS_INT8: int8 + a scale per kv head
+    CK(alloc_pool(L.km, (size_t)rows / C + 1, true, d, means_i8()));
+    CK(alloc_pool(L.vm, (size_t)rows / C + 1, true, d, means_i8()));
   }
   *kc = int8() ? nullptr : L.k.rows;
   *vc = int8() ? nullptr : L.v.rows;
@@ -236,6 +269,11 @@ int init_device(int dev, int nslots, int wctx) {
   d.sel_rows = dzero<int>((size_t)d.ksel * C, d);
   d.sel_last = dzero<int>(d.ksel, d);
   d.dtmp = dzero<int>(64, d);  // store_dec: 8; store_dec_multi: 6 per token (T <= 8)
+  if (means_i8() && (!(d.mtmp = dzero<__nv_bfloat16>((size_t)MT * KVH * HD, d)) || !(d.mloc = dzero<int>(MT, d))))
+    return (int)cudaErrorMemoryAllocation;
+  static bool warned = false;
+  if (env_on("AGENS_KV_MEANS_INT8") && !means_i8() && !warned)
+    warned = true, fprintf(stderr, "m1kv: AGENS_KV_MEANS_INT8 ignored: it needs the block-mean far pool (AGENS_KV_TIER=2, bf16 KV)\n");
   d.brows = dzero<int>(16 * 8, d);
   if (tier() && !(d.ringmap_b = dzero<int>((size_t)16 * wctx, d))) return (int)cudaErrorMemoryAllocation;
   d.wctx = wctx;
@@ -276,8 +314,7 @@ int store(const Ctx& c, const void* k, const void* v, const int* loc) {
     if (n1 > n0) {
       CK(ak_kv_window_rows(C * n0, C * (n1 - n0), 0, 0, ring_base(d, L.li, c.kslot), RING,
                            c.prefill ? c.seq0 : INT_MAX, chunk_base(d), d.tmp, c.s));
-      CK(ak_kv_block_mean(d.kw.rows, d.tmp, n1 - n0, KVH * HD, L.km.rows, c.r2t + C * n0 + C - 1, C, 2, c.s));
-      CK(ak_kv_block_mean(d.vw.rows, d.tmp, n1 - n0, KVH * HD, L.vm.rows, c.r2t + C * n0 + C - 1, C, 2, c.s));
+      CK(put_means(d, L, d.kw.rows, d.vw.rows, d.tmp, n1 - n0, c.r2t + C * n0 + C - 1, C, 2, c.s));
     }
   }
   return 0;
@@ -360,8 +397,8 @@ int far_prefetch(const Ctx& c, void* qi, void* pos, void* reqs, void* blk) {
     ch.cur = nw, ch.valid = true, ch.last_seq = c.seq0, ch.gen = g_gen[c.kslot];
     d.att_k = ch.k[nw], d.att_v = ch.v[nw];
   } else if (means()) {  // one mean row per selected block
-    CK(ak_kv_copy_rows(L.km.rows, d.sel_last, d.kf, nullptr, d.ksel, BF_ROW, d.side));
-    CK(ak_kv_copy_rows(L.vm.rows, d.sel_last, d.vf, nullptr, d.ksel, BF_ROW, d.side));
+    CK(fetch_means(L.km, d.sel_last, d.ksel, d.kf, d.side));
+    CK(fetch_means(L.vm, d.sel_last, d.ksel, d.vf, d.side));
   } else {
     CK(fetch_rows(L.k, d.sel_rows, n, d.kf, d.side));
     CK(fetch_rows(L.v, d.sel_rows, n, d.vf, d.side));
@@ -419,8 +456,8 @@ int far_extend(const Ctx& c, void* qi, void* qh, void* o_loc, float* lse, void* 
   }
   if (n > 0 && means()) {  // block means of blocks 0 .. nb-1 (pool row of each block's last token)
     CK(ak_kv_pick_rows(c.r2t, C - 1, C, n, 2, d.tmp, c.s));
-    CK(ak_kv_copy_rows(L.km.rows, d.tmp, d.ke, nullptr, n, BF_ROW, c.s));
-    CK(ak_kv_copy_rows(L.vm.rows, d.tmp, d.ve, nullptr, n, BF_ROW, c.s));
+    CK(fetch_means(L.km, d.tmp, n, d.ke, c.s));
+    CK(fetch_means(L.vm, d.tmp, n, d.ve, c.s));
   } else if (n > 0) {  // rows of positions 0 .. 4nb-1, in position order (= tkc.index({r2t[0:4nb]}))
     CK(fetch_rows(L.k, c.r2t, n, d.ke, c.s));
     CK(fetch_rows(L.v, c.r2t, n, d.ve, c.s));
@@ -470,7 +507,7 @@ int fork(int dev, int src_kslot, int dst_kslot, cudaStream_t s) {
   return 0;
 }
 
-int rebuild(int dev, int kslot, const int* r2t, int seq, cudaStream_t s) {
+int rebuild(int dev, int kslot, const int* r2t, int seq, cudaStream_t s, bool with_means) {
   if (!tier()) return 0;
   ++g_gen[kslot];
   Dev& d = g_dev[dev];
@@ -481,10 +518,8 @@ int rebuild(int dev, int kslot, const int* r2t, int seq, cudaStream_t s) {
     CK(ak_kv_window_rows(lo, n, 0, 0, ring_base(d, L.li, kslot), RING, INT_MAX, 0, d.tmp, s));
     CK(move_rows(L.k, r2t + lo, d.kw, d.tmp, n, s));
     CK(move_rows(L.v, r2t + lo, d.vw, d.tmp, n, s));
-    if (means() && seq >= C) {  // block means of every closed block, from the restored pool rows
-      CK(ak_kv_block_mean(L.k.rows, r2t, seq / C, KVH * HD, L.km.rows, r2t + C - 1, C, 2, s));
-      CK(ak_kv_block_mean(L.v.rows, r2t, seq / C, KVH * HD, L.vm.rows, r2t + C - 1, C, 2, s));
-    }
+    if (means() && with_means && seq >= C)  // block means of every closed block, from the restored pool rows
+      CK(put_means(d, L, L.k.rows, L.v.rows, r2t, seq / C, r2t + C - 1, C, 2, s));
   }
   return 0;
 }
@@ -569,8 +604,7 @@ int store_dec_multi(const Ctx& c, int T, const void* k, const void* v, const int
   CK(write_rows(k, T, d.dtmp, d.kw, c.s));
   CK(write_rows(v, T, d.dtmp, d.vw, c.s));
   if (means()) {
-    CK(ak_kv_block_mean(d.kw.rows, d.dtmp + T, T, KVH * HD, L.km.rows, d.dtmp + 5 * T, 1, 0, c.s));
-    CK(ak_kv_block_mean(d.vw.rows, d.dtmp + T, T, KVH * HD, L.vm.rows, d.dtmp + 5 * T, 1, 0, c.s));
+    CK(put_means(d, L, d.kw.rows, d.vw.rows, d.dtmp + T, T, d.dtmp + 5 * T, 1, 0, c.s));
   }
   return 0;
 }
@@ -585,8 +619,7 @@ int store_dec(const Ctx& c, const void* k, const void* v, const int* loc, const 
   CK(write_rows(k, 1, d.dtmp, d.kw, c.s));
   CK(write_rows(v, 1, d.dtmp, d.vw, c.s));
   if (means()) {  // every step: the block mean (to its page when this position closes it, else to the trash page)
-    CK(ak_kv_block_mean(d.kw.rows, d.dtmp + 1, 1, KVH * HD, L.km.rows, d.dtmp + 5, 1, 0, c.s));
-    CK(ak_kv_block_mean(d.vw.rows, d.dtmp + 1, 1, KVH * HD, L.vm.rows, d.dtmp + 5, 1, 0, c.s));
+    CK(put_means(d, L, d.kw.rows, d.vw.rows, d.dtmp + 1, 1, d.dtmp + 5, 1, 0, c.s));
   }
   return 0;
 }
@@ -636,7 +669,7 @@ int far_select_fetch_multi(const Ctx& c, int T, void* qi, const long long* pos, 
   CK(ak_far_decode_multi_select(T, qi, pos, c.r2t, c.wctx, blk, c.rows, wsm, c.s));
   CK(cudaEventRecord(d.ev_ms, c.s));
   CK(cudaStreamWaitEvent(d.side, d.ev_ms, 0));
-  if (means() && tag && far_cache_cap() > 0) {
+  if (means() && !means_i8() && tag && far_cache_cap() > 0) {
     void*& fc = g_fcache[c.layer];
     if (!fc) {
       if (cudaMalloc(&fc, ak_far_cache_bytes(c.wctx, far_cache_cap())) != cudaSuccess) return (int)cudaErrorMemoryAllocation;
@@ -647,10 +680,10 @@ int far_select_fetch_multi(const Ctx& c, int T, void* qi, const long long* pos, 
                                         d.side));
     return (int)cudaEventRecord(d.ev_mf, d.side);
   }
-  const int src = means() ? 1 : int8() ? 2 : 0;
+  const int src = means_i8() ? 3 : means() ? 1 : int8() ? 2 : 0;
   const Pool &k = means() ? L.km : L.k, &v = means() ? L.vm : L.v;
-  CK(ak_far_decode_multi_fetch(T, pos, c.r2t, c.wctx, src, k.rows, v.rows, src == 2 ? k.scale : nullptr,
-                               src == 2 ? v.scale : nullptr, c.rows, wsm, d.side));
+  CK(ak_far_decode_multi_fetch(T, pos, c.r2t, c.wctx, src, k.rows, v.rows, src >= 2 ? k.scale : nullptr,
+                               src >= 2 ? v.scale : nullptr, c.rows, wsm, d.side));
   return (int)cudaEventRecord(d.ev_mf, d.side);
 }
 int far_attend_multi(const Ctx& c, int T, void* qh, void* o_loc, float* lse, const long long* pos, void* wsm, void* out) {
@@ -662,6 +695,9 @@ int far_attend_multi(const Ctx& c, int T, void* qh, void* o_loc, float* lse, con
 int far_dec(const Ctx& c, void* qi, void* qh, void* o_loc, float* lse, const long long* pos, void* blk, void* ws,
             void* out) {
   const Layer& L = g_layer[c.layer];
+  if (means_i8())
+    return ak_far_decode_src(qi, qh, o_loc, lse, pos, c.r2t, c.wctx, 3, L.km.rows, L.vm.rows, L.km.scale, L.vm.scale, blk,
+                             c.rows, ws, out, c.s);
   if (means())
     return ak_far_decode_src(qi, qh, o_loc, lse, pos, c.r2t, c.wctx, 1, L.km.rows, L.vm.rows, nullptr, nullptr, blk,
                              c.rows, ws, out, c.s);
@@ -675,6 +711,9 @@ int far_dec(const Ctx& c, void* qi, void* qh, void* o_loc, float* lse, const lon
 int far_dec_multi(const Ctx& c, int T, void* qi, void* qh, void* o_loc, float* lse, const long long* pos, void* blk,
                   void* wsm, void* out) {
   const Layer& L = g_layer[c.layer];
+  if (means_i8())
+    return ak_far_decode_multi_src(T, qi, qh, o_loc, lse, pos, c.r2t, c.wctx, 3, L.km.rows, L.vm.rows, L.km.scale,
+                                   L.vm.scale, blk, c.rows, wsm, out, c.s);
   if (means())
     return ak_far_decode_multi_src(T, qi, qh, o_loc, lse, pos, c.r2t, c.wctx, 1, L.km.rows, L.vm.rows, nullptr, nullptr,
                                    blk, c.rows, wsm, out, c.s);
@@ -750,8 +789,7 @@ int store_rows_dec(const Ctx& c, const void* k, const void* v, int B, const int*
     CK(write_rows((const char*)k + (size_t)r * KVH * HD * 2, 1, d.brows + 8 * r, d.kw, c.s));
     CK(write_rows((const char*)v + (size_t)r * KVH * HD * 2, 1, d.brows + 8 * r, d.vw, c.s));
     if (means()) {
-      CK(ak_kv_block_mean(d.kw.rows, d.brows + 8 * r + 1, 1, KVH * HD, L.km.rows, d.brows + 8 * r + 5, 1, 0, c.s));
-      CK(ak_kv_block_mean(d.vw.rows, d.brows + 8 * r + 1, 1, KVH * HD, L.vm.rows, d.brows + 8 * r + 5, 1, 0, c.s));
+      CK(put_means(d, L, d.kw.rows, d.vw.rows, d.brows + 8 * r + 1, 1, d.brows + 8 * r + 5, 1, 0, c.s));
     }
   }
   return 0;
@@ -784,5 +822,12 @@ int far_dec_row(const Ctx& c, void* qi, void* qh, void* o_loc, float* lse, const
   Ctx cr = c;
   cr.r2t = r2t;
   return far_dec(cr, qi, qh, o_loc, lse, pos, blk, ws, out);
+}
+// Session persistence: the mean pools of BCSA layer `layer` (int8 rows + scales with AGENS_KV_MEANS_INT8). -1: none.
+int mean_pools(int layer, void** kq, void** vq, float** ks, float** vs) {
+  auto it = g_layer.find(layer);
+  if (!means() || it == g_layer.end()) return -1;
+  *kq = it->second.km.rows, *vq = it->second.vm.rows, *ks = it->second.km.scale, *vs = it->second.vm.scale;
+  return 0;
 }
 }  // namespace m1kv

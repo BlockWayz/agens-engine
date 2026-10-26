@@ -17,6 +17,7 @@ mod ffi {
         pub fn ak_synchronize() -> c_int;
         pub fn ak_error_string(code: c_int) -> *const c_char;
         pub fn ak_mem_info(free: *mut usize, total: *mut usize) -> c_int;
+        pub fn ak_device_display(dev: c_int, on: *mut c_int) -> c_int;
         pub fn ak_host_alloc(ptr: *mut *mut c_void, bytes: usize) -> c_int;
         pub fn ak_host_free(ptr: *mut c_void) -> c_int;
         pub fn ak_rope_cache(out: *mut f32, max_pos: c_int, rot: c_int, base: f32, stream: *mut c_void) -> c_int;
@@ -87,6 +88,12 @@ mod imp {
         let (mut f, mut t) = (0, 0);
         check(unsafe { ffi::ak_mem_info(&mut f, &mut t) }, "mem_info")?;
         Ok((f, t))
+    }
+    /// true when the device runs a display (its kernels have a run-time limit: cudaDevAttrKernelExecTimeout)
+    pub fn display_attached(dev: usize) -> Result<bool> {
+        let mut on = 0;
+        check(unsafe { ffi::ak_device_display(dev as i32, &mut on) }, "device_display")?;
+        Ok(on != 0)
     }
     pub fn upload(data: &[u8]) -> Result<DeviceBuffer> {
         let mut ptr = std::ptr::null_mut();
@@ -211,6 +218,9 @@ mod imp {
         bail!(NO)
     }
     pub fn mem_info() -> Result<(usize, usize)> {
+        bail!(NO)
+    }
+    pub fn display_attached(_: usize) -> Result<bool> {
         bail!(NO)
     }
     pub fn upload(_: &[u8]) -> Result<DeviceBuffer> {
