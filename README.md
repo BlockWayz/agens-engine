@@ -97,6 +97,10 @@ comes out of the KV pool:
   over PCIe, many times slower. Setting "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" in the NVIDIA
   Control Panel makes that case fail instead.
 - For the full context on a 16 GB card, drive the display from another GPU (an integrated GPU, for example).
+- **Known limitation (Windows, 16 GB cards):** the 16 GB build does not currently fit a 16 GB card that also drives
+  a Windows desktop. In a community report (issue #3) the same plan used about 2.4 GB more GPU memory under Windows
+  than on Linux, which leaves no room for the KV cache. Under investigation; on Windows, a GPU with more memory or a
+  GPU that drives no display is needed for now.
 
 ### Request limits
 
