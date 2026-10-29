@@ -54,8 +54,10 @@ void run(const char* name, K kern, int blocks, int threads, const uint4* buf, si
 int main() {
   cudaDeviceProp prop; cudaGetDeviceProperties(&prop, 0);
   const int sm = prop.multiProcessorCount;
-  printf("# %s, mem clock %d kHz, bus %d bit -> theoretical %.0f GB/s\n", prop.name, prop.memoryClockRate,
-         prop.memoryBusWidth, 2.0 * prop.memoryClockRate * 1e3 * prop.memoryBusWidth / 8 / 1e9);
+  int mem_clock = 0;
+  cudaDeviceGetAttribute(&mem_clock, cudaDevAttrMemoryClockRate, 0);
+  printf("# %s, mem clock %d kHz, bus %d bit -> theoretical %.0f GB/s\n", prop.name, mem_clock,
+         prop.memoryBusWidth, 2.0 * mem_clock * 1e3 * prop.memoryBusWidth / 8 / 1e9);
   const size_t bytes = 1ull << 30;
   uint4* buf; uint32_t* sink;
   cudaMalloc(&buf, bytes); cudaMalloc(&sink, 4); cudaMemset(buf, 1, bytes);
