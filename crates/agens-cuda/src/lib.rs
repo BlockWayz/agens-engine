@@ -44,6 +44,16 @@ fn check(code: std::os::raw::c_int, what: &str) -> Result<()> {
     bail!("{what}: CUDA error {code} ({msg})")
 }
 
+/// check() for a pinned / host-mapped host allocation: out of memory there is host RAM, not GPU memory
+#[cfg(feature = "cuda")]
+fn host_check(code: std::os::raw::c_int, bytes: usize) -> Result<()> {
+    if code == 2 {
+        bail!("host_alloc: CUDA error 2 (out of memory): {:.2} GB of pinned host RAM requested and not available; \
+               free host RAM (other programs; on Windows also WSL) or lower --wctx", bytes as f64 / 1e9)
+    }
+    check(code, "host_alloc")
+}
+
 pub fn available() -> bool {
     cfg!(feature = "cuda")
 }
@@ -138,7 +148,7 @@ mod imp {
     /// Pinned host memory mapped into the device address space; filled from `data`, never freed (weights).
     pub fn upload_host_mapped(data: &[u8]) -> Result<*mut std::ffi::c_void> {
         let mut ptr = std::ptr::null_mut();
-        check(unsafe { ffi::ak_host_alloc(&mut ptr, data.len().max(1)) }, "host_alloc")?;
+        host_check(unsafe { ffi::ak_host_alloc(&mut ptr, data.len().max(1)) }, data.len())?;
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len()) };
         Ok(ptr)
     }
@@ -205,7 +215,7 @@ mod imp {
     /// Pinned host buffer (not initialised); free with host_free.
     pub fn host_alloc(bytes: usize) -> Result<*mut std::ffi::c_void> {
         let mut ptr = std::ptr::null_mut();
-        check(unsafe { ffi::ak_host_alloc(&mut ptr, bytes.max(1)) }, "host_alloc")?;
+        host_check(unsafe { ffi::ak_host_alloc(&mut ptr, bytes.max(1)) }, bytes)?;
         Ok(ptr)
     }
     pub fn host_free(p: *mut std::ffi::c_void) -> Result<()> {
