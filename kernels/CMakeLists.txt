@@ -15,6 +15,14 @@ find_package(CUDAToolkit 12.4 REQUIRED)
 # --fmad=false is NOT global: bit-exact kernels opt out of contraction per expression (__fmul_rn/__fadd_rn),
 # quantised-path kernels keep FMA.
 set(AGENS_CUDA_FLAGS --expt-relaxed-constexpr -lineinfo -Xptxas=-v)
+# Two MSVC-only project-wide mechanisms, applied to every CUDA TU in this tree; a no-op on other platforms.
+# CCCL (libcudacxx) rejects cl.exe's traditional preprocessor, so /Zc:preprocessor is routed to cl via -Xcompiler;
+# MSVC emits an import library only when the DLL exports symbols, and nvcc ignores __declspec in .cu host code
+# so we force-export all symbols with WINDOWS_EXPORT_ALL_SYMBOLS
+if(MSVC)
+  add_compile_options(-Xcompiler=/Zc:preprocessor)
+  set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
 
 set(AGENS_SOURCES
   src/runtime.cu
@@ -104,14 +112,25 @@ endif()
 # (find_package(Torch) would rewrite this project's CUDA flags). Pass -DAGENS_TORCH_PREFIX=<torch cmake prefix>.
 if(AGENS_BUILD_ORACLE AND AGENS_TORCH_PREFIX)
   set(BRIDGE_DIR ${CMAKE_BINARY_DIR}/bridge)
-  add_custom_command(OUTPUT ${BRIDGE_DIR}/libagens_oracle_bridge.so
-    COMMAND ${CMAKE_COMMAND} -S ${CMAKE_CURRENT_SOURCE_DIR}/oracle/bridge -B ${BRIDGE_DIR}
+  # The MSVC link step emits both the DLL and its import library, so the command must list both.
+  if(MSVC)
+    set(BRIDGE_OUTPUTS ${BRIDGE_DIR}/agens_oracle_bridge.dll ${BRIDGE_DIR}/agens_oracle_bridge.lib)
+  else()
+    set(BRIDGE_OUTPUTS ${BRIDGE_DIR}/libagens_oracle_bridge.so)
+  endif()
+  list(GET BRIDGE_OUTPUTS 0 BRIDGE_ARTIFACT)
+  add_custom_command(OUTPUT ${BRIDGE_OUTPUTS}
+    COMMAND ${CMAKE_COMMAND} -G ${CMAKE_GENERATOR} -S ${CMAKE_CURRENT_SOURCE_DIR}/oracle/bridge -B ${BRIDGE_DIR}
             -DCMAKE_PREFIX_PATH=${AGENS_TORCH_PREFIX} -DCMAKE_BUILD_TYPE=Release
     COMMAND ${CMAKE_COMMAND} --build ${BRIDGE_DIR} -j
     DEPENDS oracle/bridge/far_bridge.cpp oracle/bridge/vision.cpp oracle/bridge/CMakeLists.txt)
-  add_custom_target(agens_oracle_bridge_build DEPENDS ${BRIDGE_DIR}/libagens_oracle_bridge.so)
+  add_custom_target(agens_oracle_bridge_build DEPENDS ${BRIDGE_ARTIFACT})
   add_library(agens_oracle_bridge SHARED IMPORTED)
-  set_target_properties(agens_oracle_bridge PROPERTIES IMPORTED_LOCATION ${BRIDGE_DIR}/libagens_oracle_bridge.so)
+  set_target_properties(agens_oracle_bridge PROPERTIES IMPORTED_LOCATION ${BRIDGE_ARTIFACT})
+  if(MSVC)
+    list(GET BRIDGE_OUTPUTS 1 BRIDGE_IMPLIB)
+    set_property(TARGET agens_oracle_bridge APPEND PROPERTY IMPORTED_IMPLIB ${BRIDGE_IMPLIB})
+  endif()
   add_dependencies(agens_oracle_bridge agens_oracle_bridge_build)
   # ---- M1 model (bf16 tp1 standalone forward over the parity bridges)
   add_library(agens_m1 SHARED m1/m1_model.cu m1/m1_kv.cu m1/m1_draft.cu m1/m1_mtp.cu m1/m1_dense8.cu)

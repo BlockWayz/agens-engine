@@ -1,6 +1,9 @@
 #include "agens_kernels.h"
 #include <cuda_runtime.h>
-#include <cxxabi.h>
+#if defined(__GLIBCXX__) || defined(_LIBCPP_HAS_CXA_DEMANGLE)
+#define HAVE_CXA_DEMANGLE 1  // __cxa_demangle is available (libstdc++/libc++)
+#include <cxxabi.h>          // Itanium ABI demangler; absent from the MSVC toolchain
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8,6 +11,13 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#if CUDART_VERSION >= 13000
+// CUDA 13 renamed the graph edge-data (_v2) APIs to their plain names and removed the old forms; signatures are identical.
+#define cudaGraphGetEdges_v2           cudaGraphGetEdges
+#define cudaGraphAddDependencies_v2    cudaGraphAddDependencies
+#define cudaGraphRemoveDependencies_v2 cudaGraphRemoveDependencies
+#endif
 
 extern "C" {
 int ak_device_count(int* n) { return (int)cudaGetDeviceCount(n); }
@@ -72,6 +82,11 @@ bool is_ident(const std::string& dn, const char* id) {
 }
 // 0: not ours / unknown, 1: PDL kernel, 3: PDL push kernel
 int kernel_class(const void* func) {
+#ifndef HAVE_CXA_DEMANGLE
+  // no demangler: kernels cannot be identified by name, so none are classified as PDL and the
+  // push-edge conversion is skipped (a perf-only loss; plain edges stay fully correct)
+  return 0;
+#else
   static std::mutex mu;
   static std::unordered_map<const void*, int> cache;
   std::lock_guard<std::mutex> l(mu);
@@ -100,6 +115,7 @@ int kernel_class(const void* func) {
   cudaGetLastError();
   cache[func] = c;
   return c;
+#endif
 }
 int node_class(cudaGraphNode_t nd, bool* kernel) {
   cudaGraphNodeType t;

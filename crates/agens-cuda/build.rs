@@ -17,7 +17,14 @@ fn main() {
         println!("cargo:rustc-link-search=native={dir}");
         println!("cargo:rustc-link-lib=dylib=agens_m1");
         println!("cargo:rustc-link-lib=dylib=agens_kernels_py");
-        println!("cargo:rustc-link-search=native={cuda}/lib64");
+        // CUDA installs its import libraries under <CUDA>/lib/<arch> on Windows
+        // lib64 is the Linux layout.
+        let libdir = if std::env::var("TARGET").unwrap_or_default().contains("-windows-") {
+            format!("{cuda}/lib/x64")
+        } else {
+            format!("{cuda}/lib64")
+        };
+        println!("cargo:rustc-link-search=native={libdir}");
         println!("cargo:rustc-link-lib=dylib=cudart");
         return;
     }
