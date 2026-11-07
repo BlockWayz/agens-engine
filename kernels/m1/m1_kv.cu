@@ -126,14 +126,20 @@ Dev g_dev[2];
 template <typename T>
 T* dzero(size_t n, Dev& d) {
   void* p = nullptr;
-  if (cudaMalloc(&p, n * sizeof(T) > 0 ? n * sizeof(T) : 16) != cudaSuccess) return nullptr;
+  if (cudaMalloc(&p, n * sizeof(T) > 0 ? n * sizeof(T) : 16) != cudaSuccess) {
+    fprintf(stderr, "m1kv: device allocation of %.1f MB failed (%.1f MB taken before)\n", n * sizeof(T) / 1e6, d.dev_bytes / 1e6);
+    return nullptr;
+  }
   cudaMemset(p, 0, n * sizeof(T));
   d.dev_bytes += n * sizeof(T);
   return (T*)p;
 }
 void* hzero(size_t bytes, Dev& d) {  // pinned + mapped + portable: the pointer is valid on the host and every device
   void* p = nullptr;
-  if (cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) return nullptr;
+  if (cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+    fprintf(stderr, "m1kv: pinned host allocation of %.1f MB failed (%.1f MB taken before)\n", bytes / 1e6, d.host_bytes / 1e6);
+    return nullptr;
+  }
   memset(p, 0, bytes);
   d.host_bytes += bytes;
   return p;

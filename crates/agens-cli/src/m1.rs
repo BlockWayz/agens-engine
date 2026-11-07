@@ -466,8 +466,13 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     // whole of a 16 GB card: there the desktop's allocations either fail ours (Linux) or make the Windows driver move
     // device memory to system RAM, read over PCIe (issue #3: 8K-token prefill 22 tok/s instead of ~600 with 0.00 GB
     // free after init). Headless Linux devices keep 0 (the plans measured since 1.1 unchanged).
+    // Windows: 0 by default. Under WDDM cudaMemGetInfo's free is the OS budget for this process less what it holds
+    // (measured: free = DXGI budget - own usage exactly), and the budget already keeps ~1.07 GiB of a 24 GB card
+    // (0.75 GiB + the driver's own) for the desktop and other processes; the plan counts that as used. 0.75 more made a
+    // 16 GB card under Windows plan no KV pool at all (emulated on a 24 GB card held to 15.24 GiB: "leaves no room for a
+    // KV pool"; at the whole card: 12K context at prefill chunk 1024, 131K at 512, no system-memory fallback).
     let budget_gib = if o.budget_gib > 0.0 {
-        let display = cfg!(windows) || agens_cuda::display_attached(devs[0] as usize).unwrap_or(false);
+        let display = !cfg!(windows) && agens_cuda::display_attached(devs[0] as usize).unwrap_or(false);
         let head = std::env::var("AGENS_M1_HEADROOM_GIB").ok().and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(if display { 0.75 } else { 0.0 });
         let (_, total) = agens_cuda::mem_info()?;

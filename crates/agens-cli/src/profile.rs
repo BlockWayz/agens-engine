@@ -48,6 +48,12 @@ pub fn expand(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<(
                 (false, true) => wctx(241668),
             };
             setdef("AGENS_KV_INT8_DENSE", "1");
+            // Windows: the OS keeps ~1 GiB of the card (desktop + WDDM budget), which the Linux plan has for the KV pool;
+            // prefill chunk 512 frees 0.33 GB of activations / KDA arena: on a 24 GB card held to 15.99 GiB (a 16 GB card
+            // under Windows) the context goes from 12K to 131K, prefill 8K-64K ~800 tok/s instead of ~940 at 1024
+            if cfg!(windows) {
+                setdef("AGENS_M1_PREFILL_CHUNK", "512");
+            }
             s(&["--budget-gib", "16", "--wctx", &w, "--mode", "personal", "--no-fork", "1"])
         }
         "12gb" => {

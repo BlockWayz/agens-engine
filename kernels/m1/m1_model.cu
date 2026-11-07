@@ -1735,7 +1735,9 @@ template <typename T>
 T* dalloc(size_t n) {
   void* p = nullptr;
   g_dalloc_bytes += n * sizeof(T) > 0 ? n * sizeof(T) : 16;
-  cudaMalloc(&p, n * sizeof(T) > 0 ? n * sizeof(T) : 16);
+  if (cudaMalloc(&p, n * sizeof(T) > 0 ? n * sizeof(T) : 16) != cudaSuccess)
+    fprintf(stderr, "m1: device allocation of %.1f MB failed (%.3f GiB dalloc'd before)\n", n * sizeof(T) / 1e6,
+            g_dalloc_bytes / 1073741824.0);
   cudaMemset(p, 0, n * sizeof(T));
   return (T*)p;
 }
