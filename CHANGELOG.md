@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.3.7
+
+### New
+
+- **Native Windows build** (community contribution by [@vehystrix](https://github.com/vehystrix), PR #2).
+  `scripts/windows/build-msvc.ps1` builds the kernels, the server and `agens.exe` with Visual Studio 2026, CUDA 13.3
+  and libtorch 2.14.1 (downloaded by the script), for compute capability 8.6, 8.9, 9.0 and 12.0, with the runtime DLLs
+  next to `agens.exe`; `scripts/windows/test-msvc.ps1` runs the deployment, determinism and parity checks. There is no
+  Windows container image: on Windows, use this build or the Linux image under WSL2.
+- **`AGENS_MEM_TRACE=1`** prints the device memory in use at each load and init stage; under Windows also this
+  process's own usage and the budget the OS gives it.
+
+### Fixed
+
+- **Compute capability 12.0: decoding failed in 1.3.4 to 1.3.6.** A fused kernel (the in_proj_b projection staged
+  in shared memory, added in 1.3.4) needs 103 KB of shared memory per block, more than the 99 KB a compute
+  capability 12.0 GPU allows, so every decode and verify step failed with `invalid argument`, on Linux and under
+  Windows. 1.3.7 runs that projection unfused where the kernel does not fit. Other GPUs are unchanged (compute
+  capability 8.9: greedy output identical to 1.3.6). On 1.3.4 to 1.3.6, `AGENS_MHC_FUSE=0` works around it
+  (the fused layer-boundary kernels off; measured on 1.3.6, compute capability 12.0).
+- **Windows: the profiles' settings did not reach the kernels** (issue #3). On Windows the `AGENS_*` defaults that
+  `--profile` and budget mode set at run time were not seen by the CUDA side, so it ran with larger buffers than the
+  memory plan counted (prefill chunk 4096 instead of 1024, KV cache not tiered to host RAM). With `--profile 16gb` at a
+  16 GiB budget, initialization allocated 3.53 GiB instead of 0.84 and left no free GPU memory; the Windows driver
+  then moved GPU memory to system RAM and every step read it over PCIe (8K-token prefill at about 22 tok/s in the
+  report). Measured on a 24 GB laptop GPU of compute capability 12.0 under Windows, `--profile 16gb` with the drafter
+  at the 16 GiB cap: 15.65 GB used and 1.53 GB free after start, as the Linux build on the same GPU (15.64 / 1.54).
+- **Windows: no extra headroom.** Under Windows the GPU memory the engine sees as free already excludes what the
+  OS keeps for the desktop and other processes (about 1.07 GiB on that 24 GB GPU), so the 0.75 GiB that 1.3.6 kept
+  out of the budget under Windows was counted twice. Windows now defaults to 0; `AGENS_M1_HEADROOM_GIB` still sets
+  it. Linux GPUs that drive a display keep 0.75 GiB.
+- **Windows, `16gb` profile: prefill chunk 512** (`AGENS_M1_PREFILL_CHUNK`; 1024 elsewhere), 0.33 GB more for the KV
+  pool. Emulated 16 GB card (the 24 GB GPU above held to 15.99 GiB with a fill, the Windows desktop on it; not yet
+  confirmed on a physical 16 GB card): with 1.3.6's 0.75 GiB headroom the plan had no room for a KV pool; 1.3.7 serves
+  a 131K-token context, with the drafter, greedy, thinking off: 8K-token prompt 869 tok/s prefill and 58 tok/s decode,
+  100K-token prompt 794 / 51 (this laptop GPU runs power-limited, about 130-150 W).
+- A failed GPU or pinned host allocation now logs its size, and a failed pinned host allocation says that host RAM
+  ran out (CUDA reports it as out of memory, which read like GPU memory), with a hint to free host RAM or lower `--wctx`.
+- Windows build: `agens.exe` is rebuilt when a kernel DLL changes, so it never starts against a stale DLL.
+
 ## 1.3.6
 
 ### New

@@ -25,10 +25,13 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md).
 
 - A GPU with 16 GB, 24 GB or 48 GB of memory and a CUDA 12.9-capable driver.
   - Prebuilt kernels: compute capability 8.6, 8.9 and 9.0 (validated; 8.6 by community contributor
-    [@mmssix](https://github.com/mmssix) on a 24 GB card, see [Community results](#community-results)), 12.0 (built; runs on a 96 GB card in a first community report,
-    bf16 weights).
+    [@mmssix](https://github.com/mmssix) on a 24 GB card, see [Community results](#community-results)), 12.0 (validated
+    in 1.3.7 on a 24 GB laptop GPU, the Linux image under WSL2 and the native Windows build; earlier, a 96 GB card in a
+    community report on 1.3.0). On compute capability 12.0, 1.3.4 to 1.3.6 fail to decode: use 1.3.7 (see the
+    changelog).
 - Host RAM: 32 GB or more for the full 262K context. The tiered KV cache keeps up to ~24 GB in pinned host memory.
-- Docker with the NVIDIA container toolkit.
+- Docker with the NVIDIA container toolkit (Linux, or Windows with WSL2), or the native Windows build (see
+  [Building from source](#building-from-source)).
 - The model checkpoint for your GPU size and, optionally, the drafter checkpoint and the MTP head
   ([Blockway/Agens-Volundr-32B-v1-MTP](https://huggingface.co/Blockway/Agens-Volundr-32B-v1-MTP)).
 - Multi-GPU (`--tp 2|4`): 2 or 4 GPUs of the same size in one machine; the budget is per GPU.
@@ -52,8 +55,14 @@ The same flags work on the image directly:
 ```bash
 docker run --gpus device=0 --ipc=host -p 30000:30000 \
   -v /path/to/model:/model:ro -v /path/to/drafter:/drafter:ro \
-  ghcr.io/blockwayz/agens-engine:1.3.6 --profile 16gb --model /model --drafter /drafter
+  ghcr.io/blockwayz/agens-engine:1.3.7 --profile 16gb --model /model --drafter /drafter
 ```
+
+Under WSL2 on Windows, the image does not find the GPU driver library by itself (`libcuda.so.1: cannot open shared
+object file`); add `-v /usr/lib/wsl:/usr/lib/wsl:ro -e LD_LIBRARY_PATH=/opt/agens/lib:/usr/lib/x86_64-linux-gnu:/usr/lib/wsl/lib`
+to the `docker run` line. With the `16gb` profile on a 16 GB card under WSL2, also add
+`-e AGENS_M1_PREFILL_CHUNK=512` (the native Windows build sets it by itself): on a 24 GB laptop GPU of compute
+capability 12.0 held to the 16 GiB cap under WSL2, the context is 122,884 tokens with it and 4,100 without.
 
 ## Profiles
 
@@ -77,8 +86,9 @@ Extra `agens serve` flags go after `--`, for example `-- --served-model-name age
 variables override the profile's tuning defaults.
 
 Outside the container (a build from source), the same profiles are `agens serve /path/to/model --profile 16gb`
-(1.3.6), with `--spec-drafter DIR`, `--mtp DIR` and `--vision 1` for the drafter, the MTP head and image input. The
-profile sets the same flags and `AGENS_*` defaults as the container; flags given on the command line win.
+(1.3.6; `agens.exe serve ...` on the native Windows build), with `--spec-drafter DIR`, `--mtp DIR` and `--vision 1`
+for the drafter, the MTP head and image input. The profile sets the same flags and `AGENS_*` defaults as the
+container; flags given on the command line win.
 
 In 1.0.0 the `24gb` profile did not start with the 4-bit weights and the drafter. 1.1.0 fixes this (see the
 changelog).
@@ -89,18 +99,23 @@ The `16gb` numbers were measured on Linux, on a GPU that drives no display, held
 card the budget is the whole card, so memory that something else on the GPU uses (a desktop, another process)
 comes out of the KV pool:
 
-- From 1.3.6, when the GPU drives a display or the engine runs under Windows, the engine keeps 0.75 GiB of the GPU
-  out of the budget and logs `--budget-gib 16 lowered to ...`. The context is then clamped to what the pool holds
-  (`--wctx N clamped to M`). `AGENS_M1_HEADROOM_GIB=N` sets the amount; `0` turns it off.
+- From 1.3.6, when the GPU drives a display on Linux, the engine keeps 0.75 GiB of the GPU out of the budget and
+  logs `--budget-gib 16 lowered to ...`. The context is then clamped to what the pool holds (`--wctx N clamped to
+  M`). `AGENS_M1_HEADROOM_GIB=N` sets the amount; `0` turns it off. Under Windows the default is 0 from 1.3.7: the
+  free memory the Windows driver reports already leaves out what the OS keeps for the desktop and other processes
+  (about 1.07 GiB on a 24 GB GPU).
 - If less than 256 MB of the GPU is free after loading, the engine logs a `WARNING`. On Linux an allocation past
   the GPU's memory fails. The Windows driver can instead move GPU memory to system RAM, and every step then reads it
   over PCIe, many times slower. Setting "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" in the NVIDIA
   Control Panel makes that case fail instead.
 - For the full context on a 16 GB card, drive the display from another GPU (an integrated GPU, for example).
-- **Known limitation (Windows, 16 GB cards):** the 16 GB build does not currently fit a 16 GB card that also drives
-  a Windows desktop. In a community report (issue #3) the same plan used about 2.4 GB more GPU memory under Windows
-  than on Linux, which leaves no room for the KV cache. Under investigation; on Windows, a GPU with more memory or a
-  GPU that drives no display is needed for now.
+- **Windows, 16 GB cards (1.3.7):** up to 1.3.6 the 16 GB build did not fit a 16 GB card that drives a Windows
+  desktop (issue #3): the profile's settings did not reach the kernels under Windows, and the headroom was counted
+  twice. 1.3.7 fixes both and uses a prefill chunk of 512 in the `16gb` profile under Windows. On a 24 GB laptop GPU
+  of compute capability 12.0 held to 15.99 GiB under Windows, with the desktop on it (an emulated 16 GB card), the
+  `16gb` profile with the drafter serves a 131K-token context. This is not yet confirmed on a physical 16 GB card;
+  what the desktop and other applications hold there comes out of the KV pool, and the context is clamped to what
+  is left.
 
 ### Request limits
 
@@ -481,3 +496,20 @@ cargo build --release --features m1 -p agens-cli
 ```
 
 The build needs CUDA 12.9, CMake 3.27+, Rust stable and libtorch (PyTorch 2.11).
+
+### Windows (native)
+
+From a PowerShell prompt in the repository (community contribution by [@vehystrix](https://github.com/vehystrix),
+PR #2):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\build-msvc.ps1
+powershell -ExecutionPolicy Bypass -File scripts\windows\test-msvc.ps1 -Checkpoint D:\models\Agens-Volundr-32B-v1-Engine-16GB -OutDir D:\tmp\agens-test
+target\release\agens.exe serve D:\models\Agens-Volundr-32B-v1-Engine-16GB --profile 16gb --spec-drafter D:\models\Agens-Volundr-32B-v1-DFlash2
+```
+
+- Needs Visual Studio 2026 (C++ desktop workload), CUDA 13.3, CMake, Ninja and Rust stable; the script downloads libtorch 2.14.1
+  once and puts the runtime DLLs next to `agens.exe`.
+- Set `AGENS_*` variables in PowerShell as `$env:AGENS_M1_PREFILL_CHUNK = "512"`.
+- Set "CUDA - Sysmem Fallback Policy" to "Prefer No Sysmem Fallback" for `agens.exe` in the NVIDIA Control Panel, so
+  that a plan that does not fit fails at start instead of running many times slower from system RAM.
