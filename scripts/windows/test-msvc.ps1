@@ -7,7 +7,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Checkpoint,
     [Parameter(Mandatory = $true)][string]$OutDir,
-    [string]$Exe = "$PSScriptRoot\..\..\target\release\agens.exe",
+    [string]$Exe = "",
     [int]$NewTokens = 64,
     [double]$BudgetGiB = 16,
     [int]$Wctx = 262148,
@@ -15,6 +15,8 @@ param(
     [string]$Skip = ""
 )
 $ErrorActionPreference = 'Stop'
+# default here, not in param(): Windows PowerShell 5.1 leaves $PSScriptRoot empty in parameter defaults
+if (-not $Exe) { $Exe = Join-Path $PSScriptRoot "..\..\target\release\agens.exe" }
 $SkipList = $Skip -split ',' | ForEach-Object { $_.Trim().ToLower() }
 if (-not (Test-Path $Checkpoint)) { Write-Host "checkpoint not found: $Checkpoint" -ForegroundColor Red; exit 2 }
 if (-not (Test-Path $Exe)) { Write-Host "exe not found: $Exe" -ForegroundColor Red; exit 2 }
