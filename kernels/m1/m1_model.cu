@@ -1715,9 +1715,26 @@ int alloc_row(Session& ss) {  // the row of position ss.rows.size(); call pages_
   return row;
 }
 
+size_t g_dalloc_bytes = 0;  // requested by dalloc (AGENS_MEM_TRACE)
+// AGENS_MEM_TRACE=1: device memory at an init stage (cudaMemGetInfo's used; Windows: this process's own usage, DXGI)
+void mem_trace(const char* tag) {
+  static const bool on = getenv("AGENS_MEM_TRACE") && getenv("AGENS_MEM_TRACE")[0] == '1';
+  if (!on) return;
+  cudaDeviceSynchronize();
+  size_t f = 0, t = 0, u = 0, b = 0;
+  cudaMemGetInfo(&f, &t);
+  int dev = 0;
+  cudaGetDevice(&dev);
+  const double G = 1073741824.0;
+  if (ak_own_mem(dev, &u, &b) == 0)
+    fprintf(stderr, "m1: mem   %s: used %.3f GiB, own %.3f GiB, dalloc'd %.3f GiB\n", tag, (t - f) / G, u / G, g_dalloc_bytes / G);
+  else
+    fprintf(stderr, "m1: mem   %s: used %.3f GiB, dalloc'd %.3f GiB\n", tag, (t - f) / G, g_dalloc_bytes / G);
+}
 template <typename T>
 T* dalloc(size_t n) {
   void* p = nullptr;
+  g_dalloc_bytes += n * sizeof(T) > 0 ? n * sizeof(T) : 16;
   cudaMalloc(&p, n * sizeof(T) > 0 ? n * sizeof(T) : 16);
   cudaMemset(p, 0, n * sizeof(T));
   return (T*)p;
@@ -2886,7 +2903,8 @@ int run_model(int T, bool prefill, int R) {
       static const bool res_ahead = !(getenv("AGENS_MHC_RES_AHEAD") && getenv("AGENS_MHC_RES_AHEAD")[0] == '0');
       fa.write_res = res_ahead || i + 2 >= NL;
       fa.res_cur = res_ahead ? S.res : nullptr;
-      if (kMixer[i + 1] == 'k' && KHV <= 48 && !(getenv("AGENS_MHC_FUSE_B") && getenv("AGENS_MHC_FUSE_B")[0] == '0')) {
+      if (kMixer[i + 1] == 'k' && KHV <= 48 && ak_mhc_fused_b_ok(KHV) &&
+          !(getenv("AGENS_MHC_FUSE_B") && getenv("AGENS_MHC_FUSE_B")[0] == '0')) {
         const LinRef& rb = lin_ref(i + 1, "linear_attn.in_proj_b.weight");  // bf16 in the INT4 recipe (fake-quantized)
         if (rb.bf16 && !rb.w4) fa.wb = (const bf16*)rb.bf16, fa.nb_out = KHV, fa.bout = kda_b_out(i + 1, T, prefill);
       }
@@ -3933,6 +3951,7 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
   cudaStreamCreateWithFlags(&S.s2, cudaStreamNonBlocking);
   cudaEventCreateWithFlags(&S.ev_fork, cudaEventDisableTiming);
   cudaEventCreateWithFlags(&S.ev_join, cudaEventDisableTiming);
+  mem_trace("init: streams");
   {  // KDA prefill takes its temporaries from the default pool (cudaMallocAsync): keep freed memory in the pool instead
      // of returning it to the driver at every sync (re-mapping ~0.5 GB per layer per chunk otherwise)
     cudaMemPool_t pool;
@@ -3976,6 +3995,7 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
   }
   if (m1kv::on()) CK(m1kv::init_device(my, g_nslots, Wctx));
   int one = 1;
+  mem_trace("init: layer state + KV");
   S.has_init = dalloc<bool>(1);
   S.eng_t[0][0] = eng2_t0, S.eng_t[0][1] = eng2_t1, S.eng_t[1][0] = eng22_t0, S.eng_t[1][1] = eng22_t1;
   const size_t T = g_chunk;
@@ -4023,6 +4043,7 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
     S.fx_kb = dalloc<bf16>((size_t)(Wctx / 4 + 512) * KVH * HD), S.fx_vb = dalloc<bf16>((size_t)(Wctx / 4 + 512) * KVH * HD);
     if (!S.fx_ws || !S.fx_kb || !S.fx_vb) return (int)cudaErrorMemoryAllocation;
   }
+  mem_trace("init: activations + buffers");
   CK(cudaMallocHost(&S.step_h, kStepInts * sizeof(int)));
   memset(S.step_h, 0, kStepInts * sizeof(int));
   CK(cudaMallocHost(&S.tok_h, kMaxBatch * sizeof(int)));
@@ -4034,6 +4055,7 @@ int init_device(int Wctx, int rows, void* eng2_t0, void* eng2_t1, void* eng22_t0
   for (auto& kv : W4M) wdq = std::max(wdq, (size_t)w4_tile_rows(kv.second.k, kv.second.n) * kv.second.k);
   if (wdq) S.wdq = dalloc<bf16>(wdq);
   cudaMemcpy(S.last1, &one, 4, cudaMemcpyHostToDevice);
+  mem_trace("init: end");
   return (int)cudaDeviceSynchronize();
 }
 
@@ -4698,12 +4720,14 @@ int prefill_res_take() {
 }
 int ak_m1_prefill_reserve(long long kda_bytes, long long torch_bytes) {
   g_res_kda = kda_bytes, g_res_torch = torch_bytes;
+  mem_trace("prefill reserve: before");
   for (int d = 0; d < g_ndev; ++d) {
     use(d);
     if (kda_bytes > 0) CK(ak_kda_prefill_set_arena(g_chunk));  // the arena for this process's heads at g_chunk
     if (torch_bytes > 0 && dev_of(NL - 1) == d) CK(ak_bridge_torch_reserve(torch_bytes));
   }
   use(0);
+  mem_trace("prefill reserve: after");
   return 0;
 }
 int ak_m1_logits_i8_row(int r, void* host_dst) {

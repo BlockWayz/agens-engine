@@ -1549,7 +1549,7 @@ pub fn run(args: &[String]) -> Result<()> {
     // 1.3.6: --profile (profile.rs): the container profiles' flags and AGENS_* defaults, ahead of the flags given
     let (args, env) = crate::profile::expand(args, &|k| std::env::var(k).ok())?;
     for (k, v) in &env {
-        std::env::set_var(k, v);
+        agens_cuda::set_env(k, v);
     }
     let args = &args[..];
     let ckpt = args.first().context(usage)?.clone();
@@ -1614,7 +1614,7 @@ pub fn run(args: &[String]) -> Result<()> {
             if std::env::var("AGENS_PERSONAL_SERVER_NUMERICS").map_or(false, |v| v == "1") {
                 for (k, v) in [("AGENS_M1_BATCH_INVARIANT", "1"), ("AGENS_M1_BI", "1"), ("AGENS_M1_W4_BATCH_MAX", "128")] {
                     if std::env::var(k).is_err() {
-                        std::env::set_var(k, v);
+                        agens_cuda::set_env(k, v);
                     }
                 }
             }
@@ -1625,7 +1625,7 @@ pub fn run(args: &[String]) -> Result<()> {
             if !(1..=MAX_BATCH).contains(&max_batch) {
                 bail!("--max-batch must be 1..{MAX_BATCH}");
             }
-            std::env::set_var("AGENS_M1_BATCH_INVARIANT", "1");
+            agens_cuda::set_env("AGENS_M1_BATCH_INVARIANT", "1");
             // one set of numerics for server mode, with or without --spec-drafter (1.0.1): the verify's batch-invariant
             // kernels (AGENS_M1_BI) for every decode row, and prefill chunks of up to 128 tokens on the batched W4
             // kernels (short prompts: no dequantized-weight GEMM). 1.0.0 set the second only with a drafter and decoded
@@ -1633,7 +1633,7 @@ pub fn run(args: &[String]) -> Result<()> {
             // (3 of the 13 gate prompts; tools/serve_gate.py). Now spec == non-spec in server mode, at every concurrency.
             for (k, v) in [("AGENS_M1_BI", "1"), ("AGENS_M1_W4_BATCH_MAX", "128")] {
                 if std::env::var(k).is_err() {
-                    std::env::set_var(k, v);
+                    agens_cuda::set_env(k, v);
                 }
             }
         }
@@ -1647,18 +1647,18 @@ pub fn run(args: &[String]) -> Result<()> {
         max_batch = 16;
     }
     // the memory plan's graph allowance follows the batch (plan.rs runtime_reserve)
-    std::env::set_var("AGENS_SERVE_MAX_BATCH", max_batch.to_string());
+    agens_cuda::set_env("AGENS_SERVE_MAX_BATCH", max_batch.to_string());
     // (1.3.4) batched steps past 16 rows: the W4H dual layout (kernels/src/w4h.cu; native mode, where m1.rs turns W4H on):
     // W4H for launches of <= 16 tokens, KT above (sm90 tp2 steady state, default sampling, --mtp: c16 1275 -> 1326,
     // c32 1440 -> 1605, c48 1577 -> 1855 tok/s with KT; c1 / c4 keep W4H's lead); costs the W4H weights' bytes again
     // (not in budget mode: W4H is off there, and its plan has no room for the copies)
     if mode == "server" && !budget && max_batch > 4 && std::env::var_os("AGENS_W4H_MMAX").is_none() {
-        std::env::set_var("AGENS_W4H_MMAX", "16");
+        agens_cuda::set_env("AGENS_W4H_MMAX", "16");
     }
     let drafting = drafter.is_some() || mtp.is_some();
     if drafting && mode != "personal" && std::env::var("AGENS_SPEC_BATCH_MAX").is_err() {
         // server mode: batched speculative decoding of up to --max-batch greedy requests per step
-        std::env::set_var("AGENS_SPEC_BATCH_MAX", max_batch.min(crate::spec::BATCH_MAX).to_string());
+        agens_cuda::set_env("AGENS_SPEC_BATCH_MAX", max_batch.min(crate::spec::BATCH_MAX).to_string());
     }
     if !fork && mode != "personal" {
         bail!("--no-fork 1: personal mode only");

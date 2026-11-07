@@ -1,5 +1,8 @@
 #include "agens_kernels.h"
 #include <cuda_runtime.h>
+#ifdef _WIN32
+#include <dxgi1_4.h>
+#endif
 #if defined(__GLIBCXX__) || defined(_LIBCPP_HAS_CXA_DEMANGLE)
 #define HAVE_CXA_DEMANGLE 1  // __cxa_demangle is available (libstdc++/libc++)
 #include <cxxabi.h>          // Itanium ABI demangler; absent from the MSVC toolchain
@@ -41,6 +44,43 @@ int ak_memcpy_d2h(void* dst, const void* src, size_t bytes) {
 int ak_synchronize(void) { return (int)cudaDeviceSynchronize(); }
 int ak_mem_info(size_t* f, size_t* t) { return (int)cudaMemGetInfo(f, t); }
 int ak_device_display(int dev, int* on) { return (int)cudaDeviceGetAttribute(on, cudaDevAttrKernelExecTimeout, dev); }
+// This process's own device memory and the OS budget for it (Windows: DXGI QueryVideoMemoryInfo of the adapter whose
+// LUID is the device's). cudaMemGetInfo under WDDM counts every process's allocations and memory the driver keeps for
+// itself (total - free > this process's usage by the desktop, other apps and ~0.3-0.5 GiB). Returns 1 when unavailable
+// (Linux: cudaMemGetInfo is already this process's view on a device without other users).
+int ak_own_mem(int dev, size_t* usage, size_t* budget) {
+#ifdef _WIN32
+  cudaDeviceProp pr;
+  if (cudaGetDeviceProperties(&pr, dev) != cudaSuccess) return 1;
+  LUID want;
+  memcpy(&want, pr.luid, sizeof(want));
+  IDXGIFactory4* f = nullptr;
+  if (CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void**)&f) != S_OK) return 1;
+  int rc = 1;
+  IDXGIAdapter1* a = nullptr;
+  for (UINT i = 0; rc && f->EnumAdapters1(i, &a) == S_OK; ++i) {
+    DXGI_ADAPTER_DESC1 d;
+    a->GetDesc1(&d);
+    IDXGIAdapter3* a3 = nullptr;
+    if (d.AdapterLuid.LowPart == want.LowPart && d.AdapterLuid.HighPart == want.HighPart &&
+        a->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&a3) == S_OK) {
+      DXGI_QUERY_VIDEO_MEMORY_INFO l{};
+      if (a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &l) == S_OK) {
+        *usage = (size_t)l.CurrentUsage;
+        *budget = (size_t)l.Budget;
+        rc = 0;
+      }
+      a3->Release();
+    }
+    a->Release();
+  }
+  f->Release();
+  return rc;
+#else
+  (void)dev; (void)usage; (void)budget;
+  return 1;
+#endif
+}
 const char* ak_error_string(int code) { return cudaGetErrorString((cudaError_t)code); }
 // Pinned, mapped host memory: the returned pointer is valid on host AND device (UVA), for weights that do not fit.
 int ak_host_alloc(void** ptr, size_t bytes) { return (int)cudaHostAlloc(ptr, bytes, cudaHostAllocMapped | cudaHostAllocPortable); }

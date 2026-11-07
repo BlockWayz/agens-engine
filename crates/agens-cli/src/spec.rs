@@ -571,7 +571,7 @@ pub fn run_batch(args: &[String]) -> Result<()> {
         i += 2;
     }
     if std::env::var("AGENS_SPEC_BATCH_MAX").is_err() {
-        std::env::set_var("AGENS_SPEC_BATCH_MAX", bsz.to_string());
+        agens_cuda::set_env("AGENS_SPEC_BATCH_MAX", bsz.to_string());
     }
     if !rest.iter().any(|a| a == "--sessions") {
         rest.push("--sessions".into());

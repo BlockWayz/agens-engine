@@ -544,10 +544,29 @@ extern "C" int ak_mhc_fused_ok() {
   }
   return ok;
 }
+// the in_proj_b fusion (nb_out rows staged in dynamic shared memory) fits the device: static + dynamic shared memory
+// within the per-block opt-in limit. sm90: 227 KB; compute capability 12.0 has clusters but 99 KB per block, and the
+// kernel's 43 KB static + 60 KB for 48 rows does not fit (the launch failed with invalid argument in every decode /
+// verify step); there the b projection runs unfused, as on devices without clusters.
+extern "C" int ak_mhc_fused_b_ok(int nb_out) {
+  static int optin = -1, stat = 0;
+  if (optin < 0) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaFuncAttributes fa{};
+    if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
+        cudaFuncGetAttributes(&fa, mhc_fused_kernel) != cudaSuccess)
+      optin = 0;
+    stat = (int)fa.sharedSizeBytes;
+    cudaGetLastError();
+  }
+  return stat + nb_out * (kFDim / 256) * 64 <= optin;
+}
 // dynamic shared memory of a launch: the staged in_proj_b weights (nb_out <= 48 rows x 1280 B per block)
 int fused_smem(const MhcFusedArgs* args) {
+  // (where 48 rows do not fit, the attribute call fails: clear its error, or the next launch check returns it)
   static const bool attr = cudaFuncSetAttribute(mhc_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                48 * (kFDim / 256) * 64) == cudaSuccess;
+                                                48 * (kFDim / 256) * 64) == cudaSuccess || (cudaGetLastError(), false);
   const int nbo = args->wb ? args->nb_out : 0;
   return attr || nbo * (kFDim / 256) * 64 <= 8192 ? nbo * (kFDim / 256) * 64 : -1;
 }

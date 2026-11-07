@@ -435,6 +435,20 @@ fn collapse_scales(sc: &[u8], n: usize, k: usize, cg: usize, group: usize, what:
     Ok(out)
 }
 
+/// AGENS_MEM_TRACE=1: device memory at a load stage -- cudaMemGetInfo's used (every process + the driver's own on
+/// Windows) next to this process's own usage and budget (Windows, DXGI)
+fn mem_trace(dev: usize, stage: &str) {
+    if std::env::var("AGENS_MEM_TRACE").map(|v| v != "1").unwrap_or(true) {
+        return;
+    }
+    let _ = agens_cuda::synchronize();
+    let (free, total) = agens_cuda::mem_info().unwrap_or((0, 0));
+    let own = agens_cuda::own_mem(dev).map(|(u, b)| format!(", own {:.3} GiB (budget {:.3} GiB)", u as f64 / (1u64 << 30) as f64,
+                                                            b as f64 / (1u64 << 30) as f64)).unwrap_or_default();
+    eprintln!("m1: mem {stage}: used {:.3} GiB of {:.3} GiB{own}", (total - free) as f64 / (1u64 << 30) as f64,
+              total as f64 / (1u64 << 30) as f64);
+}
+
 pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     let (gpu_gib, mut wctx) = (o.gpu_gib, o.wctx);
     crate::tp::launch(o.tp)?;
@@ -446,6 +460,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         bail!("--tp: one device per rank (no --devices)");
     }
     agens_cuda::set_device(devs[0] as usize)?;
+    mem_trace(devs[0] as usize, "context");
     // 1.3.6: on a device that also drives a display (or any device under Windows) keep AGENS_M1_HEADROOM_GIB (default
     // 0.75) of it out of --budget-gib. The plan fills the budget to the last few hundred MB, and a 16 GiB budget is the
     // whole of a 16 GB card: there the desktop's allocations either fail ours (Linux) or make the Windows driver move
@@ -477,7 +492,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     // decode and every verify query take the same kernels, so spec == non-spec greedy); AGENS_FAR_ATTEND=bridge keeps
     // the cuBLAS-einsum numerics of the ATen bridge.
     if std::env::var("AGENS_FAR_ATTEND").is_err() {
-        std::env::set_var("AGENS_FAR_ATTEND", "fused");
+        agens_cuda::set_env("AGENS_FAR_ATTEND", "fused");
     }
     let kv_auto = budget_gib > 0.0 && tp == 1 && std::env::var("AGENS_KV_TIER").is_err()
         && std::env::var("AGENS_KV_IDX_HOST").is_err() && std::env::var("AGENS_KV_AUTO").map(|v| v != "0").unwrap_or(true);
@@ -503,7 +518,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
                 continue;
             }
             if std::env::var(k).is_err() {
-                std::env::set_var(k, v);
+                agens_cuda::set_env(k, v);
             }
         }
     }
@@ -519,6 +534,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         }
         CAP.store(ballast, std::sync::atomic::Ordering::Relaxed);
     }
+    mem_trace(devs[0] as usize, "ballast");
     let ck = Checkpoint::open(dir)?;
     let n_layers = ck.config.n_layers;
     let split = std::env::var("AGENS_M1_SPLIT").ok().and_then(|v| v.parse().ok())
@@ -583,7 +599,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
     // f_down: faster than KT at m = 1 / 8 on compute capability 9.0; bit-identical); devices without the 200 KB shared-memory opt-in
     // keep KT by themselves. AGENS_W4H set: as given (0 = off).
     if gpu_gib > 0.0 && budget_gib <= 0.0 && std::env::var_os("AGENS_W4H").is_none() {
-        std::env::set_var("AGENS_W4H", "2");
+        agens_cuda::set_env("AGENS_W4H", "2");
     }
     // =draft: the INT8 head (1.27 GB more) for the drafter's candidate logits while the target decodes with the bf16
     // head (drafter numerics move acceptance only). Not the default: ak_i8_gemv at 7 rows took 1.16 ms on sm90 vs
@@ -861,6 +877,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
                                the prefill temporaries)", ws as f64 / 1e9, (ws - own) as f64 / 1e9), own));
     }
     let t_weights = t0.elapsed().as_secs_f64();
+    mem_trace(devs[0] as usize, "weights");
     // the W4 prefill weight cache in budget mode only when forced on (--w4-prefill-cache 1): the plan counts it
     let budget_cache = budget_gib > 0.0 && w4_cache_mode(o) == "1" && devs.len() == 1;
     if budget_cache {
@@ -891,8 +908,8 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
                            as 1.2)", p.pool_rows);
             } else {
                 let rows0 = p.pool_rows;
-                std::env::set_var("AGENS_KV_TIER", "2");
-                std::env::set_var("AGENS_KV_IDX_HOST", "1");
+                agens_cuda::set_env("AGENS_KV_TIER", "2");
+                agens_cuda::set_env("AGENS_KV_IDX_HOST", "1");
                 reserve.splice(0..n_spec_res, spec_res());
                 p = crate::plan::plan(&ck.config, budget, total - free - ballast, o.sessions, wctx, w4_max_nk, &reserve, tp);
                 eprintln!("m1: KV cache tiered to host RAM: the all-GPU plan holds {rows0} rows < --wctx {wctx}");
@@ -941,11 +958,13 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         agens_cuda::m1::tp_config(rank, tp)?;
     }
     agens_cuda::m1::init(wctx, &mixers, eng_layers, engram, &devs, split, pool, o.sessions)?;
+    mem_trace(devs[0] as usize, "m1 init");
     // the largest all-reduce: a prefill chunk of hidden rows
     let chunk = std::env::var("AGENS_M1_PREFILL_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4096).min(8192);
     crate::tp::setup_allreduce(chunk * 5120)?;
     if let Some(d) = &draft {
         crate::spec::finish_drafter(d, cap_rows)?;
+        mem_trace(devs[0] as usize, "drafter");
     }
     if o.copy && draft.is_none() && mtp.is_none() {
         agens_cuda::m1::spec_init(true, None, cap_rows)?;  // verify buffers (KDA stash) for copy-only drafting
@@ -996,6 +1015,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         eprintln!("m1: W4H dual layout: KT kept, W4H copies {:.2} GB for launches of <= {} tokens (AGENS_W4H_MMAX)",
                   dual as f64 / 1e9, std::env::var("AGENS_W4H_MMAX").unwrap_or_default());
     }
+    mem_trace(devs[0] as usize, "vision / mtp");
     w4_prefill_cache(o, budget_cache || auto_w4)?;
     if budget_gib > 0.0 && std::env::var("AGENS_M1_PREFILL_RESERVE").map(|v| v != "0").unwrap_or(true) {
         // the plan's prefill temporaries taken now, before any CUDA graph (AGENS_M1_PREFILL_RESERVE=0: 1.3.1's lazy way)
@@ -1003,6 +1023,7 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         agens_cuda::m1::prefill_reserve(kb, tb)?;
         eprintln!("m1: prefill temporaries reserved: KDA arena {:.2} GB, torch cache {:.2} GB", kb as f64 / 1e9, tb as f64 / 1e9);
     }
+    mem_trace(devs[0] as usize, "prefill reserve");
     for (k, &d) in devs.iter().enumerate() {
         pl.on(k)?;
         let (free, total) = agens_cuda::mem_info()?;

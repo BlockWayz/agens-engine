@@ -24,6 +24,7 @@ int ak_memcpy_d2h(void* dst, const void* src, size_t bytes);
 int ak_synchronize(void);
 int ak_mem_info(size_t* free_bytes, size_t* total_bytes);
 int ak_device_display(int dev, int* on);  // cudaDevAttrKernelExecTimeout: the device drives a display
+int ak_own_mem(int dev, size_t* usage, size_t* budget);  // Windows: this process's device memory + OS budget (DXGI)
 const char* ak_error_string(int code);
 int ak_host_alloc(void** ptr, size_t bytes);  // pinned + mapped (device-accessible via UVA)
 int ak_host_free(void* ptr);
@@ -297,6 +298,7 @@ typedef struct MhcFusedArgs {
                                                    // write_res (then dcur / res_s_cur are not read)
 } MhcFusedArgs;
 int ak_mhc_fused_ok(void);  // the device can launch it (thread-block clusters: sm90+)
+int ak_mhc_fused_b_ok(int nb_out);  // the in_proj_b fusion fits the device's shared memory per block
 int ak_mhc_fused(const MhcFusedArgs* args, int T, void* stream);
 // the same with layer i's MLP tensor-parallel all-reduce folded in (Yb = this rank's partial; push path only);
 // ak_mhc_fused_ar_ok(T): whether it can take T rows (else all-reduce Yb and call ak_mhc_fused)

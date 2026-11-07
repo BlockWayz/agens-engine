@@ -30,12 +30,12 @@ pub fn launch(tp: usize) -> Result<()> {
     if ![2, 4].contains(&tp) {
         bail!("--tp {tp}: 2 or 4 (4 KV heads split evenly)");
     }
-    std::env::set_var("AGENS_TP_SIZE", tp.to_string());
-    std::env::set_var("AGENS_TP_RANK", "0");
+    agens_cuda::set_env("AGENS_TP_SIZE", tp.to_string());
+    agens_cuda::set_env("AGENS_TP_RANK", "0");
     // the pid alone repeats across containers (PID namespaces, --ipc=host shares /dev/shm): a stale handle file of an
     // earlier run with the same pid was read as this run's peer handle (tp_region_open: invalid argument)
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
-    std::env::set_var("AGENS_TP_ID", format!("{}x{nanos:x}", std::process::id()));
+    agens_cuda::set_env("AGENS_TP_ID", format!("{}x{nanos:x}", std::process::id()));
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut ins = Vec::new();

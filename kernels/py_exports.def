@@ -9,6 +9,7 @@ ak_memcpy_d2h
 ak_synchronize
 ak_error_string
 ak_mem_info
+ak_own_mem
 ak_host_alloc
 ak_host_free
 ak_rope_cache

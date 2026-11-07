@@ -49,13 +49,13 @@ set_source_files_properties(src/fastmath/silu_mul.cu PROPERTIES COMPILE_OPTIONS 
 add_library(agens_kernels STATIC ${AGENS_SOURCES})
 target_include_directories(agens_kernels PUBLIC include)
 target_compile_options(agens_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${AGENS_CUDA_FLAGS}>)
-target_link_libraries(agens_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::cuda_driver)
+target_link_libraries(agens_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::cuda_driver $<$<BOOL:${MSVC}>:dxgi>)
 
 # Shared build of the same kernels for the Python tests (ctypes): tools/test_*.py load libagens_kernels_py.so.
 add_library(agens_kernels_py SHARED ${AGENS_SOURCES})
 target_include_directories(agens_kernels_py PUBLIC include)
 target_compile_options(agens_kernels_py PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${AGENS_CUDA_FLAGS}>)
-target_link_libraries(agens_kernels_py PUBLIC CUDA::cudart CUDA::cublas CUDA::cuda_driver)
+target_link_libraries(agens_kernels_py PUBLIC CUDA::cudart CUDA::cublas CUDA::cuda_driver $<$<BOOL:${MSVC}>:dxgi>)
 
 if(AGENS_BUILD_BENCH)
   add_executable(bench_gemv bench/bench_gemv.cu)

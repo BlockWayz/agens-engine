@@ -18,6 +18,7 @@ mod ffi {
         pub fn ak_error_string(code: c_int) -> *const c_char;
         pub fn ak_mem_info(free: *mut usize, total: *mut usize) -> c_int;
         pub fn ak_device_display(dev: c_int, on: *mut c_int) -> c_int;
+        pub fn ak_own_mem(dev: c_int, usage: *mut usize, budget: *mut usize) -> c_int;
         pub fn ak_host_alloc(ptr: *mut *mut c_void, bytes: usize) -> c_int;
         pub fn ak_host_free(ptr: *mut c_void) -> c_int;
         pub fn ak_rope_cache(out: *mut f32, max_pos: c_int, rot: c_int, base: f32, stream: *mut c_void) -> c_int;
@@ -45,6 +46,25 @@ fn check(code: std::os::raw::c_int, what: &str) -> Result<()> {
 
 pub fn available() -> bool {
     cfg!(feature = "cuda")
+}
+
+/// std::env::set_var, also seen by the kernels' getenv(). On Windows set_var changes the process environment block
+/// (SetEnvironmentVariableW) but not the C runtime's copy that getenv() reads (initialised at startup), so the AGENS_*
+/// defaults the profiles and budget mode set at run time never reached the CUDA side (prefill chunk 4096 instead of
+/// 1024, KV not tiered, torch's allocator without expandable segments: ~1.5 GB more device memory than the plan,
+/// issue #3). _putenv_s updates the UCRT's table, which every DLL built with /MD shares.
+pub fn set_env<K: AsRef<str>, V: AsRef<str>>(k: K, v: V) {
+    let (k, v) = (k.as_ref(), v.as_ref());
+    std::env::set_var(k, v);
+    #[cfg(windows)]
+    {
+        extern "C" {
+            fn _putenv_s(name: *const std::os::raw::c_char, value: *const std::os::raw::c_char) -> std::os::raw::c_int;
+        }
+        if let (Ok(k), Ok(v)) = (std::ffi::CString::new(k), std::ffi::CString::new(v)) {
+            unsafe { _putenv_s(k.as_ptr(), v.as_ptr()) };
+        }
+    }
 }
 
 /// Owned device allocation.
@@ -94,6 +114,11 @@ mod imp {
         let mut on = 0;
         check(unsafe { ffi::ak_device_display(dev as i32, &mut on) }, "device_display")?;
         Ok(on != 0)
+    }
+    /// Windows: (this process's device memory, the OS budget for it) from DXGI; None elsewhere
+    pub fn own_mem(dev: usize) -> Option<(usize, usize)> {
+        let (mut u, mut b) = (0, 0);
+        (unsafe { ffi::ak_own_mem(dev as i32, &mut u, &mut b) } == 0).then_some((u, b))
     }
     pub fn upload(data: &[u8]) -> Result<DeviceBuffer> {
         let mut ptr = std::ptr::null_mut();
@@ -222,6 +247,9 @@ mod imp {
     }
     pub fn display_attached(_: usize) -> Result<bool> {
         bail!(NO)
+    }
+    pub fn own_mem(_: usize) -> Option<(usize, usize)> {
+        None
     }
     pub fn upload(_: &[u8]) -> Result<DeviceBuffer> {
         bail!(NO)
