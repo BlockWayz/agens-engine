@@ -29,6 +29,9 @@ fn main() {
         for ent in rd.flatten() {
             let p = ent.path();
             if p.extension().map(|e| e == "dll").unwrap_or(false) {
+                // per file: a rebuilt kernel DLL changes no directory mtime, and a stale copy next to agens.exe fails to
+                // start with STATUS_ENTRYPOINT_NOT_FOUND once the DLL exports a new function
+                println!("cargo:rerun-if-changed={}", p.display());
                 let dst = exe_dir.join(p.file_name().unwrap());
                 let fresh = std::fs::metadata(&dst).ok().zip(std::fs::metadata(&p).ok())
                     .and_then(|(d, s)| Some(d.modified().ok()?.ge(&s.modified().ok()?))).unwrap_or(false);
