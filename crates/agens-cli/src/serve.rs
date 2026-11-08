@@ -804,6 +804,10 @@ impl Engine {
                                                     first: Some((g, l)) })));
         }
         let Some(k) = conv.clone() else {
+            if let Some(k) = &job.conv {  // 1.3.8: a session-hinted request that cannot use its conversation says so
+                eprintln!("serve: request {} session {k:?}: the conversation has a request running: this one prefills on a \
+                           session of its own ({} of {n} prompt tokens to prefill)", job.id, n - l0);
+            }
             let mm = match Self::mm_feed(job, l0, n) {
                 Ok(m) => m,
                 Err(e) => return Ok(Admit::Fail(format!("{e:#}"))),
@@ -814,6 +818,15 @@ impl Engine {
             };
             return Ok(Admit::Ok(mk(Phase::Prefill { sess: s, feed: ids[l0..].to_vec(), done: 0, mm, pos0: l0, canon: true, first: None })));
         };
+        if reuse == Some(false) {
+            // 1.3.8: the prompt does not extend what the conversation holds (edited or regenerated history, a client that
+            // renders earlier turns differently): the conversation starts over with a full prefill, said in one line
+            let c = &self.convs[&k];
+            let same = c.held.iter().zip(&job.key).take_while(|(a, b)| a == b).count();
+            eprintln!("serve: request {} session {k:?}: prefix check failed: the conversation holds {} tokens, the prompt has {n} \
+                       and they agree on the first {same}: full prefill ({} of {n} prompt tokens{})", job.id, c.held.len(),
+                      n - l0, if l0 > 0 { format!("; {l0} restored from the prefix cache") } else { String::new() });
+        }
         if reuse != Some(true) {
             if let Some(old) = self.convs.remove(&k) {
                 self.free_session(old.main)?; // prefix mismatch: start the conversation over
