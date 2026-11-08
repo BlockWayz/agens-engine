@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "fi_batch_prefill_config.inc"
+#include "fi_ws.h"
 #include <flashinfer/attention/variants.cuh>
 #include <flashinfer/attention/prefill.cuh>
 
@@ -24,7 +25,7 @@ struct Ws {
   void* f = nullptr;
   void* i = nullptr;
   void* pinned = nullptr;
-  size_t fbytes = 0, ibytes = 0;
+  size_t fbytes = 0, ibytes = 0;  // float workspace: grows with the plans (fi_ws.h)
   // plan resident in the int workspace (decode): reused while its inputs are unchanged, like flashinfer's
   // plan-once-per-forward (the kernels only read it). A dense prefill plan overwrites the workspace and clears it.
   std::vector<int> key;
@@ -39,17 +40,32 @@ Ws& cur_ws() {
 }  // namespace
 #define g_ws cur_ws()
 
+namespace {
+// the float workspace for a (non-window) plan of these lengths, grown when it is short (fi_ws.h)
+cudaError_t ws_ensure(const int* qo_indptr_host, const int* kv_indptr_host, int rows, int bs, int qo_heads, int kv_heads,
+                      bool cuda_graph, const char* who, cudaStream_t s) {
+  size_t need_f = 0, need_i = 0;
+  cudaError_t e = PrefillPlanWorkspaceSize<int32_t>(need_f, need_i, const_cast<int*>(qo_indptr_host),
+                                                    const_cast<int*>(kv_indptr_host), rows, bs, qo_heads, kv_heads, 256,
+                                                    256, 1, cuda_graph, 2, -1, -1, false, 0, s);
+  if (e != cudaSuccess) return e;
+  if (need_i > g_ws.ibytes) {
+    fprintf(stderr, "attn: %s plan needs a %.1f MiB int workspace (have %zu MiB)\n", who, need_i / 1048576.0,
+            g_ws.ibytes >> 20);
+    return cudaErrorMemoryAllocation;
+  }
+  return agens_fi_ws::ensure(&g_ws.f, &g_ws.fbytes, need_f, who, s);
+}
+}  // namespace
+
 // q [bs][24][256] bf16; k/v cache [pool][1][kvh][256] bf16 (NHD, page 1); kv_indptr / indices / last_page_len device
 // int32; kv_indptr_host + kv_len_host on host. o [bs][24][256] bf16; lse [bs][24] fp32 (log2 domain).
-extern "C" int ak_oracle_bcsa_local(void* q, void* kc, void* vc, int pool, int* kv_indptr, int* kv_indices,
-                                    int* last_page_len, const int* kv_indptr_host, const int* qo_indptr_host,
-                                    int* qo_indptr_dev, int bs, int qo_heads, int kv_heads, float sm_scale, void* o,
-                                    float* lse, int cuda_graph, void* stream) {
+static int bcsa_local(void* q, void* kc, void* vc, int pool, int* kv_indptr, int* kv_indices, int* last_page_len,
+                      const int* kv_indptr_host, const int* qo_indptr_host, int* qo_indptr_dev, int bs, int qo_heads,
+                      int kv_heads, float sm_scale, void* o, float* lse, int cuda_graph, void* stream) {
   cudaStream_t s = static_cast<cudaStream_t>(stream);
-  if (!g_ws.f) {
-    g_ws.fbytes = 128ull << 20;  // sglv23 _FI_WORKSPACE_BYTES
-    g_ws.ibytes = 8ull << 20;    // flashinfer wrapper int workspace
-    cudaMalloc(&g_ws.f, g_ws.fbytes);
+  if (!g_ws.i) {
+    g_ws.ibytes = 8ull << 20;  // flashinfer wrapper int workspace
     cudaMalloc(&g_ws.i, g_ws.ibytes);
     cudaMallocHost(&g_ws.pinned, g_ws.ibytes);
   }
@@ -58,11 +74,13 @@ extern "C" int ak_oracle_bcsa_local(void* q, void* kc, void* vc, int pool, int* 
   key.insert(key.end(), kv_indptr_host, kv_indptr_host + bs + 1);
   if (key != g_ws.key) {
     g_ws.key.clear();
-    cudaError_t e = PrefillPlan<int32_t>(g_ws.f, g_ws.fbytes, g_ws.i, g_ws.pinned, g_ws.ibytes, g_ws.plan,
-                                         const_cast<int*>(qo_indptr_host), const_cast<int*>(kv_indptr_host),
-                                         /*total_num_rows=*/bs, bs, qo_heads, kv_heads, 256, 256, /*page=*/1,
-                                         cuda_graph != 0, /*sizeof_dtype_o=*/2, /*window_left=*/-1,
-                                         /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 0, s);
+    cudaError_t e = ws_ensure(qo_indptr_host, kv_indptr_host, bs, bs, qo_heads, kv_heads, cuda_graph != 0, "BCSA decode", s);
+    if (e != cudaSuccess) return (int)e;
+    e = PrefillPlan<int32_t>(g_ws.f, g_ws.fbytes, g_ws.i, g_ws.pinned, g_ws.ibytes, g_ws.plan,
+                             const_cast<int*>(qo_indptr_host), const_cast<int*>(kv_indptr_host),
+                             /*total_num_rows=*/bs, bs, qo_heads, kv_heads, 256, 256, /*page=*/1, cuda_graph != 0,
+                             /*sizeof_dtype_o=*/2, /*window_left=*/-1, /*fixed_split_size=*/-1,
+                             /*disable_split_kv=*/false, 0, s);
     if (e != cudaSuccess) return (int)e;
     // PrefillPlan stages the plan through ONE pinned host buffer with an async H2D copy; the next plan would
     // overwrite it before that copy runs. Same inputs (all BCSA layers of a decode step) reuse the resident plan.
@@ -123,25 +141,36 @@ extern "C" int ak_oracle_bcsa_local(void* q, void* kc, void* vc, int pool, int* 
   }
 }
 
+// a planner exception (flashinfer throws on a workspace or shape it cannot handle) fails the call instead of aborting
+extern "C" int ak_oracle_bcsa_local(void* q, void* kc, void* vc, int pool, int* kv_indptr, int* kv_indices,
+                                    int* last_page_len, const int* kv_indptr_host, const int* qo_indptr_host,
+                                    int* qo_indptr_dev, int bs, int qo_heads, int kv_heads, float sm_scale, void* o,
+                                    float* lse, int cuda_graph, void* stream) {
+  return agens_fi_ws::guarded("BCSA decode attention", [&] {
+    return bcsa_local(q, kc, vc, pool, kv_indptr, kv_indices, last_page_len, kv_indptr_host, qo_indptr_host,
+                      qo_indptr_dev, bs, qo_heads, kv_heads, sm_scale, o, lse, cuda_graph, stream);
+  });
+}
+
 // Dense layer (71) prefill: sglang's own FlashInferAttnBackend paged prefill wrapper (use_ragged=False for this
 // multimodal model class), causal, no window, eager plan. Same non-SWA module as the decode above (mask_1 variant).
-extern "C" int ak_oracle_dense_prefill(void* q, void* kc, void* vc, int* qo_indptr_dev, int* kv_indptr, int* kv_indices,
-                                       int* last_page_len, const int* qo_indptr_host, const int* kv_indptr_host,
-                                       int bs, int qo_heads, int kv_heads, float sm_scale, void* o, void* stream) {
+static int dense_prefill(void* q, void* kc, void* vc, int* qo_indptr_dev, int* kv_indptr, int* kv_indices,
+                         int* last_page_len, const int* qo_indptr_host, const int* kv_indptr_host, int bs, int qo_heads,
+                         int kv_heads, float sm_scale, void* o, void* stream) {
   cudaStream_t s = static_cast<cudaStream_t>(stream);
-  if (!g_ws.f) {
-    g_ws.fbytes = 128ull << 20;
+  if (!g_ws.i) {
     g_ws.ibytes = 8ull << 20;
-    cudaMalloc(&g_ws.f, g_ws.fbytes);
     cudaMalloc(&g_ws.i, g_ws.ibytes);
     cudaMallocHost(&g_ws.pinned, g_ws.ibytes);
   }
   PrefillPlanInfo plan;
   g_ws.key.clear();  // overwrites the resident decode plan
-  cudaError_t e = PrefillPlan<int32_t>(g_ws.f, g_ws.fbytes, g_ws.i, g_ws.pinned, g_ws.ibytes, plan,
-                                       const_cast<int*>(qo_indptr_host), const_cast<int*>(kv_indptr_host),
-                                       qo_indptr_host[bs], bs, qo_heads, kv_heads, 256, 256, 1, false, 2, -1, -1, false,
-                                       0, s);
+  cudaError_t e = ws_ensure(qo_indptr_host, kv_indptr_host, qo_indptr_host[bs], bs, qo_heads, kv_heads, false,
+                            "dense prefill", s);
+  if (e != cudaSuccess) return (int)e;
+  e = PrefillPlan<int32_t>(g_ws.f, g_ws.fbytes, g_ws.i, g_ws.pinned, g_ws.ibytes, plan, const_cast<int*>(qo_indptr_host),
+                           const_cast<int*>(kv_indptr_host), qo_indptr_host[bs], bs, qo_heads, kv_heads, 256, 256, 1,
+                           false, 2, -1, -1, false, 0, s);
   if (e != cudaSuccess) return (int)e;
   // PrefillPlan stages the plan through ONE pinned host buffer with an async H2D copy; the next call would
   // overwrite it before that copy runs. (flashinfer plans once per forward; this oracle plans per call.)
@@ -194,6 +223,15 @@ extern "C" int ak_oracle_dense_prefill(void* q, void* kc, void* vc, int* qo_indp
     default:
       return (int)cudaErrorInvalidValue;
   }
+}
+
+extern "C" int ak_oracle_dense_prefill(void* q, void* kc, void* vc, int* qo_indptr_dev, int* kv_indptr, int* kv_indices,
+                                       int* last_page_len, const int* qo_indptr_host, const int* kv_indptr_host,
+                                       int bs, int qo_heads, int kv_heads, float sm_scale, void* o, void* stream) {
+  return agens_fi_ws::guarded("dense prefill attention", [&] {
+    return dense_prefill(q, kc, vc, qo_indptr_dev, kv_indptr, kv_indices, last_page_len, qo_indptr_host, kv_indptr_host,
+                         bs, qo_heads, kv_heads, sm_scale, o, stream);
+  });
 }
 
 // ---------------------------------------------------------------- graph-safe decode attention (M1 decode graphs)
@@ -659,13 +697,11 @@ extern "C" int ak_attn_decode_packed(int mslot, void* q, void* kc, void* vc, int
 // ---------------------------------------------------------------- prefill over a staged KV list, with lse
 // q [T][24][256] against kv rows indices[0, kv_len) of kc/vc (one request; host plan), causal (the chunk's own keys,
 // kv_len == T) or no mask (keys before the chunk); o [T][24][256] bf16, lse [T][24] (log2). INT8 dense-layer prefill.
-extern "C" int ak_prefill_staged_lse(void* q, void* kc, void* vc, int* indices, int T, int kv_len, int causal,
-                                     int qo_heads, int kv_heads, float sm_scale, void* o, float* lse, void* stream) {
+static int prefill_staged_lse(void* q, void* kc, void* vc, int* indices, int T, int kv_len, int causal, int qo_heads,
+                              int kv_heads, float sm_scale, void* o, float* lse, void* stream) {
   cudaStream_t s = static_cast<cudaStream_t>(stream);
-  if (!g_ws.f) {
-    g_ws.fbytes = 128ull << 20;
+  if (!g_ws.i) {
     g_ws.ibytes = 8ull << 20;
-    cudaMalloc(&g_ws.f, g_ws.fbytes);
     cudaMalloc(&g_ws.i, g_ws.ibytes);
     cudaMallocHost(&g_ws.pinned, g_ws.ibytes);
   }
@@ -682,8 +718,10 @@ extern "C" int ak_prefill_staged_lse(void* q, void* kc, void* vc, int* indices, 
   cudaMemcpyAsync(ld, hp + 4, 4, cudaMemcpyHostToDevice, s);
   PrefillPlanInfo plan;
   g_ws.key.clear();
-  cudaError_t e = PrefillPlan<int32_t>(g_ws.f, g_ws.fbytes, g_ws.i, g_ws.pinned, g_ws.ibytes, plan, qh, kh, T, 1,
-                                       qo_heads, kv_heads, 256, 256, 1, false, 2, -1, -1, false, 0, s);
+  cudaError_t e = ws_ensure(qh, kh, T, 1, qo_heads, kv_heads, false, "staged prefill", s);
+  if (e != cudaSuccess) return (int)e;
+  e = PrefillPlan<int32_t>(g_ws.f, g_ws.fbytes, g_ws.i, g_ws.pinned, g_ws.ibytes, plan, qh, kh, T, 1, qo_heads, kv_heads,
+                           256, 256, 1, false, 2, -1, -1, false, 0, s);
   if (e != cudaSuccess) return (int)e;
   cudaStreamSynchronize(s);
   PagedParams p;
@@ -732,4 +770,11 @@ extern "C" int ak_prefill_staged_lse(void* q, void* kc, void* vc, int* indices, 
     default: return (int)cudaErrorInvalidValue;
   }
 #undef AK_PF
+}
+
+extern "C" int ak_prefill_staged_lse(void* q, void* kc, void* vc, int* indices, int T, int kv_len, int causal,
+                                     int qo_heads, int kv_heads, float sm_scale, void* o, float* lse, void* stream) {
+  return agens_fi_ws::guarded("staged prefill attention", [&] {
+    return prefill_staged_lse(q, kc, vc, indices, T, kv_len, causal, qo_heads, kv_heads, sm_scale, o, lse, stream);
+  });
 }

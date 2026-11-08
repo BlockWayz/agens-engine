@@ -62,6 +62,11 @@ pub fn torch_temp_bytes(tp: usize) -> usize {
     if engine_far() { 0 } else { prefill_temp_bytes() * 3 / 2 + (32 << 20) }
 }
 
+/// AGENS_FI_WORKSPACE_MIB: the starting size of each flashinfer float workspace (kernels/oracle/fi_ws.h reads it too)
+fn fi_workspace_mib() -> usize {
+    std::env::var("AGENS_FI_WORKSPACE_MIB").ok().and_then(|v| v.parse().ok()).filter(|&m| m > 0).unwrap_or(128)
+}
+
 fn env_on(n: &str) -> bool {
     std::env::var(n).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
 }
@@ -78,7 +83,10 @@ pub fn scratch_bytes(w4_max_nk: usize, wctx: usize, tier: bool, tp: usize) -> (u
     let parts = vec![
         (format!("activations (prefill chunk {t})"), acts),
         ("W4 dequant scratch (prefill, tiled)".to_string(), w4_scratch(w4_max_nk)),
-        ("flashinfer + cuBLAS workspaces".to_string(), 2 * (136 << 20) + (32 << 20)),
+        // 1.3.8: the two flashinfer float workspaces start at AGENS_FI_WORKSPACE_MIB (default 128) and grow when a plan
+        // needs more (kernels/oracle/fi_ws.h); + 8 MiB int workspace each
+        (format!("flashinfer ({} MiB float x 2) + cuBLAS workspaces", fi_workspace_mib()),
+         2 * ((fi_workspace_mib() + 8) << 20) + (32 << 20)),
         // 1.3.2: reserved at load (1.3.1 left them to the stream-ordered pool / torch's cache at prefill
         // time, and after short requests' CUDA graphs had taken the room every 4K+ prompt failed with out of memory)
         (format!("prefill temporaries: KDA arena (chunk {t})"), kda_temp_bytes(tp)),

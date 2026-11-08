@@ -9,6 +9,7 @@
 #include <flashinfer/pos_enc.cuh>
 
 #include "fi_batch_prefill_swa_config.inc"
+#include "fi_ws.h"
 #include <flashinfer/attention/variants.cuh>
 #include <flashinfer/attention/prefill.cuh>
 
@@ -17,6 +18,7 @@ using VariantSwa = DefaultAttention</*custom mask*/ false, /*sliding window*/ tr
 
 namespace {
 void* g_fd[16] = {};
+size_t g_fcap[16] = {};
 void* g_id[16] = {};
 void* g_pind[16] = {};
 int cur_dev() {
@@ -27,26 +29,35 @@ int cur_dev() {
 #define g_f g_fd[cur_dev()]
 #define g_i g_id[cur_dev()]
 #define g_pin g_pind[cur_dev()]
-const size_t kF = 128ull << 20, kI = 8ull << 20;
+const size_t kI = 8ull << 20;  // float workspace: grows with the plans (fi_ws.h)
 }  // namespace
 
 // q [T][24][256] (T = qo_indptr_host[bs]); k/v cache [pool][1][kvh][256]; kv_indptr/indices/last_page_len device int32
 // with host copies of qo_indptr / kv_indptr. o [T][24][256] bf16, lse [T][24] fp32 (log2).
-extern "C" int ak_oracle_bcsa_prefill(void* q, void* kc, void* vc, int* qo_indptr_dev, int* kv_indptr, int* kv_indices,
-                                      int* last_page_len, const int* qo_indptr_host, const int* kv_indptr_host, int bs,
-                                      int qo_heads, int kv_heads, int window_left, float sm_scale, void* o, float* lse,
-                                      void* stream) {
+static int bcsa_prefill(void* q, void* kc, void* vc, int* qo_indptr_dev, int* kv_indptr, int* kv_indices,
+                        int* last_page_len, const int* qo_indptr_host, const int* kv_indptr_host, int bs, int qo_heads,
+                        int kv_heads, int window_left, float sm_scale, void* o, float* lse, void* stream) {
   cudaStream_t s = static_cast<cudaStream_t>(stream);
-  if (!g_f) {
-    cudaMalloc(&g_f, kF);
+  if (!g_i) {
     cudaMalloc(&g_i, kI);
     cudaMallocHost(&g_pin, kI);
   }
   const int total_rows = qo_indptr_host[bs];
+  size_t need_f = 0, need_i = 0;
+  cudaError_t e = PrefillPlanWorkspaceSize<int32_t>(need_f, need_i, const_cast<int*>(qo_indptr_host),
+                                                    const_cast<int*>(kv_indptr_host), total_rows, bs, qo_heads, kv_heads,
+                                                    256, 256, 1, false, 2, window_left, -1, false, 0, s);
+  if (e != cudaSuccess) return (int)e;
+  if (need_i > kI) {
+    fprintf(stderr, "attn: BCSA prefill plan needs a %.1f MiB int workspace (have %zu MiB)\n", need_i / 1048576.0,
+            kI >> 20);
+    return (int)cudaErrorMemoryAllocation;
+  }
+  if ((e = agens_fi_ws::ensure(&g_f, &g_fcap[cur_dev()], need_f, "BCSA prefill", s)) != cudaSuccess) return (int)e;
   PrefillPlanInfo plan;
-  cudaError_t e = PrefillPlan<int32_t>(g_f, kF, g_i, g_pin, kI, plan, const_cast<int*>(qo_indptr_host),
-                                       const_cast<int*>(kv_indptr_host), total_rows, bs, qo_heads, kv_heads, 256, 256,
-                                       1, /*cuda graph*/ false, 2, window_left, -1, false, 0, s);
+  e = PrefillPlan<int32_t>(g_f, g_fcap[cur_dev()], g_i, g_pin, kI, plan, const_cast<int*>(qo_indptr_host),
+                           const_cast<int*>(kv_indptr_host), total_rows, bs, qo_heads, kv_heads, 256, 256, 1,
+                           /*cuda graph*/ false, 2, window_left, -1, false, 0, s);
   if (e != cudaSuccess) return (int)e;
   // PrefillPlan stages the plan through ONE pinned host buffer with an async H2D copy; the next call would
   // overwrite it before that copy runs. (flashinfer plans once per forward; this oracle plans per call.)
@@ -100,4 +111,15 @@ extern "C" int ak_oracle_bcsa_prefill(void* q, void* kc, void* vc, int* qo_indpt
     default:
       return (int)cudaErrorInvalidValue;
   }
+}
+
+// a planner exception (flashinfer throws on a workspace or shape it cannot handle) fails the call instead of aborting
+extern "C" int ak_oracle_bcsa_prefill(void* q, void* kc, void* vc, int* qo_indptr_dev, int* kv_indptr, int* kv_indices,
+                                      int* last_page_len, const int* qo_indptr_host, const int* kv_indptr_host, int bs,
+                                      int qo_heads, int kv_heads, int window_left, float sm_scale, void* o, float* lse,
+                                      void* stream) {
+  return agens_fi_ws::guarded("BCSA prefill attention", [&] {
+    return bcsa_prefill(q, kc, vc, qo_indptr_dev, kv_indptr, kv_indices, last_page_len, qo_indptr_host, kv_indptr_host,
+                        bs, qo_heads, kv_heads, window_left, sm_scale, o, lse, stream);
+  });
 }
