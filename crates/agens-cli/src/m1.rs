@@ -938,6 +938,21 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         if pool < p.pool_rows {
             eprintln!("m1: KV pool capped at {pool} rows (plan {}; AGENS_M1_POOL_MAX_ROWS)", p.pool_rows);
         }
+        // 1.3.8: tiered KV pins host RAM per pool row: the pool also fits what the machine can pin (plan::host_pinnable)
+        let mut ram_capped = false;
+        if tiered && p.row_host > 0 {
+            let gb = |b: usize| b as f64 / 1e9;
+            if let Some((pin, avail, head)) = crate::plan::host_pinnable() {
+                let rows = (pin / p.row_host) & !3;
+                if rows < pool {
+                    eprintln!("m1: KV pool capped at {rows} rows by host RAM (plan {pool}): {:.2} GB available, {:.2} GB kept free \
+                               (AGENS_HOST_PIN_HEADROOM_GIB), {} B pinned per row", gb(avail), gb(head), p.row_host);
+                    pool = rows;
+                    ram_capped = true;
+                }
+            }
+            eprintln!("m1: tiered KV: pinning {:.2} GB of host RAM ({pool} rows x {} B)", gb(pool * p.row_host), p.row_host);
+        }
         let agreed = crate::tp::agree_min("pool", pool)?;  // tp: every rank the same pool (the smallest plan)
         if agreed < pool {
             eprintln!("m1: KV pool {agreed} rows (rank {rank} planned {pool}; the ranks take the smallest)");
@@ -949,9 +964,11 @@ pub(crate) fn load(dir: &str, o: &Opts) -> Result<()> {
         if pool < wctx {
             let w = (pool.saturating_sub(4) / 4096) * 4096 + 4; // the profiles' form: 4096 k + 4
             if w < 2 * crate::plan::chunk().max(4096) {
-                bail!("budget {} GiB: the KV pool ({pool} rows) cannot hold a useful context (--wctx {wctx})", budget_gib);
+                bail!("budget {} GiB: the KV pool ({pool} rows{}) cannot hold a useful context (--wctx {wctx})", budget_gib,
+                      if ram_capped { ", capped by the host RAM free to pin" } else { "" });
             }
-            eprintln!("m1: --wctx {wctx} clamped to {w}: the KV pool holds {pool} rows at the {} GiB cap", budget_gib);
+            eprintln!("m1: --wctx {wctx} clamped to {w}: the KV pool holds {pool} rows {}", if ram_capped {
+                "within the host RAM it may pin".to_string() } else { format!("at the {} GiB cap", budget_gib) });
             wctx = w;
         }
     }

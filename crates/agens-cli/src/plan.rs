@@ -7,6 +7,7 @@ use agens_core::{Mixer, VolundrConfig};
 
 pub struct Plan {
     pub pool_rows: usize,
+    pub row_host: usize, // pinned host bytes per pool row (tiered KV), 0 when all KV is on the GPU
     pub lines: Vec<String>,
 }
 
@@ -60,6 +61,67 @@ pub fn torch_temp_bytes(tp: usize) -> usize {
     // prompts; 1.5 x the sm89-era figure + 32 MB covers it
     let _ = tp;
     if engine_far() { 0 } else { prefill_temp_bytes() * 3 / 2 + (32 << 20) }
+}
+
+/// Host RAM this process may still pin, as (pinnable, available, headroom) bytes: available = MemAvailable (Linux; the
+/// cgroup's limit less its usage when lower, as in a container started with --memory) or ullAvailPhys (Windows), and the
+/// headroom kept free is AGENS_HOST_PIN_HEADROOM_GIB (default: 10 % of physical RAM, at least 4 GiB and at most 8 GiB).
+/// AGENS_HOST_AVAIL_GIB replaces the measured availability (tests). None: not measurable here.
+/// (1.3.8) 1.3.7 sized the tiered KV pool by GPU memory alone: with the 16gb profile at 262K context a 30 GB machine was
+/// asked to pin 22 GB on top of the weights, and the system stalled.
+pub fn host_pinnable() -> Option<(usize, usize, usize)> {
+    let gib = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).map(|g| (g * (1u64 << 30) as f64) as usize);
+    let (total, avail) = host_mem()?;
+    let avail = gib("AGENS_HOST_AVAIL_GIB").unwrap_or(avail);
+    let head = gib("AGENS_HOST_PIN_HEADROOM_GIB").unwrap_or((total / 10).clamp(4usize << 30, 8usize << 30));
+    Some((avail.saturating_sub(head), avail, head))
+}
+
+#[cfg(target_os = "linux")]
+fn host_mem() -> Option<(usize, usize)> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb = |key: &str| info.lines().find(|l| l.starts_with(key))
+        .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<usize>().ok()).map(|k| k << 10);
+    let (mut total, mut avail) = (kb("MemTotal:")?, kb("MemAvailable:")?);
+    let num = |p: &str| std::fs::read_to_string(p).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    // cgroup v2, then v1 (v1 reports "no limit" as a huge number)
+    let lim = num("/sys/fs/cgroup/memory.max").zip(num("/sys/fs/cgroup/memory.current"))
+        .or_else(|| num("/sys/fs/cgroup/memory/memory.limit_in_bytes").zip(num("/sys/fs/cgroup/memory/memory.usage_in_bytes")));
+    if let Some((limit, used)) = lim.filter(|&(l, _)| l < total) {
+        total = limit;
+        avail = avail.min(limit.saturating_sub(used));
+    }
+    Some((total, avail))
+}
+
+#[cfg(windows)]
+fn host_mem() -> Option<(usize, usize)> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut m: MemoryStatusEx = unsafe { std::mem::zeroed() };
+    m.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return None;
+    }
+    Some((m.total_phys as usize, m.avail_phys as usize))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn host_mem() -> Option<(usize, usize)> {
+    None
 }
 
 /// AGENS_FI_WORKSPACE_MIB: the starting size of each flashinfer float workspace (kernels/oracle/fi_ws.h reads it too)
@@ -175,7 +237,7 @@ pub fn plan(cfg: &VolundrConfig, budget: usize, used_now: usize, slots: usize, w
     if pool_rows < wctx {
         lines.push(format!("  WARNING: pool ({pool_rows} rows) is shorter than one full-length session (wctx {wctx})"));
     }
-    Plan { pool_rows, lines }
+    Plan { pool_rows, row_host, lines }
 }
 
 /// `agens m1-plan <ckpt_dir> --weights-gb W [--budget-gib 16] [--sessions N] [--wctx N] [--context-gb 0.45]`: the plan
