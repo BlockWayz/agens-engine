@@ -27,9 +27,10 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md).
   - Prebuilt kernels: compute capability 8.6, 8.9 and 9.0 (validated; 8.6 by community contributor
     [@mmssix](https://github.com/mmssix) on a 24 GB card, see [Community results](#community-results)), 12.0 (validated
     in 1.3.7 on a 24 GB laptop GPU, the Linux image under WSL2 and the native Windows build; earlier, a 96 GB card in a
-    community report on 1.3.0). On compute capability 12.0, 1.3.4 to 1.3.6 fail to decode: use 1.3.7 (see the
+    community report on 1.3.0). On compute capability 12.0, 1.3.4 to 1.3.6 fail to decode: use 1.3.7 or later (see the
     changelog).
-- Host RAM: 32 GB or more for the full 262K context. The tiered KV cache keeps up to ~24 GB in pinned host memory.
+- Host RAM: 32 GB or more for the full 262K context. The tiered KV cache keeps up to ~24 GB in pinned host memory;
+  from 1.3.8 it pins no more than the host RAM that is free, and the context clamps to fit.
 - Docker with the NVIDIA container toolkit (Linux, or Windows with WSL2), or the native Windows build (see
   [Building from source](#building-from-source)).
 - The model checkpoint for your GPU size and, optionally, the drafter checkpoint and the MTP head
@@ -55,7 +56,7 @@ The same flags work on the image directly:
 ```bash
 docker run --gpus device=0 --ipc=host -p 30000:30000 \
   -v /path/to/model:/model:ro -v /path/to/drafter:/drafter:ro \
-  ghcr.io/blockwayz/agens-engine:1.3.7 --profile 16gb --model /model --drafter /drafter
+  ghcr.io/blockwayz/agens-engine:1.3.8 --profile 16gb --model /model --drafter /drafter
 ```
 
 Under WSL2 on Windows, the image does not find the GPU driver library by itself (`libcuda.so.1: cannot open shared

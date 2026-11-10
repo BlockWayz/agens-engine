@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.3.8
+
+### Fixed
+
+- **Long prefills on GPUs with many SMs could abort the server** (reported on Hugging Face). The attention plans'
+  float workspace was fixed at 128 MiB. On a GPU with many SMs, the split plan of a short prefill chunk over a long
+  context can need more (`batch_prefill_tmp_v`, 144 MB in the report), and the planner's error then crossed
+  into the engine as an exception and ended the process. The workspace now starts at `AGENS_FI_WORKSPACE_MIB`
+  (default 128, as before) and grows to what a plan needs, up to `AGENS_FI_WORKSPACE_MAX_MIB` (default 1024); a growth
+  is logged (`attn: ... flashinfer workspace <old> -> <new> MiB`). A plan that still cannot be served fails that request
+  with an error, and the server keeps running. The workspace size never changes the plan, so outputs are unchanged:
+  greedy output identical to 1.3.7 on the 13 gate prompts (`--profile 16gb` and `--profile 24gb`, with and without the
+  drafter, compute capability 8.9), also with the workspace forced to start at 1 MiB and grow.
+- **The `16gb` profile could pin more host RAM than the machine has** (reported on Hugging Face). With the KV cache
+  tiered to host RAM, the pool was sized from GPU memory and `--wctx` alone and pinned about 91 KB of host RAM per row
+  at start-up, 24 GB at the full 262K-token context, which stalled a 30 GB machine. The pool is now also capped by the
+  host RAM free to pin: available RAM (`MemAvailable` on Linux, or the container's memory limit less its usage when
+  lower; available physical memory on Windows) less a headroom kept free (`AGENS_HOST_PIN_HEADROOM_GIB`, default
+  10 % of RAM, at least 4 GiB and at most 8 GiB). The context clamps to the capped pool, and the start-up log says how
+  much host RAM the KV cache pins and why the pool was capped. Example: `--profile 16gb` in a container limited to
+  20 GiB: 1.3.7 was killed for running out of memory during start-up; 1.3.8 pins 9.61 GB, serves a 98,308-token
+  context and answers (compute capability 8.9, 48 GB card).
+- **A session that could not be reused was silent.** When a request with a session id (`session_id` /
+  `X-Session-Id`) does not continue its conversation's tokens (edited or regenerated history, a client that renders
+  earlier turns differently), the server prefills the whole prompt again; it now logs one line with how many tokens
+  the conversation held, how many matched, and what was prefilled. A request whose conversation already has a request
+  running is logged the same way.
+
 ## 1.3.7
 
 ### New
